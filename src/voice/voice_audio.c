@@ -507,11 +507,12 @@ void speex_echo_get_residual(void *st, float *Yout, int len)
 
 static void tx_send(const uint8_t *payload, int len, uint16_t *seq, uint32_t *ts, uint32_t *ctr)
 {
-    uint8_t hdr[12], pkt[1400];
+    uint8_t hdr[12];
+    static uint8_t pkt[1400];
 #if VOICE_DAVE_ENABLE
     // Inner E2EE: wrap the Opus payload with the DAVE frame codec at our per-
     // generation key before transport seal; passthrough until a key is established.
-    uint8_t wrapped[1400];
+    static uint8_t wrapped[1400];
     if (s_dave_hooks && s_dave_hooks->my_key) {
         unsigned eg = s_tx_epoch_gen;
         if (eg != s_tx_epoch_seen) {
@@ -649,7 +650,7 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
 
     s_run = 1;
 #ifdef CORDLESS_PLUGIN
-    const SceSize rx_stack = 0x4000;
+    const SceSize rx_stack = 0x3000;
     const int rx_aff = 0;
 #else
     const SceSize rx_stack = 0x10000;
@@ -688,7 +689,7 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
                                SCE_AUDIO_IN_PARAM_FORMAT_S16_MONO);
     if (s_mic < 0) console_logf("[voice] mic open failed 0x%08x", (unsigned)s_mic);
 #ifdef CORDLESS_PLUGIN
-    const SceSize tx_stack = 0x4000;
+    const SceSize tx_stack = 0x3000;
     const int tx_aff = 0;
 #else
     const SceSize tx_stack = 0x10000;

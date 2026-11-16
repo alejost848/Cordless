@@ -333,12 +333,14 @@ static void dave_send_binary(ws_client *ws, int op, const uint8_t *payload, size
 static void dave_send_key_package(ws_client *ws)
 {
     if (!s_dave) return;
-    uint8_t kp[8192];
+    uint8_t *kp = (uint8_t *)malloc(8192);
+    if (!kp) return;
     size_t kl = 0;
-    if (dave_make_key_package(s_dave, kp, &kl, sizeof(kp)) == 0)
+    if (dave_make_key_package(s_dave, kp, &kl, 8192) == 0)
         dave_send_binary(ws, DAVE_OP_KEY_PACKAGE, kp, kl);
     else
         console_logf("[dave] key_package build failed");
+    free(kp);
 }
 
 static void dave_send_ready(ws_client *ws, int tid)
@@ -789,10 +791,7 @@ void voice_on_server(const char *token, const char *endpoint,
                      const char *channel_id, const char *user_id)
 {
 #ifndef CORDLESS_PLUGIN
-    if (voice_ipc_available()) {
-        voice_ipc_on_server(token, endpoint, session_id, guild_id, channel_id, user_id);
-        return;
-    }
+    if (voice_ipc_available()) return;
 #endif
     if (!s_active) return;
     if (s_guild[0]) {
@@ -813,10 +812,7 @@ void voice_on_state_update(const char *guild_id, const char *channel_id,
                            const char *session_id)
 {
 #ifndef CORDLESS_PLUGIN
-    if (voice_ipc_available()) {
-        voice_ipc_on_state_update(guild_id, channel_id, session_id);
-        return;
-    }
+    if (voice_ipc_available()) return;
 #endif
     if (!s_active) return;
     if (s_guild[0]) {
@@ -862,11 +858,8 @@ int voice_join(const char *guild_id, const char *channel_id,
 #ifndef CORDLESS_PLUGIN
     if (voice_ipc_available()) {
         int rc = voice_ipc_join(guild_id, channel_id, token, cacert_path);
-        if (rc == 0) {
-            gateway_voice_update_ex(guild_id, channel_id, 0, 0);
-            if (!guild_id || !guild_id[0]) {
-                discord_ring_call(channel_id, token, cacert_path);
-            }
+        if (rc == 0 && (!guild_id || !guild_id[0])) {
+            discord_ring_call(channel_id, token, cacert_path);
         }
         return rc;
     }
@@ -874,6 +867,7 @@ int voice_join(const char *guild_id, const char *channel_id,
     if (s_active || s_thread >= 0) voice_leave();
 
     // run the crypto self-tests once, on first join
+#ifndef CORDLESS_PLUGIN
     static int s_crypto_checked;
     if (!s_crypto_checked) {
         s_crypto_checked = 1;
@@ -882,6 +876,7 @@ int voice_join(const char *guild_id, const char *channel_id,
         dave_selftest();
 #endif
     }
+#endif
 
     snprintf(s_guild, sizeof(s_guild), "%s", guild_id ? guild_id : "");
     snprintf(s_chan, sizeof(s_chan), "%s", channel_id);
@@ -915,9 +910,6 @@ void voice_leave(void)
 {
 #ifndef CORDLESS_PLUGIN
     if (voice_ipc_available()) {
-        if (voice_ipc_active()) {
-            gateway_voice_update_ex(voice_ipc_guild_id(), "", 0, 0);
-        }
         voice_ipc_leave();
         return;
     }

@@ -156,6 +156,7 @@ if(BUILD_VOICE_FULL)
   add_executable(cordless_voice_full
     src/full_entry.c
     src/voice_shim.c
+    src/main_gw.c
     src/pool_alloc.c
     ${ROOT_DIR}/src/net_common.c
     ${ROOT_DIR}/src/util/b64.c

@@ -37,11 +37,6 @@ void store_voice_set(const char *guild_id, const char *channel_id,
     (void)guild_id; (void)channel_id; (void)user_id;
     (void)session_id; (void)mute; (void)deaf;
 }
-int gateway_voice_update_ex(const char *guild_id, const char *channel_id,
-                            int self_mute, int self_deaf) {
-    (void)guild_id; (void)channel_id; (void)self_mute; (void)self_deaf;
-    return 0;
-}
 int discord_ring_call(const char *channel_id, const char *token, const char *cacert_path) {
     (void)channel_id; (void)token; (void)cacert_path;
     return 0;

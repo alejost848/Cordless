@@ -22,6 +22,9 @@
 
 extern void console_logf(const char *fmt, ...);
 extern void pool_alloc_shutdown(void);
+extern void main_gw_set_auth(const char *token, const char *cacert);
+extern void main_gw_tick(void);
+extern void main_gw_stop(void);
 
 static volatile int s_run = 0;
 static SceUID s_thread = -1;
@@ -75,6 +78,7 @@ static void handle_ipc_line(int fd, const char *line) {
         const char *chan_id  = json_string_value(json_object_get(req, "channel_id"));
         const char *token    = json_string_value(json_object_get(req, "token"));
         const char *cacert   = json_string_value(json_object_get(req, "cacert"));
+        main_gw_set_auth(token, cacert);
         int rc = voice_join(guild_id, chan_id, token, cacert);
         json_object_set_new(resp, "rc", json_integer(rc));
     } else if (strcmp(cmd, "server") == 0) {
@@ -146,9 +150,16 @@ static int full_thread(SceSize args, void *argp) {
     }
 
     int combo_held = 0;
+    int prev_ov = -1;
     while (s_run) {
-        cordless_mem_set_overlay(voice_active(), voice_connected(),
-                                 voice_is_muted(), voice_is_deafened());
+        main_gw_tick();
+        if (!voice_active()) main_gw_stop();
+        int a = voice_active(), c = voice_connected(), m = voice_is_muted(), d = voice_is_deafened();
+        int ov = (a ? 1 : 0) | (c ? 2 : 0) | (m ? 4 : 0) | (d ? 8 : 0);
+        if (ov != prev_ov) {
+            prev_ov = ov;
+            cordless_mem_set_overlay(a, c, m, d);
+        }
         /* In-game mute toggle on L + R + SELECT when a call is active */
         SceCtrlData pad;
         sceClibMemset(&pad, 0, sizeof(pad));
@@ -190,6 +201,7 @@ static int full_thread(SceSize args, void *argp) {
 
     cordless_mem_set_overlay(0, 0, 0, 0);
     voice_leave();
+    main_gw_stop();
     if (s_listen_fd >= 0) { close(s_listen_fd); s_listen_fd = -1; }
     pool_alloc_shutdown();
     console_logf("=== cordless_voice_full stopped ===");
@@ -203,7 +215,7 @@ void _start() __attribute__((weak, alias("module_start")));
 int module_start(SceSize argc, const void *args) {
     (void)argc; (void)args;
     s_run = 1;
-    s_thread = sceKernelCreateThread("cv_full", full_thread, 0x10000100, 0x8000, 0, 0, NULL);
+    s_thread = sceKernelCreateThread("cv_full", full_thread, 0x10000100, 0x6000, 0, 0, NULL);
     if (s_thread >= 0) sceKernelStartThread(s_thread, 0, NULL);
     return SCE_KERNEL_START_SUCCESS;
 }
