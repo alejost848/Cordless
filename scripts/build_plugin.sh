@@ -37,11 +37,13 @@ cmake --build "$WORK/build" -j"$JOBS"
 SUPRX="$WORK/build/cordless_voice_poc.suprx"
 CORE_SUPRX="$WORK/build/cordless_voice_core.suprx"
 MEM_SKPRX="$WORK/build/cordless_mem.skprx"
-if [[ -f "$SUPRX" && -f "$CORE_SUPRX" && -f "$MEM_SKPRX" ]]; then
+HUD_SUPRX="$WORK/build/cordless_hud.suprx"
+if [[ -f "$SUPRX" && -f "$CORE_SUPRX" && -f "$MEM_SKPRX" && -f "$HUD_SUPRX" ]]; then
   cp "$SUPRX" "$OUT_DIR/cordless_voice_poc.suprx"
   cp "$CORE_SUPRX" "$OUT_DIR/cordless_voice_core.suprx"
   cp "$MEM_SKPRX" "$OUT_DIR/cordless_mem.skprx"
-  echo ">> OK: poc=$(du -h "$SUPRX" | cut -f1), core=$(du -h "$CORE_SUPRX" | cut -f1), mem=$(du -h "$MEM_SKPRX" | cut -f1)"
+  cp "$HUD_SUPRX" "$OUT_DIR/cordless_hud.suprx"
+  echo ">> OK: poc=$(du -h "$SUPRX" | cut -f1), core=$(du -h "$CORE_SUPRX" | cut -f1), mem=$(du -h "$MEM_SKPRX" | cut -f1), hud=$(du -h "$HUD_SUPRX" | cut -f1)"
 else
   echo ">> BUILD FAILED: missing plugin output" >&2
   exit 1

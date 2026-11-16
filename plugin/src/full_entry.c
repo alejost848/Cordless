@@ -1,3 +1,4 @@
+#include "../kernel/cordless_mem.h"
 #include "voice/voice.h"
 #include "voice/voice_crypto.h"
 
@@ -146,6 +147,8 @@ static int full_thread(SceSize args, void *argp) {
 
     int combo_held = 0;
     while (s_run) {
+        cordless_mem_set_overlay(voice_active(), voice_connected(),
+                                 voice_is_muted(), voice_is_deafened());
         /* In-game mute toggle on L + R + SELECT when a call is active */
         SceCtrlData pad;
         sceClibMemset(&pad, 0, sizeof(pad));
@@ -185,6 +188,7 @@ static int full_thread(SceSize args, void *argp) {
         }
     }
 
+    cordless_mem_set_overlay(0, 0, 0, 0);
     voice_leave();
     if (s_listen_fd >= 0) { close(s_listen_fd); s_listen_fd = -1; }
     pool_alloc_shutdown();

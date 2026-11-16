@@ -1,0 +1,15 @@
+modules:
+  taihen:
+    nid: 0xe07d1a14
+    libraries:
+      taihenForKernel:
+        nid: 0xcfe3e8c0
+        kernel: true
+        version: 0x1
+        functions:
+          taiHookFunctionAbs: 0xd6e4f68f
+          taiHookFunctionExportForKernel: 0x45ccffc0
+          taiHookFunctionImportForKernel: 0x4519d882
+          taiHookFunctionOffsetForKernel: 0x8f319d77
+          taiGetModuleInfoForKernel: 0x6e931197
+          taiHookReleaseForKernel: 0xd22678ca

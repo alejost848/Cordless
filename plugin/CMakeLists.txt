@@ -20,9 +20,23 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -frtti -fexceptions -Wno-psabi")
 
 option(BUILD_VOICE_FULL "Build full voice+TLS+DAVE suprx for size/link check" OFF)
 
-# Stage 0: Kernel memory pool helper (*KERNEL)
+# Stage 0: Kernel memory pool + display overlay helper (*KERNEL)
+set(TAIHEN_K_STUB_DIR "${CMAKE_CURRENT_BINARY_DIR}/taihen_k_stubs")
+add_custom_command(
+  OUTPUT "${TAIHEN_K_STUB_DIR}/libtaihenForKernel_stub.a"
+  COMMAND ${VITA_LIBS_GEN} "${CMAKE_CURRENT_SOURCE_DIR}/taihen/taihen_kernel_stubs.yml" "${TAIHEN_K_STUB_DIR}"
+  COMMAND make -C "${TAIHEN_K_STUB_DIR}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/taihen/taihen_kernel_stubs.yml"
+  COMMENT "Building libtaihenForKernel_stub.a"
+)
+add_custom_target(taihen_k_stubs ALL DEPENDS "${TAIHEN_K_STUB_DIR}/libtaihenForKernel_stub.a")
+
 add_executable(cordless_mem
   kernel/cordless_mem.c
+)
+add_dependencies(cordless_mem taihen_k_stubs)
+target_link_directories(cordless_mem PRIVATE
+  ${TAIHEN_K_STUB_DIR}
 )
 target_link_libraries(cordless_mem
   -Wl,--gc-sections
@@ -31,7 +45,10 @@ target_link_libraries(cordless_mem
   -Wl,-u,cordless_mem_alloc_pool
   -Wl,-u,cordless_mem_free_pool
   -Wl,-u,cordless_mem_probe
+  -Wl,-u,cordless_mem_set_overlay
+  -Wl,-u,cordless_mem_get_overlay
   -nostdlib
+  taihenForKernel_stub
   SceSysmemForDriver_stub
   SceSysclibForDriver_stub
   SceThreadmgrForDriver_stub
@@ -99,8 +116,43 @@ vita_create_self(cordless_voice_core.suprx cordless_voice_core
   UNSAFE
 )
 
+# Stage 3: Tiny *ALL user-mode HUD overlay (~8K)
+set(TAIHEN_STUB_DIR "${CMAKE_CURRENT_BINARY_DIR}/taihen_stubs")
+add_custom_command(
+  OUTPUT "${TAIHEN_STUB_DIR}/libtaihen_stub.a"
+  COMMAND ${VITA_LIBS_GEN} "${CMAKE_CURRENT_SOURCE_DIR}/taihen/taihen_stubs.yml" "${TAIHEN_STUB_DIR}"
+  COMMAND make -C "${TAIHEN_STUB_DIR}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/taihen/taihen_stubs.yml"
+  COMMENT "Building libtaihen_stub.a"
+)
+add_custom_target(taihen_stubs ALL DEPENDS "${TAIHEN_STUB_DIR}/libtaihen_stub.a")
+
+add_executable(cordless_hud
+  src/hud.c
+)
+add_dependencies(cordless_hud cordless_mem_stubs taihen_stubs)
+target_link_directories(cordless_hud PRIVATE
+  ${CMAKE_CURRENT_BINARY_DIR}/cordless_mem_stubs
+  ${TAIHEN_STUB_DIR}
+)
+target_link_libraries(cordless_hud
+  -Wl,--gc-sections
+  -Wl,-u,module_start
+  -Wl,-u,module_stop
+  -nostdlib
+  cordless_mem_stub
+  taihen_stub
+  gcc
+)
+vita_create_self(cordless_hud.suprx cordless_hud
+  CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/exports.yml
+  STRIPPED
+  UNSAFE
+)
+
 if(BUILD_VOICE_FULL)
   set(ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
+
   add_executable(cordless_voice_full
     src/full_entry.c
     src/voice_shim.c

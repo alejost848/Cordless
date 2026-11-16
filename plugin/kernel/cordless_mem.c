@@ -9,6 +9,32 @@
 #include <stdint.h>
 
 static SceUID s_pool_uid = -1;
+static volatile int s_ov_active = 0;
+static volatile int s_ov_conn   = 0;
+static volatile int s_ov_muted  = 0;
+static volatile int s_ov_deaf   = 0;
+
+int cordless_mem_set_overlay(int active, int connected, int muted, int deaf) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    s_ov_active = active ? 1 : 0;
+    s_ov_conn   = connected ? 1 : 0;
+    s_ov_muted  = muted ? 1 : 0;
+    s_ov_deaf   = deaf ? 1 : 0;
+    EXIT_SYSCALL(state);
+    return 0;
+}
+
+int cordless_mem_get_overlay(void) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int r = (s_ov_active ? 1 : 0) |
+            (s_ov_conn   ? 2 : 0) |
+            (s_ov_muted  ? 4 : 0) |
+            (s_ov_deaf   ? 8 : 0);
+    EXIT_SYSCALL(state);
+    return r;
+}
 
 SceUID cordless_mem_alloc_pool(uint32_t size, uint32_t *out_addr, uint32_t *out_type) {
     uint32_t state;
@@ -17,13 +43,6 @@ SceUID cordless_mem_alloc_pool(uint32_t size, uint32_t *out_addr, uint32_t *out_
     if (size == 0 || (size & 0xFFF) != 0) {
         size = (size + 0xFFF) & ~0xFFFu;
     }
-
-    SceUID pid = ksceKernelGetProcessId();
-    SceKernelAllocMemBlockKernelOpt opt;
-    memset(&opt, 0, sizeof(opt));
-    opt.size = sizeof(opt);
-    opt.attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_PID;
-    opt.pid = pid;
 
     const SceKernelMemBlockType candidates[] = {
         SCE_KERNEL_MEMBLOCK_TYPE_USER_SHARED_MAIN_RW,

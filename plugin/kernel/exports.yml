@@ -13,3 +13,5 @@ cordless_mem:
         - cordless_mem_alloc_pool
         - cordless_mem_free_pool
         - cordless_mem_probe
+        - cordless_mem_set_overlay
+        - cordless_mem_get_overlay
