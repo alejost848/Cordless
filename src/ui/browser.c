@@ -296,6 +296,21 @@ static int      s_set_sw_r[4];  // Switch Account button
 static int      s_set_app_r[SET_NAPP][4];  // appearance row hit rects
 static char     s_msg_sel_id[24];
 static bool     s_msg_sel_follow;
+static bool     s_rail_focus;
+static int      s_rail_sel_slot = -1;
+
+static void rail_scroll_to_slot(int slot, int gcount)
+{
+    if (slot < 0) { s_rail_scroll = 0; return; }
+    int cy = RAIL_G0 + slot * RAIL_PITCH;
+    int top_vis = 74 + 26;
+    int bot_vis = SCREEN_H - 62 - 26;
+    if (cy - s_rail_scroll < top_vis) s_rail_scroll = cy - top_vis;
+    if (cy - s_rail_scroll > bot_vis) s_rail_scroll = cy - bot_vis;
+    int maxr = rail_max_scroll(gcount);
+    if (s_rail_scroll < 0) s_rail_scroll = 0;
+    if (s_rail_scroll > maxr) s_rail_scroll = maxr;
+}
 static int      s_set_scroll;              // settings modal scroll (tall content)
 static int      s_set_scroll_max;
 
@@ -2173,42 +2188,57 @@ void browser_input(unsigned pressed, unsigned held, int ly, int ry)
         store_unlock();
     }
 
+    if (s_rail_focus) {
+        store_lock();
+        rail_compute_order(gs, gcount);
+        store_unlock();
+        if (pressed & SCE_CTRL_UP) {
+            if (s_rail_sel_slot >= 0) {
+                s_rail_sel_slot--;
+                rail_scroll_to_slot(s_rail_sel_slot, gcount);
+            }
+        }
+        if (pressed & SCE_CTRL_DOWN) {
+            if (s_rail_sel_slot + 1 < s_rail_order_n) {
+                s_rail_sel_slot++;
+                rail_scroll_to_slot(s_rail_sel_slot, gcount);
+            }
+        }
+        if (pressed & SCE_CTRL_CROSS) {
+            int target = (s_rail_sel_slot < 0) ? -1
+                       : (s_rail_sel_slot < s_rail_order_n ? s_rail_order[s_rail_sel_slot] : s_guild);
+            if (target != s_guild) {
+                s_guild = target;
+                s_chan_sel = 0; s_side_scroll = 0;
+                s_pending_open = true;
+            }
+            s_rail_focus = false;
+        }
+        if (pressed & (SCE_CTRL_RIGHT | SCE_CTRL_CIRCLE)) {
+            s_rail_focus = false;
+        }
+        if (pressed & SCE_CTRL_TRIANGLE) compose_message();
+        if ((pressed & SCE_CTRL_SQUARE) && voice_active()) voice_toggle_mute();
+        if ((pressed & SCE_CTRL_SELECT) && voice_active()) voice_toggle_deaf();
+        return;
+    }
+
     if (!s_channels_collapsed) {
         if (pressed & SCE_CTRL_UP)   { if (s_chan_sel > 0) s_chan_sel--; }
         if (pressed & SCE_CTRL_DOWN) { if (s_chan_sel < s_sel_count - 1) s_chan_sel++; }
     }
-    if (pressed & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT)) {
+    if ((pressed & SCE_CTRL_LEFT) && !s_msg_sel_id[0]) {
         store_lock();
         rail_compute_order(gs, gcount);
         store_unlock();
-        int cur_slot = -1;
+        s_rail_sel_slot = -1;
         if (s_guild >= 0) {
             for (int i = 0; i < s_rail_order_n; i++)
-                if (s_rail_order[i] == s_guild) { cur_slot = i; break; }
+                if (s_rail_order[i] == s_guild) { s_rail_sel_slot = i; break; }
         }
-        int next_slot = cur_slot;
-        if (pressed & SCE_CTRL_RIGHT) {
-            if (cur_slot + 1 < s_rail_order_n) next_slot = cur_slot + 1;
-        } else {
-            if (cur_slot >= 0) next_slot = cur_slot - 1;  // 0 -> -1 (Home)
-        }
-        if (next_slot != cur_slot) {
-            s_guild = (next_slot < 0) ? -1 : s_rail_order[next_slot];
-            s_chan_sel = 0; s_side_scroll = 0;
-            s_channels_collapsed = false; s_pending_open = true;
-            if (next_slot < 0) {
-                s_rail_scroll = 0;
-            } else {
-                int cy = RAIL_G0 + next_slot * RAIL_PITCH;
-                int top_vis = 74 + 26;  // below DM divider
-                int bot_vis = SCREEN_H - 62 - 26;  // above user avatar strip
-                if (cy - s_rail_scroll < top_vis) s_rail_scroll = cy - top_vis;
-                if (cy - s_rail_scroll > bot_vis) s_rail_scroll = cy - bot_vis;
-                int maxr = rail_max_scroll(gcount);
-                if (s_rail_scroll < 0) s_rail_scroll = 0;
-                if (s_rail_scroll > maxr) s_rail_scroll = maxr;
-            }
-        }
+        s_rail_focus = true;
+        s_channels_collapsed = false;
+        rail_scroll_to_slot(s_rail_sel_slot, gcount);
     }
 
     if (s_msg_sel_id[0] && (pressed & SCE_CTRL_CIRCLE)) {
@@ -2265,6 +2295,7 @@ void browser_touch(int x, int y, int dy, bool tap)
 {
     // Modal while composing: the inline keyboard owns input; ignore app taps.
     if (s_compose_active) return;
+    if (tap) s_rail_focus = false;
 
     bool home = (s_guild < 0);
     g_msg_x = SIDE_X + (s_channels_collapsed ? 0 : SIDE_W);  // channel drawer state
@@ -2911,6 +2942,9 @@ static void draw_rail(guild *gs, int gcount)
         if (gi == s_guild)     ui_rect(0, cy - 22, 4, 44, COL_WHITE);
         else if (gunread)      ui_rounded_rect(0, cy - 5, 4, 10, 2, COL_WHITE);
 
+        if (s_rail_focus && slot == s_rail_sel_slot)
+            ui_rounded_rect(RAIL_W / 2 - 25, cy - 25, 50, 50, 17, COL_WHITE);
+
         char url[256] = "";
         if (gs[gi].icon[0])
             snprintf(url, sizeof(url),
@@ -2945,6 +2979,8 @@ static void draw_rail(guild *gs, int gcount)
     // guild icons scrolled up vanish under the top line.
     ui_rect(0, 0, RAIL_W, hy + 34, COL_GUILDBAR);
     if (home_sel) ui_rect(0, hy - 22, 4, 44, COL_WHITE);
+    if (s_rail_focus && s_rail_sel_slot < 0)
+        ui_rounded_rect(RAIL_W / 2 - 25, hy - 25, 50, 50, 17, COL_WHITE);
     ui_rounded_rect(RAIL_W / 2 - 22, hy - 22, 44, 44, home_sel ? 15 : 22,
                     home_sel ? COL_BLURPLE : COL_ELEVATED);
     ui_text_bold(RAIL_W / 2 - aw / 2, hy - 12, FS_HEADER, COL_WHITE, "@");
