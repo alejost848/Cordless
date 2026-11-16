@@ -2156,7 +2156,7 @@ void browser_input(unsigned pressed, unsigned held, int ly, int ry)
     if (ry < -55 && s_msg_nav_cd == 0) { mdir = -1; s_msg_nav_cd = 10; }
     else if (ry > 55 && s_msg_nav_cd == 0) { mdir = 1; s_msg_nav_cd = 10; }
     else if (ry >= -55 && ry <= 55) s_msg_nav_cd = 0;
-    if (s_channels_collapsed && !s_forum_view) {
+    if ((s_channels_collapsed || s_msg_sel_id[0]) && !s_rail_focus && !s_forum_view) {
         if (pressed & SCE_CTRL_UP)   mdir = -1;
         if (pressed & SCE_CTRL_DOWN) mdir = 1;
     }
@@ -2223,11 +2223,26 @@ void browser_input(unsigned pressed, unsigned held, int ly, int ry)
         return;
     }
 
-    if (!s_channels_collapsed) {
+    if (!s_channels_collapsed && !s_msg_sel_id[0]) {
         if (pressed & SCE_CTRL_UP)   { if (s_chan_sel > 0) s_chan_sel--; }
         if (pressed & SCE_CTRL_DOWN) { if (s_chan_sel < s_sel_count - 1) s_chan_sel++; }
     }
-    if ((pressed & SCE_CTRL_LEFT) && !s_msg_sel_id[0]) {
+    if ((pressed & SCE_CTRL_RIGHT) && !s_msg_sel_id[0] && s_have_open && !s_forum_view) {
+        store_lock();
+        int mc = 0;
+        message *msgs = store_messages(&mc);
+        if (mc > 0) {
+            int cur = mc - 1;
+            if (s_nmhit > 0) {
+                for (int i = 0; i < mc; i++)
+                    if (strcmp(msgs[i].id, s_mhit[s_nmhit - 1].id) == 0) { cur = i; break; }
+            }
+            snprintf(s_msg_sel_id, sizeof(s_msg_sel_id), "%s", msgs[cur].id);
+            s_msg_sel_follow = true;
+            s_want_unread = false; s_pin_anchor[0] = '\0';
+        }
+        store_unlock();
+    } else if ((pressed & SCE_CTRL_LEFT) && !s_msg_sel_id[0]) {
         store_lock();
         rail_compute_order(gs, gcount);
         store_unlock();
@@ -2241,7 +2256,7 @@ void browser_input(unsigned pressed, unsigned held, int ly, int ry)
         rail_scroll_to_slot(s_rail_sel_slot, gcount);
     }
 
-    if (s_msg_sel_id[0] && (pressed & SCE_CTRL_CIRCLE)) {
+    if (s_msg_sel_id[0] && (pressed & (SCE_CTRL_CIRCLE | SCE_CTRL_LEFT))) {
         s_msg_sel_id[0] = '\0';
     }
     if (pressed & SCE_CTRL_CROSS) {
