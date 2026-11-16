@@ -2963,6 +2963,27 @@ static void draw_rail(guild *gs, int gcount)
     draw_status_dot(RAIL_W / 2 + 12, uy + 12, s_my_status, COL_GUILDBAR);
 }
 
+static void draw_mic_icon(int cx, int cy, unsigned col, bool muted)
+{
+    ui_rounded_rect(cx - 3, cy - 8, 6, 10, 3, col);
+    ui_rect(cx - 6, cy - 3, 2, 6, col);
+    ui_rect(cx + 4, cy - 3, 2, 6, col);
+    ui_rect(cx - 5, cy + 2, 10, 2, col);
+    ui_rect(cx - 1, cy + 4, 2, 3, col);
+    ui_rect(cx - 4, cy + 7, 8, 2, col);
+    if (muted) {
+        vita2d_draw_line((float)(cx - 8), (float)(cy - 7), (float)(cx + 8), (float)(cy + 7), col);
+        vita2d_draw_line((float)(cx - 8), (float)(cy - 6), (float)(cx + 8), (float)(cy + 8), col);
+    }
+}
+
+static void draw_hangup_icon(int cx, int cy, unsigned col)
+{
+    ui_rounded_rect(cx - 8, cy - 3, 16, 4, 2, col);
+    ui_rounded_rect(cx - 10, cy - 1, 5, 5, 2, col);
+    ui_rounded_rect(cx + 5, cy - 1, 5, 5, 2, col);
+}
+
 static void draw_sidebar(guild *g, bool home)
 {
     if (s_channels_collapsed) return;  // channel drawer hidden; message pane fills it
@@ -3153,30 +3174,21 @@ static void draw_sidebar(guild *g, bool home)
         ui_text_bold_clip(SIDE_X + 24, vy + 5, FS_TINY,
                           vconn ? COL_GREEN : COL_TEXT_BRIGHT, vhdr, SIDE_W - 32);
 
-        int bw = (SIDE_W - 32) / 3, gap = 6, bx0 = SIDE_X + 10, by = vy + 26, bh = 36;
+        int bw = (SIDE_W - 28) / 2, gap = 8, bx0 = SIDE_X + 10, by = vy + 26, bh = 36;
 
         int muted = voice_is_muted();
-        const char *mlbl = muted ? "Muted" : "Mute";
         int mx = bx0;
         ui_rounded_rect(mx, by, bw, bh, 7, muted ? COL_RED : COL_ELEVATED);
-        ui_text_bold(mx + (bw - ui_text_bold_w(FS_SMALL, mlbl)) / 2, by + 10, FS_SMALL,
-                     muted ? COL_WHITE : COL_TEXT_BRIGHT, mlbl);
+        draw_mic_icon(mx + bw / 2, by + bh / 2,
+                      muted ? COL_WHITE : COL_TEXT_BRIGHT, muted != 0);
         s_vmute_btn[0] = mx; s_vmute_btn[1] = by;
         s_vmute_btn[2] = bw; s_vmute_btn[3] = bh;
 
-        int deaf = voice_is_deafened();
-        const char *dlbl = deaf ? "Deafened" : "Deaf";
-        int dx = mx + bw + gap;
-        ui_rounded_rect(dx, by, bw, bh, 7, deaf ? COL_RED : COL_ELEVATED);
-        ui_text_bold(dx + (bw - ui_text_bold_w(FS_SMALL, dlbl)) / 2, by + 10, FS_SMALL,
-                     deaf ? COL_WHITE : COL_TEXT_BRIGHT, dlbl);
-        s_vdeaf_btn[0] = dx; s_vdeaf_btn[1] = by;
-        s_vdeaf_btn[2] = bw; s_vdeaf_btn[3] = bh;
+        s_vdeaf_btn[2] = 0;
 
-        int lx = dx + bw + gap;
+        int lx = mx + bw + gap;
         ui_rounded_rect(lx, by, bw, bh, 7, COL_RED);
-        ui_text_bold(lx + (bw - ui_text_bold_w(FS_SMALL, "End")) / 2, by + 10, FS_SMALL,
-                     COL_WHITE, "End");
+        draw_hangup_icon(lx + bw / 2, by + bh / 2, COL_WHITE);
         s_vleave_btn[0] = lx; s_vleave_btn[1] = by;
         s_vleave_btn[2] = bw; s_vleave_btn[3] = bh;
     } else {
@@ -3943,39 +3955,31 @@ static void draw_topbar(const channel *cc, int msg_w)
         ui_text_bold(px + bpad / 2, 14, FS_SMALL, COL_TEXT_BRIGHT, "Pins");
         s_pin_btn_x0 = px; s_pin_btn_x1 = px + pw;
         rx = px;
-        // Call / End Call + Mute (DM / Group DM).
+        // Call / Hang Up + Mute (DM / Group DM).
         if (c->type == CH_DM || c->type == CH_GROUP_DM) {
             bool in_dm_call = voice_active() && strcmp(voice_channel_id(), c->id) == 0;
-            const char *clbl = in_dm_call ? "End Call" : "Call";
-            unsigned cbg = in_dm_call ? (voice_connected() ? COL_RED : RGBA8(0xf0, 0xb2, 0x32, 0xFF))
-                                      : COL_ELEVATED;
-            int cw = ui_text_bold_w(FS_SMALL, clbl) + bpad;
-            int cx = rx - cw - bgap;
-            ui_rounded_rect(cx, 9, cw, 24, 8, cbg);
-            ui_text_bold(cx + bpad / 2, 14, FS_SMALL,
-                         in_dm_call ? COL_WHITE : COL_TEXT_BRIGHT, clbl);
-            s_call_btn_x0 = cx; s_call_btn_x1 = cx + cw;
-            rx = cx;
             if (in_dm_call) {
+                int cw = 36, cx = rx - cw - bgap;
+                unsigned cbg = voice_connected() ? COL_RED : RGBA8(0xf0, 0xb2, 0x32, 0xFF);
+                ui_rounded_rect(cx, 9, cw, 24, 8, cbg);
+                draw_hangup_icon(cx + cw / 2, 21, COL_WHITE);
+                s_call_btn_x0 = cx; s_call_btn_x1 = cx + cw;
+                rx = cx;
+
                 int muted = voice_is_muted();
-                const char *mlbl = muted ? "Muted" : "Mute";
-                int mw = ui_text_bold_w(FS_SMALL, mlbl) + bpad;
-                int mx = rx - mw - bgap;
+                int mw = 34, mx = rx - mw - bgap;
                 ui_rounded_rect(mx, 9, mw, 24, 8, muted ? COL_RED : COL_ELEVATED);
-                ui_text_bold(mx + bpad / 2, 14, FS_SMALL,
-                             muted ? COL_WHITE : COL_TEXT_BRIGHT, mlbl);
+                draw_mic_icon(mx + mw / 2, 21,
+                              muted ? COL_WHITE : COL_TEXT_BRIGHT, muted != 0);
                 s_dm_mute_btn_x0 = mx; s_dm_mute_btn_x1 = mx + mw;
                 rx = mx;
-
-                int deaf = voice_is_deafened();
-                const char *dlbl = deaf ? "Deafened" : "Deaf";
-                int dw = ui_text_bold_w(FS_SMALL, dlbl) + bpad;
-                int dx = rx - dw - bgap;
-                ui_rounded_rect(dx, 9, dw, 24, 8, deaf ? COL_RED : COL_ELEVATED);
-                ui_text_bold(dx + bpad / 2, 14, FS_SMALL,
-                             deaf ? COL_WHITE : COL_TEXT_BRIGHT, dlbl);
-                s_dm_deaf_btn_x0 = dx; s_dm_deaf_btn_x1 = dx + dw;
-                rx = dx;
+            } else {
+                int cw = ui_text_bold_w(FS_SMALL, "Call") + bpad;
+                int cx = rx - cw - bgap;
+                ui_rounded_rect(cx, 9, cw, 24, 8, COL_ELEVATED);
+                ui_text_bold(cx + bpad / 2, 14, FS_SMALL, COL_TEXT_BRIGHT, "Call");
+                s_call_btn_x0 = cx; s_call_btn_x1 = cx + cw;
+                rx = cx;
             }
         }
         // Search (guild view).
