@@ -3034,13 +3034,16 @@ static void draw_sidebar(guild *g, bool home)
                                 : "#";
                 bool in_call = is_v && vactive && strcmp(voice_channel_id(), row->ch->id) == 0;
                 unsigned ccol = in_call ? (voice_connected() ? COL_GREEN : COL_TEXT_BRIGHT) : col;
-                if ((unread && !is_v) || in_call) {
-                    ui_text_bold(SIDE_X + 16, y, FS_CHANNEL, ccol, pfx);
-                    ui_text_bold_clip(SIDE_X + 30, y, FS_CHANNEL, ccol, row->ch->name, SIDE_W - 66);
-                } else {
-                    ui_text(SIDE_X + 16, y, FS_CHANNEL, ccol, pfx);
-                    ui_text_clip(SIDE_X + 30, y, FS_CHANNEL, ccol, row->ch->name, SIDE_W - 66);
+                bool bold_ch = (unread && !is_v) || in_call;
+                // Uniform 18px icon column (SIDE_X+14..32) so emoji prefixes match # size.
+                if (strcmp(pfx, "#") == 0 || !ui_draw_emoji(pfx, SIDE_X + 14, y + 3, 14)) {
+                    if (bold_ch) ui_text_bold(SIDE_X + 16, y, FS_CHANNEL, ccol, pfx);
+                    else         ui_text(SIDE_X + 16, y, FS_CHANNEL, ccol, pfx);
                 }
+                if (bold_ch)
+                    ui_text_bold_clip(SIDE_X + 34, y, FS_CHANNEL, ccol, row->ch->name, SIDE_W - 70);
+                else
+                    ui_text_clip(SIDE_X + 34, y, FS_CHANNEL, ccol, row->ch->name, SIDE_W - 70);
             }
             // red mention badge on the right
             if (mentions > 0) {
@@ -3074,26 +3077,6 @@ static void draw_sidebar(guild *g, bool home)
         }
     }
 
-    ui_text_bold_clip(SIDE_X + 14, 14, FS_HEADER, COL_TEXT_BRIGHT,
-                      home ? "Direct Messages" : (g ? g->name : "No servers"),
-                      home ? SIDE_W - 92 : SIDE_W - 100);
-    // Boost-tier badge in the header's bottom-right (pink pill, "Lv N").
-    if (!home && g && g->premium_tier > 0) {
-        char lv[12]; snprintf(lv, sizeof(lv), "Lv %d", g->premium_tier);
-        int pw = 30, px = SIDE_X + SIDE_W - pw - 8, py = TOPBAR_H - 16;
-        ui_rounded_rect(px, py, pw, 14, 4, 0xFFFA73FFu);  // Nitro boost pink
-        ui_text(px + 5, py + 1, FS_TINY, COL_WHITE, lv);
-    }
-    ui_rect(SIDE_X, TOPBAR_H, SIDE_W, 1, COL_GUILDBAR);
-    if (home) {  // Friends button in the header
-        int fbw = 64, fbx = SIDE_X + SIDE_W - fbw - 8, fby = 11, fbh = 22;
-        ui_rounded_rect(fbx, fby, fbw, fbh, 6, COL_ELEVATED);
-        ui_text(fbx + 8, fby + 4, FS_TINY, COL_TEXT_BRIGHT, "Friends");
-        s_friends_btn[0] = fbx; s_friends_btn[1] = fby;
-        s_friends_btn[2] = fbw; s_friends_btn[3] = fbh;
-    } else {
-        s_friends_btn[2] = 0;  // not on Home: no hit rect
-    }
     // Guild view: "Mark Read" button when the server has unread channels.
     s_markread_btn[2] = 0;
     if (!home && g) {
@@ -3105,6 +3088,29 @@ static void draw_sidebar(guild *g, bool home)
             ui_text(bx + 8, by + 4, FS_TINY, COL_TEXT_BRIGHT, "\xE2\x9C\x93 Mark Read");
             s_markread_btn[0] = bx; s_markread_btn[1] = by; s_markread_btn[2] = bw; s_markread_btn[3] = bh;
         }
+    }
+    // Boost-tier badge placed left of Mark Read (or right edge) so they never overlap.
+    int right_used = home ? 92 : (s_markread_btn[2] ? s_markread_btn[2] + 14 : 14);
+    if (!home && g && g->premium_tier > 0) {
+        char lv[12]; snprintf(lv, sizeof(lv), "Lv %d", g->premium_tier);
+        int pw = 30, px = SIDE_X + SIDE_W - right_used - pw - 4, py = 15;
+        ui_rounded_rect(px, py, pw, 14, 4, 0xFFFA73FFu);  // Nitro boost pink
+        ui_text(px + 5, py + 1, FS_TINY, COL_WHITE, lv);
+        right_used += pw + 8;
+    }
+
+    ui_text_bold_clip(SIDE_X + 14, 14, FS_HEADER, COL_TEXT_BRIGHT,
+                      home ? "Direct Messages" : (g ? g->name : "No servers"),
+                      SIDE_W - 18 - right_used);
+    ui_rect(SIDE_X, TOPBAR_H, SIDE_W, 1, COL_GUILDBAR);
+    if (home) {  // Friends button in the header
+        int fbw = 64, fbx = SIDE_X + SIDE_W - fbw - 8, fby = 11, fbh = 22;
+        ui_rounded_rect(fbx, fby, fbw, fbh, 6, COL_ELEVATED);
+        ui_text(fbx + 8, fby + 4, FS_TINY, COL_TEXT_BRIGHT, "Friends");
+        s_friends_btn[0] = fbx; s_friends_btn[1] = fby;
+        s_friends_btn[2] = fbw; s_friends_btn[3] = fbh;
+    } else {
+        s_friends_btn[2] = 0;  // not on Home: no hit rect
     }
 
     if (home && s_sel_count == 0)
@@ -3907,11 +3913,13 @@ static void draw_topbar(const channel *cc, int msg_w)
             s_memtoggle_r[2] = 26; s_memtoggle_r[3] = TOPBAR_H;
             rx = ax;
         }
+        int bpad = (msg_w < 520) ? 14 : 20;
+        int bgap = (msg_w < 520) ? 6 : 8;
         // Pins
-        int pw = ui_text_bold_w(FS_SMALL, "Pins") + 20;
-        int px = rx - pw - 8;
+        int pw = ui_text_bold_w(FS_SMALL, "Pins") + bpad;
+        int px = rx - pw - bgap;
         ui_rounded_rect(px, 9, pw, 24, 8, COL_ELEVATED);
-        ui_text_bold(px + 10, 14, FS_SMALL, COL_TEXT_BRIGHT, "Pins");
+        ui_text_bold(px + bpad / 2, 14, FS_SMALL, COL_TEXT_BRIGHT, "Pins");
         s_pin_btn_x0 = px; s_pin_btn_x1 = px + pw;
         rx = px;
         // Call / End Call + Mute (DM / Group DM).
@@ -3920,30 +3928,30 @@ static void draw_topbar(const channel *cc, int msg_w)
             const char *clbl = in_dm_call ? "End Call" : "Call";
             unsigned cbg = in_dm_call ? (voice_connected() ? COL_RED : RGBA8(0xf0, 0xb2, 0x32, 0xFF))
                                       : COL_ELEVATED;
-            int cw = ui_text_bold_w(FS_SMALL, clbl) + 20;
-            int cx = rx - cw - 8;
+            int cw = ui_text_bold_w(FS_SMALL, clbl) + bpad;
+            int cx = rx - cw - bgap;
             ui_rounded_rect(cx, 9, cw, 24, 8, cbg);
-            ui_text_bold(cx + 10, 14, FS_SMALL,
+            ui_text_bold(cx + bpad / 2, 14, FS_SMALL,
                          in_dm_call ? COL_WHITE : COL_TEXT_BRIGHT, clbl);
             s_call_btn_x0 = cx; s_call_btn_x1 = cx + cw;
             rx = cx;
             if (in_dm_call) {
                 int muted = voice_is_muted();
                 const char *mlbl = muted ? "Muted" : "Mute";
-                int mw = ui_text_bold_w(FS_SMALL, mlbl) + 20;
-                int mx = rx - mw - 8;
+                int mw = ui_text_bold_w(FS_SMALL, mlbl) + bpad;
+                int mx = rx - mw - bgap;
                 ui_rounded_rect(mx, 9, mw, 24, 8, muted ? COL_RED : COL_ELEVATED);
-                ui_text_bold(mx + 10, 14, FS_SMALL,
+                ui_text_bold(mx + bpad / 2, 14, FS_SMALL,
                              muted ? COL_WHITE : COL_TEXT_BRIGHT, mlbl);
                 s_dm_mute_btn_x0 = mx; s_dm_mute_btn_x1 = mx + mw;
                 rx = mx;
 
                 int deaf = voice_is_deafened();
                 const char *dlbl = deaf ? "Deafened" : "Deaf";
-                int dw = ui_text_bold_w(FS_SMALL, dlbl) + 20;
-                int dx = rx - dw - 8;
+                int dw = ui_text_bold_w(FS_SMALL, dlbl) + bpad;
+                int dx = rx - dw - bgap;
                 ui_rounded_rect(dx, 9, dw, 24, 8, deaf ? COL_RED : COL_ELEVATED);
-                ui_text_bold(dx + 10, 14, FS_SMALL,
+                ui_text_bold(dx + bpad / 2, 14, FS_SMALL,
                              deaf ? COL_WHITE : COL_TEXT_BRIGHT, dlbl);
                 s_dm_deaf_btn_x0 = dx; s_dm_deaf_btn_x1 = dx + dw;
                 rx = dx;
@@ -3952,20 +3960,20 @@ static void draw_topbar(const channel *cc, int msg_w)
         // Search (guild view).
         s_search_btn_x0 = s_search_btn_x1 = -1;
         if (s_guild >= 0) {
-            int sw = ui_text_bold_w(FS_SMALL, "Search") + 20;
-            int sx = rx - sw - 8;
+            int sw = ui_text_bold_w(FS_SMALL, "Search") + bpad;
+            int sx = rx - sw - bgap;
             ui_rounded_rect(sx, 9, sw, 24, 8, COL_ELEVATED);
-            ui_text_bold(sx + 10, 14, FS_SMALL, COL_TEXT_BRIGHT, "Search");
+            ui_text_bold(sx + bpad / 2, 14, FS_SMALL, COL_TEXT_BRIGHT, "Search");
             s_search_btn_x0 = sx; s_search_btn_x1 = sx + sw;
             rx = sx;
         }
         // Threads (text/announce).
         s_thr_btn_x0 = s_thr_btn_x1 = -1;
         if (c->type == CH_TEXT || c->type == CH_ANNOUNCE) {
-            int tw2 = ui_text_bold_w(FS_SMALL, "Threads") + 20;
-            int tx2 = rx - tw2 - 8;
+            int tw2 = ui_text_bold_w(FS_SMALL, "Threads") + bpad;
+            int tx2 = rx - tw2 - bgap;
             ui_rounded_rect(tx2, 9, tw2, 24, 8, COL_ELEVATED);
-            ui_text_bold(tx2 + 10, 14, FS_SMALL, COL_TEXT_BRIGHT, "Threads");
+            ui_text_bold(tx2 + bpad / 2, 14, FS_SMALL, COL_TEXT_BRIGHT, "Threads");
             s_thr_btn_x0 = tx2; s_thr_btn_x1 = tx2 + tw2;
             rx = tx2;
         }
@@ -3987,7 +3995,8 @@ static void draw_topbar(const channel *cc, int msg_w)
             if (dm) namex = base + 6;  // DMs: just the name, no "@" prefix
             else    ui_text(base + 6, 14, FS_HEADER, COL_TEXT_MUTED, "#");
         }
-        ui_text_bold_clip(namex, 14, FS_HEADER, COL_TEXT_BRIGHT, c->name, rx - namex - 8);
+        if (rx - namex - 8 > 16)
+            ui_text_bold_clip(namex, 14, FS_HEADER, COL_TEXT_BRIGHT, c->name, rx - namex - 8);
         // Channel topic after the name (single line, clipped), like Discord.
         if (c->topic[0]) {
             int namew = ui_text_bold_w(FS_HEADER, c->name);
@@ -4438,11 +4447,19 @@ static void draw_messages(void)
         bool dm = (c->type == CH_DM || c->type == CH_GROUP_DM);
         char ph[128];
         snprintf(ph, sizeof(ph), "Message %s%s", dm ? "" : "#", c->name);
-        ui_text(g_msg_x + 76, cb_y + 8, FS_BODY, COL_TEXT_MUTED, ph);
+        int ph_max = msg_w - 76 - 166;
+        if (ph_max > 24)
+            ui_text_clip(g_msg_x + 76, cb_y + 8, FS_BODY, COL_TEXT_MUTED, ph, ph_max);
     }
     if (s_uploading)
         ui_text(msg_right - 150, cb_y + 10, FS_SMALL, COL_TEXT_LINK, "Uploading image...");
-    else {
+    else if (s_msg_sel_id[0]) {
+        int hy = cb_y + 10, hx = msg_right - 162;
+        hx += ui_pad_glyph(hx, hy, FS_SMALL, COL_TEXT_BRIGHT, UI_PAD_CROSS, "[X]");
+        hx += ui_text(hx, hy, FS_SMALL, COL_TEXT_MUTED, " Actions  ");
+        hx += ui_pad_glyph(hx, hy, FS_SMALL, COL_TEXT_BRIGHT, UI_PAD_CIRCLE, "[O]");
+        ui_text(hx, hy, FS_SMALL, COL_TEXT_MUTED, " Clear");
+    } else {
         // "tap or [triangle] to type" -- real PS button glyph from psexchar.pvf,
         // drawn inline (falls back to [/\] text if the system font is missing).
         int hy = cb_y + 10, hx = msg_right - 150;
