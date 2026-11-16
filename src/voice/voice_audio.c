@@ -209,7 +209,10 @@ static spk_slot *speaker_for(unsigned ssrc, unsigned tick)
         if (!s_spk[i].dec) {
             int err = 0;
             OpusDecoder *d = opus_decoder_create(48000, 2, &err);
-            if (!d) return NULL;
+            if (!d) {
+                console_logf("[voice] opus decoder create failed %d", err);
+                return NULL;
+            }
             memset(&s_spk[i], 0, sizeof(s_spk[i]));
             s_spk[i].dec = d;
             s_spk[i].ssrc = ssrc;
@@ -332,6 +335,9 @@ static void spk_push_pcm(spk_slot *sp, int got)
 static int rx_worker(SceSize sz, void *p)
 {
     (void)sz; (void)p;
+#ifdef CORDLESS_PLUGIN
+    int rx_logged = 0;
+#endif
     static uint8_t pkt[1600], plain[1600];
     // Ping-pong output buffers: sceAudioOutOutput may DMA from the submitted
     // buffer after returning until the next sceAudioOutOutput completes.
@@ -481,12 +487,19 @@ static int rx_worker(SceSize sz, void *p)
         mix_cue_into(mix);
         if (s_aport >= 0) sceAudioOutOutput(s_aport, mix);  // blocks ~20ms -> paces us
         else sceKernelDelayThread(20 * 1000);
+#ifdef CORDLESS_PLUGIN
+        if (!rx_logged) { rx_logged = 1; console_logf("[voice] rx loop ready (aport=%d)", s_aport); }
+#endif
         if ((tick % 250) == 0) {
             console_logf("[voice-rx] pkts=%u open=%u nokey=%u decfail=%u opus=%u",
                          dbg_pkts, dbg_open_ok, dbg_dave_nokey, dbg_dave_decfail, dbg_opus_ok);
             dbg_pkts = dbg_open_ok = dbg_dave_nokey = dbg_dave_decfail = dbg_opus_ok = 0;
         }
     }
+#ifdef CORDLESS_PLUGIN
+    extern int vitasdk_delete_thread_reent(SceUID thid);
+    vitasdk_delete_thread_reent(0);
+#endif
     return 0;
 }
 
@@ -553,10 +566,13 @@ static void tx_silence(uint16_t *seq, uint32_t *ts, uint32_t *ctr)
 static int tx_worker(SceSize sz, void *p)
 {
     (void)sz; (void)p;
-    int16_t in16[VA_MIC_GRAIN];
+#ifdef CORDLESS_PLUGIN
+    int tx_logged = 0;
+#endif
+    static int16_t in16[VA_MIC_GRAIN];
     static int16_t acc[2048]; int accn = 0;
     static int16_t pre_roll[VA_TX_FRAME_SAMPLES]; int has_preroll = 0;
-    uint8_t opus[1024];
+    static uint8_t opus[1024];
     uint16_t seq = 0; uint32_t ts = 0, ctr = 1;
     int speaking = 0, quiet = 0;
     float hp_x1 = 0.0f, hp_y1 = 0.0f;
@@ -599,6 +615,12 @@ static int tx_worker(SceSize sz, void *p)
                 }
                 quiet = active ? 0 : quiet + 1;
                 int n = opus_encode(s_enc, acc, VA_TX_FRAME_SAMPLES, opus, sizeof opus);
+#ifdef CORDLESS_PLUGIN
+                if (!tx_logged && n > 0) {
+                    tx_logged = 1;
+                    console_logf("[voice] tx first opus ok (n=%d)", n);
+                }
+#endif
                 if (n > 0) { tx_send(opus, n, &seq, &ts, &ctr); tx_sent++; }
             } else if (speaking) {  // trailing quiet -> stop
                 tx_silence(&seq, &ts, &ctr);
@@ -621,6 +643,10 @@ static int tx_worker(SceSize sz, void *p)
     }
     if (speaking) { tx_silence(&seq, &ts, &ctr); if (s_on_speaking) s_on_speaking(0); }
     s_tx_speaking = 0;
+#ifdef CORDLESS_PLUGIN
+    extern int vitasdk_delete_thread_reent(SceUID thid);
+    vitasdk_delete_thread_reent(0);
+#endif
     return 0;
 }
 
@@ -655,14 +681,16 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
 
     s_run = 1;
 #ifdef CORDLESS_PLUGIN
-    const SceSize rx_stack = 0x8000;
+    const SceSize rx_stack = 0x10000;
+    const int rx_prio = 0x60;
     const int rx_aff = 0;
 #else
     const SceSize rx_stack = 0x10000;
+    const int rx_prio = 0x40;
     const int rx_aff = SCE_KERNEL_CPU_MASK_USER_1;
 #endif
     // Vita user thread priorities must be >= 0x40 (0x40 is highest user priority).
-    s_rx_thread = sceKernelCreateThread("cl_voice_rx", rx_worker, 0x40, rx_stack, 0,
+    s_rx_thread = sceKernelCreateThread("cl_voice_rx", rx_worker, rx_prio, rx_stack, 0,
                                         rx_aff, NULL);
     if (s_rx_thread < 0) {
         console_logf("[voice] rx thread create failed 0x%08x", (unsigned)s_rx_thread);
@@ -694,13 +722,15 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
                                SCE_AUDIO_IN_PARAM_FORMAT_S16_MONO);
     if (s_mic < 0) console_logf("[voice] mic open failed 0x%08x", (unsigned)s_mic);
 #ifdef CORDLESS_PLUGIN
-    const SceSize tx_stack = 0x8000;
+    const SceSize tx_stack = 0x10000;
+    const int tx_prio = 0x62;
     const int tx_aff = 0;
 #else
     const SceSize tx_stack = 0x10000;
+    const int tx_prio = 0x42;
     const int tx_aff = SCE_KERNEL_CPU_MASK_USER_2;
 #endif
-    s_tx_thread = sceKernelCreateThread("cl_voice_tx", tx_worker, 0x42, tx_stack, 0,
+    s_tx_thread = sceKernelCreateThread("cl_voice_tx", tx_worker, tx_prio, tx_stack, 0,
                                         tx_aff, NULL);
     if (s_tx_thread >= 0) sceKernelStartThread(s_tx_thread, 0, NULL);
     else console_logf("[voice] tx thread create failed 0x%08x", (unsigned)s_tx_thread);

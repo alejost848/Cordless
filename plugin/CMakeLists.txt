@@ -220,6 +220,8 @@ if(BUILD_VOICE_FULL)
     -Wl,--wrap=_free_r
     -Wl,--wrap=_calloc_r
     -Wl,--wrap=_realloc_r
+    -Wl,--wrap=sbrk
+    -Wl,--wrap=_sbrk_r
     cordless_mem_stub
     jansson
     ${ROOT_DIR}/third_party/mlspp/lib/libmlspp_core.a

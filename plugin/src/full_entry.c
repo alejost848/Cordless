@@ -11,17 +11,26 @@
 #include <jansson.h>
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #define IPC_PORT 47321
 
 extern void console_logf(const char *fmt, ...);
 extern void pool_alloc_shutdown(void);
+extern void _init_vita_reent(void);
+extern void _init_vita_io(void);
+extern void _free_vita_io(void);
+extern void __libc_init_array(void);
+extern void __libc_fini_array(void);
+extern int vitasdk_delete_thread_reent(SceUID thid);
 extern void main_gw_set_auth(const char *token, const char *cacert, const char *user_id);
 extern void main_gw_tick(void);
 extern void main_gw_stop(void);
@@ -127,6 +136,9 @@ static void handle_ipc_line(int fd, const char *line) {
 
 static int full_thread(SceSize args, void *argp) {
     (void)args; (void)argp;
+    _init_vita_reent();
+    _init_vita_io();
+    __libc_init_array();
     console_logf("=== cordless_voice_full started (lazy pool) ===");
 
     play_ready_chime();
@@ -142,6 +154,8 @@ static int full_thread(SceSize args, void *argp) {
         sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (bind(s_listen_fd, (struct sockaddr *)&sa, sizeof(sa)) == 0 &&
             listen(s_listen_fd, 4) == 0) {
+            int fl = fcntl(s_listen_fd, F_GETFL, 0);
+            if (fl >= 0) fcntl(s_listen_fd, F_SETFL, fl | O_NONBLOCK);
             console_logf("[full] IPC listening on 127.0.0.1:%d", IPC_PORT);
         } else {
             console_logf("[full] IPC bind/listen failed");
@@ -179,33 +193,39 @@ static int full_thread(SceSize args, void *argp) {
         }
 
         if (s_listen_fd >= 0) {
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(s_listen_fd, &rfds);
-            struct timeval tv = { 0, 50 * 1000 };
-            if (select(s_listen_fd + 1, &rfds, NULL, NULL, &tv) > 0) {
+            for (;;) {
                 int cfd = accept(s_listen_fd, NULL, NULL);
-                if (cfd >= 0) {
-                    char buf[2048];
-                    int n = recv(cfd, buf, sizeof(buf) - 1, 0);
-                    if (n > 0) {
-                        buf[n] = '\0';
-                        handle_ipc_line(cfd, buf);
-                    }
-                    close(cfd);
+                if (cfd < 0) break;
+                int cfl = fcntl(cfd, F_GETFL, 0);
+                if (cfl >= 0) fcntl(cfd, F_SETFL, cfl & ~O_NONBLOCK);
+                struct timeval tv = { 0, 250 * 1000 };
+                setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                char buf[2048];
+                int tot = 0;
+                while (tot < (int)sizeof(buf) - 1) {
+                    int n = recv(cfd, buf + tot, sizeof(buf) - 1 - tot, 0);
+                    if (n <= 0) break;
+                    tot += n;
+                    buf[tot] = '\0';
+                    if (strchr(buf, '\n')) break;
                 }
+                if (tot > 0) handle_ipc_line(cfd, buf);
+                close(cfd);
             }
-        } else {
-            sceKernelDelayThread(50 * 1000);
         }
+        sceKernelDelayThread(20 * 1000);
     }
 
     cordless_mem_set_overlay(0, 0, 0, 0);
     voice_leave();
     main_gw_stop();
     if (s_listen_fd >= 0) { close(s_listen_fd); s_listen_fd = -1; }
+    __libc_fini_array();
+    _free_vita_io();
     pool_alloc_shutdown();
     console_logf("=== cordless_voice_full stopped ===");
+    vitasdk_delete_thread_reent(0);
     return sceKernelExitDeleteThread(0);
 }
 

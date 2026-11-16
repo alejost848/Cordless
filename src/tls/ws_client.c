@@ -159,7 +159,9 @@ ws_client *ws_open(const char *url, const char *cacert_path,
                               (const unsigned char *)pers, strlen(pers)) != 0) goto fail;
     mbedtls_ssl_config_defaults(&w->conf, MBEDTLS_SSL_IS_CLIENT,
                                 MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+    net_lock();
     mbedtls_x509_crt *ca = ca_bundle_get();
+    net_unlock();
     if (ca) {
         mbedtls_ssl_conf_ca_chain(&w->conf, ca, NULL);
         mbedtls_ssl_conf_authmode(&w->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);

@@ -230,3 +230,14 @@ void *__wrap__realloc_r(struct _reent *r, void *ptr, size_t size) {
     (void)r;
     return __wrap_realloc(ptr, size);
 }
+
+void *__wrap_sbrk(intptr_t incr) {
+    (void)incr;
+    return (void *)-1;
+}
+
+void *__wrap__sbrk_r(struct _reent *r, intptr_t incr) {
+    (void)r;
+    (void)incr;
+    return (void *)-1;
+}

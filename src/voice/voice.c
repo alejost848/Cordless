@@ -66,8 +66,32 @@ static char          s_local_ip[64];
 static int           s_local_port;
 
 static SceUID s_thread = -1;
-static ws_client *s_vws;  // voice-gateway ws (op5 Speaking from the TX thread)
+static volatile int s_spk_dirty = 0;
+static volatile int s_spk_val = 0;
+static int s_spk_sent = -1;
 static int s_seq_ack = -1;  // last voice gateway seq received (v8 heartbeat)
+
+// Serializes MLS state and ssrc<->user_id map across cl_voice, audio RX, and UI threads.
+static SceUID s_dave_mtx = -1;
+static volatile int s_dave_mtx_state = 0;
+
+static void ensure_dave_mtx(void)
+{
+    int st = __atomic_load_n(&s_dave_mtx_state, __ATOMIC_ACQUIRE);
+    if (st == 2) return;
+    int expected = 0;
+    if (__atomic_compare_exchange_n(&s_dave_mtx_state, &expected, 1, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        s_dave_mtx = sceKernelCreateMutex("cl_dave", 0, 0, NULL);
+        __atomic_store_n(&s_dave_mtx_state, 2, __ATOMIC_RELEASE);
+    } else {
+        while (__atomic_load_n(&s_dave_mtx_state, __ATOMIC_ACQUIRE) != 2)
+            sceKernelDelayThread(100);
+    }
+}
+
+static void dave_lock(void)   { ensure_dave_mtx(); if (s_dave_mtx >= 0) sceKernelLockMutex(s_dave_mtx, 1, NULL); }
+static void dave_unlock(void) { if (s_dave_mtx >= 0) sceKernelUnlockMutex(s_dave_mtx, 1); }
 
 // ssrc <-> user_id map & Op 5 speaking state, learned from op5 Speaking / op12 Client Connect.
 #define VOICE_SSRC_MAP_N 32
@@ -86,6 +110,7 @@ static void dave_note_speaker(json_t *d)
     int spk = has_spk ? (json_integer_value(spkj) != 0 ? 1 : 0) : 0;
     if (!ssrc && (!uid || !uid[0])) return;
 
+    dave_lock();
     int slot = -1;
     for (int i = 0; i < VOICE_SSRC_MAP_N; i++) {
         if ((ssrc && s_ssrc_map[i].ssrc == ssrc) ||
@@ -102,22 +127,26 @@ static void dave_note_speaker(json_t *d)
             }
         }
     }
-    if (slot < 0) return;
-    if (ssrc) s_ssrc_map[slot].ssrc = ssrc;
-    if (uid && uid[0]) snprintf(s_ssrc_map[slot].uid, 24, "%s", uid);
-    if (has_spk) {
-        s_ssrc_map[slot].speaking = spk;
-        s_ssrc_map[slot].speaking_at = spk ? now_ms() : 0;
+    if (slot >= 0) {
+        if (ssrc) s_ssrc_map[slot].ssrc = ssrc;
+        if (uid && uid[0]) snprintf(s_ssrc_map[slot].uid, 24, "%s", uid);
+        if (has_spk) {
+            s_ssrc_map[slot].speaking = spk;
+            s_ssrc_map[slot].speaking_at = spk ? now_ms() : 0;
+        }
     }
+    dave_unlock();
 }
 
 static void voice_clear_speaker(const char *uid)
 {
     if (!uid || !uid[0]) return;
+    dave_lock();
     for (int i = 0; i < VOICE_SSRC_MAP_N; i++) {
         if (strcmp(s_ssrc_map[i].uid, uid) == 0)
             memset(&s_ssrc_map[i], 0, sizeof(s_ssrc_map[i]));
     }
+    dave_unlock();
 }
 
 #if VOICE_DAVE_ENABLE
@@ -133,11 +162,6 @@ static int           s_dave_ver;  // negotiated DAVE protocol version (0 = off)
 static int           s_dave_pending_tid;  // transition id awaiting op22 execute (-1 = none)
 static int           s_dave_pending_ver;  // protocol version for pending transition
 static int           s_dave_kp_sent;      // non-zero once initial key package was sent
-
-// Serializes MLS state access between the worker and audio threads.
-static SceUID s_dave_mtx = -1;
-static void dave_lock(void)   { if (s_dave_mtx >= 0) sceKernelLockMutex(s_dave_mtx, 1, NULL); }
-static void dave_unlock(void) { if (s_dave_mtx >= 0) sceKernelUnlockMutex(s_dave_mtx, 1); }
 
 static uint64_t str_to_u64(const char *s)
 {
@@ -256,18 +280,25 @@ int voice_is_speaking(const char *user_id)
         return (!s_muted && !s_deafened && voice_audio_is_tx_speaking()) ? 1 : 0;
     if (s_deafened) return 0;
     int64_t now = now_ms();
+    int active_spk = 0;
+    dave_lock();
     for (int i = 0; i < VOICE_SSRC_MAP_N; i++) {
         if (s_ssrc_map[i].uid[0] && strcmp(s_ssrc_map[i].uid, user_id) == 0) {
-            if (s_ssrc_map[i].ssrc && voice_audio_ssrc_speaking(s_ssrc_map[i].ssrc))
-                return 1;
+            if (s_ssrc_map[i].ssrc && voice_audio_ssrc_speaking(s_ssrc_map[i].ssrc)) {
+                active_spk = 1;
+                break;
+            }
             if (s_ssrc_map[i].speaking) {
-                if (now - s_ssrc_map[i].speaking_at <= 1500)
-                    return 1;
+                if (now - s_ssrc_map[i].speaking_at <= 1500) {
+                    active_spk = 1;
+                    break;
+                }
                 s_ssrc_map[i].speaking = 0;
             }
         }
     }
-    return 0;
+    dave_unlock();
+    return active_spk;
 }
 
 unsigned voice_speaking_mask(void)
@@ -276,8 +307,10 @@ unsigned voice_speaking_mask(void)
     unsigned mask = voice_audio_speaking_mask();
     if (!s_deafened) {
         unsigned ws = 0;
+        dave_lock();
         for (int i = 0; i < VOICE_SSRC_MAP_N; i++)
             if (s_ssrc_map[i].speaking) ws |= (1u << (i % 16));
+        dave_unlock();
         mask |= (ws << 12);
     }
     return mask;
@@ -300,19 +333,26 @@ static int vws_read(ws_client *ws, char **buf, size_t *cap, int timeout_ms, int 
         int r = ws_recv_ex(ws, buf, cap, is_binary);
         if (r > 0) return r;
         if (r < 0) return -1;
+        if (s_connected && __atomic_load_n(&s_spk_dirty, __ATOMIC_ACQUIRE)) return 0;
         if (now_ms() - start > timeout_ms) return 0;
         sceKernelDelayThread(15 * 1000);
     }
 }
 
-// Called from the audio TX thread.
+// Called from the audio TX thread; flushed on the cl_voice gateway thread.
 static void voice_send_speaking(int on)
 {
-    if (!s_vws) return;
+    s_spk_val = on ? 1 : 0;
+    __atomic_store_n(&s_spk_dirty, 1, __ATOMIC_RELEASE);
+}
+
+static void voice_flush_speaking(ws_client *ws, int on)
+{
+    if (!ws) return;
     json_t *d = json_pack("{s:i, s:i, s:i}", "speaking", on ? 1 : 0,
                           "delay", 0, "ssrc", (json_int_t)s_ssrc);
     json_t *p = json_pack("{s:i, s:o}", "op", 5, "d", d);
-    vws_send(s_vws, p);
+    vws_send(ws, p);
     json_decref(p);
 }
 
@@ -432,6 +472,8 @@ static void dave_handle_binary(ws_client *ws, const uint8_t *msg, size_t n)
     case DAVE_OP_EXTERNAL_SENDER:
         if (dave_on_external_sender(s_dave, pl, pn) != 0)
             console_logf("[dave] external_sender install failed");
+        else
+            console_logf("[dave] external_sender ok");
         break;
     case DAVE_OP_PROPOSALS: {
         // op28 payload is [Commit][optional Welcome] concatenated
@@ -619,10 +661,6 @@ static int worker(SceSize argsz, void *argp)
     char url[192];
     snprintf(url, sizeof(url), "wss://%s/?v=8", s_endpoint);
 
-#if VOICE_DAVE_ENABLE
-    s_dave_mtx = sceKernelCreateMutex("cl_dave", 0, 0, NULL);
-#endif
-
     for (int attempt = 0; s_run && attempt < 6; attempt++) {
         if (attempt > 0) {
             s_connected = 0;
@@ -641,14 +679,19 @@ static int worker(SceSize argsz, void *argp)
             console_logf("[voice] ws connect failed");
             continue;
         }
-        s_vws = ws;
 
 #if VOICE_DAVE_ENABLE
         s_dave = NULL; s_dave_ver = 0; s_dave_pending_tid = -1; s_dave_pending_ver = 0;
         s_dave_kp_sent = 0;
+        dave_lock();
         memset(s_ssrc_map, 0, sizeof s_ssrc_map);
+        dave_unlock();
         s_dave = dave_session_create(s_user, str_to_u64(s_chan));
         if (!s_dave) console_logf("[dave] session create failed -- E2EE disabled this call");
+#else
+        dave_lock();
+        memset(s_ssrc_map, 0, sizeof s_ssrc_map);
+        dave_unlock();
 #endif
 
         send_identify(ws);
@@ -738,6 +781,8 @@ static int worker(SceSize argsz, void *argp)
 #endif
                         voice_audio_set_muted(s_muted);
                         voice_audio_set_deafened(s_deafened);
+                        __atomic_store_n(&s_spk_dirty, 0, __ATOMIC_RELEASE);
+                        s_spk_sent = -1;
                         voice_audio_start(s_udp, s_ssrc, s_secret, s_mode, voice_send_speaking);
                         voice_audio_play_cue(0);
                         memcpy(audio_key, s_secret, 32);
@@ -753,6 +798,13 @@ static int worker(SceSize argsz, void *argp)
                 json_decref(root);
             }
         }
+        if (s_connected && __atomic_exchange_n(&s_spk_dirty, 0, __ATOMIC_ACQ_REL)) {
+            int val = s_spk_val;
+            if (val != s_spk_sent) {
+                s_spk_sent = val;
+                voice_flush_speaking(ws, val);
+            }
+        }
         if (hb > 0 && now_ms() - last_hb >= hb) {
             json_t *hd = json_object();
             json_object_set_new(hd, "t", json_integer((json_int_t)now_ms()));
@@ -765,10 +817,13 @@ static int worker(SceSize argsz, void *argp)
     }
 
         voice_audio_stop();
-        s_vws = NULL;
+        __atomic_store_n(&s_spk_dirty, 0, __ATOMIC_RELEASE);
+        s_spk_sent = -1;
 #if VOICE_DAVE_ENABLE
         voice_audio_set_dave(NULL);
+        dave_lock();
         dave_session_free(s_dave); s_dave = NULL;
+        dave_unlock();
 #endif
         free(buf);
         ws_close(ws);
@@ -778,15 +833,21 @@ static int worker(SceSize argsz, void *argp)
 
 done:
     voice_audio_stop();
-    s_vws = NULL;
+    __atomic_store_n(&s_spk_dirty, 0, __ATOMIC_RELEASE);
+    s_spk_sent = -1;
 #if VOICE_DAVE_ENABLE
     voice_audio_set_dave(NULL);
-    if (s_dave_mtx >= 0) { sceKernelDeleteMutex(s_dave_mtx); s_dave_mtx = -1; }
+    dave_lock();
     dave_session_free(s_dave); s_dave = NULL;
+    dave_unlock();
 #endif
     if (s_udp >= 0) { close(s_udp); s_udp = -1; }
     s_connected = 0;
     if (s_active) s_status = "Disconnected";
+#ifdef CORDLESS_PLUGIN
+    extern int vitasdk_delete_thread_reent(SceUID thid);
+    vitasdk_delete_thread_reent(0);
+#endif
     return 0;
 }
 
@@ -921,7 +982,9 @@ int voice_join(const char *guild_id, const char *channel_id,
     s_pre_deaf_muted = 0;
     voice_audio_set_muted(0);
     voice_audio_set_deafened(0);
+    dave_lock();
     memset(s_ssrc_map, 0, sizeof(s_ssrc_map));
+    dave_unlock();
     s_have_server = 0; s_have_secret = 0; s_connected = 0; s_state_acked = 0;
     s_active = 1; s_run = 1; s_status = "Requesting";
 
@@ -929,11 +992,13 @@ int voice_join(const char *guild_id, const char *channel_id,
     gateway_voice_update_ex(s_guild, channel_id, 0, 0);
 
 #ifdef CORDLESS_PLUGIN
-    const SceSize worker_stack = 0x8000;
+    const SceSize worker_stack = 0x10000;
+    const int worker_prio = 0x60;
 #else
     const SceSize worker_stack = 0x40000;
+    const int worker_prio = 0x40;
 #endif
-    s_thread = sceKernelCreateThread("cl_voice", worker, 0x40, worker_stack, 0, 0, NULL);
+    s_thread = sceKernelCreateThread("cl_voice", worker, worker_prio, worker_stack, 0, 0, NULL);
     if (s_thread < 0) { s_active = 0; s_run = 0; s_status = "Idle"; return -1; }
     sceKernelStartThread(s_thread, 0, NULL);
     console_dbgf("[voice] join %s#%s", s_guild[0] ? s_guild : "(dm)", channel_id);
@@ -964,7 +1029,9 @@ void voice_leave(void)
     s_muted = 0; s_deafened = 0; s_pre_deaf_muted = 0;
     voice_audio_set_muted(0);
     voice_audio_set_deafened(0);
+    dave_lock();
     memset(s_ssrc_map, 0, sizeof(s_ssrc_map));
+    dave_unlock();
     s_guild[0] = '\0'; s_chan[0] = '\0';
     s_status = "Idle";
 }

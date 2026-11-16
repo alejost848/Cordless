@@ -10,7 +10,7 @@
  * We only ever have <= 8 threads in cordless_voice_core.suprx.
  */
 
-#define MAX_REENT_SLOTS 12
+#define MAX_REENT_SLOTS 16
 
 struct _reent _newlib_global_reent = _REENT_INIT(_newlib_global_reent);
 
@@ -56,6 +56,19 @@ static reent_slot_t *find_or_alloc_slot(SceUID tid) {
         }
         if (free_idx < 0 && s_slots[i].tid == 0) free_idx = i;
     }
+    if (free_idx < 0) {
+        /* Reclaim a slot whose thread exited without calling delete_thread_reent */
+        for (int i = 0; i < MAX_REENT_SLOTS; i++) {
+            SceKernelThreadInfo info;
+            memset(&info, 0, sizeof(info));
+            info.size = sizeof(info);
+            if (s_slots[i].tid > 0 && sceKernelGetThreadInfo(s_slots[i].tid, &info) < 0) {
+                _reclaim_reent(&s_slots[i].reent);
+                free_idx = i;
+                break;
+            }
+        }
+    }
     if (free_idx >= 0) {
         memset(&s_slots[free_idx], 0, sizeof(s_slots[free_idx]));
         s_slots[free_idx].tid = tid;
@@ -83,7 +96,9 @@ struct _reent *__getreent(void) {
     return __getreent_for_thread(sceKernelGetThreadId());
 }
 
-void __vita_delete_thread_reent(SceUID tid) {
+int vitasdk_delete_thread_reent(SceUID tid) {
+    if (tid <= 0) tid = sceKernelGetThreadId();
+    int deleted = 0;
     reent_lock();
     for (int i = 0; i < MAX_REENT_SLOTS; i++) {
         if (s_slots[i].tid == tid) {
@@ -91,14 +106,16 @@ void __vita_delete_thread_reent(SceUID tid) {
             s_slots[i].tid = 0;
             memset(s_slots[i].pthread_data, 0, sizeof(s_slots[i].pthread_data));
             memset(s_slots[i].tls_data, 0, sizeof(s_slots[i].tls_data));
+            deleted = 1;
             break;
         }
     }
     reent_unlock();
+    return deleted;
 }
 
-void vitasdk_delete_thread_reent(SceUID tid) {
-    __vita_delete_thread_reent(tid);
+void __vita_delete_thread_reent(SceUID tid) {
+    (void)vitasdk_delete_thread_reent(tid);
 }
 
 void *vitasdk_get_pthread_data(SceUID thid) {
