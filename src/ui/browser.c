@@ -2177,16 +2177,37 @@ void browser_input(unsigned pressed, unsigned held, int ly, int ry)
         if (pressed & SCE_CTRL_UP)   { if (s_chan_sel > 0) s_chan_sel--; }
         if (pressed & SCE_CTRL_DOWN) { if (s_chan_sel < s_sel_count - 1) s_chan_sel++; }
     }
-    if (pressed & SCE_CTRL_LEFT) {
-        if (s_guild > -1) {
-            s_guild--; s_chan_sel = 0; s_side_scroll = 0;
-            s_channels_collapsed = false; s_pending_open = true;
+    if (pressed & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT)) {
+        store_lock();
+        rail_compute_order(gs, gcount);
+        store_unlock();
+        int cur_slot = -1;
+        if (s_guild >= 0) {
+            for (int i = 0; i < s_rail_order_n; i++)
+                if (s_rail_order[i] == s_guild) { cur_slot = i; break; }
         }
-    }
-    if (pressed & SCE_CTRL_RIGHT) {
-        if (s_guild < gcount - 1) {
-            s_guild++; s_chan_sel = 0; s_side_scroll = 0;
+        int next_slot = cur_slot;
+        if (pressed & SCE_CTRL_RIGHT) {
+            if (cur_slot + 1 < s_rail_order_n) next_slot = cur_slot + 1;
+        } else {
+            if (cur_slot >= 0) next_slot = cur_slot - 1;  // 0 -> -1 (Home)
+        }
+        if (next_slot != cur_slot) {
+            s_guild = (next_slot < 0) ? -1 : s_rail_order[next_slot];
+            s_chan_sel = 0; s_side_scroll = 0;
             s_channels_collapsed = false; s_pending_open = true;
+            if (next_slot < 0) {
+                s_rail_scroll = 0;
+            } else {
+                int cy = RAIL_G0 + next_slot * RAIL_PITCH;
+                int top_vis = 74 + 26;  // below DM divider
+                int bot_vis = SCREEN_H - 62 - 26;  // above user avatar strip
+                if (cy - s_rail_scroll < top_vis) s_rail_scroll = cy - top_vis;
+                if (cy - s_rail_scroll > bot_vis) s_rail_scroll = cy - bot_vis;
+                int maxr = rail_max_scroll(gcount);
+                if (s_rail_scroll < 0) s_rail_scroll = 0;
+                if (s_rail_scroll > maxr) s_rail_scroll = maxr;
+            }
         }
     }
 
