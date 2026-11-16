@@ -8,6 +8,7 @@
 
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #include <sys/socket.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -27,8 +28,13 @@ int voice_audio_selftest(void) { return voice_crypto_selftest(); }
 
 #define VA_FRAME_SAMPLES 960  // 20ms @ 48kHz, per channel
 #define VA_MAX_SPEAKERS  8
+#define VA_JITTER_FRAMES 4
 
-static volatile int  s_run;
+static volatile int      s_run;
+static volatile int      s_muted;
+static volatile int      s_deafened;
+static volatile int      s_tx_speaking;
+static volatile unsigned s_rx_tick;
 static int           s_udp = -1;  // borrowed from voice.c
 static int           s_aport = -1;  // sceAudioOut port
 static int           s_mode_id;
@@ -37,39 +43,140 @@ static unsigned      s_ssrc;  // our own ssrc (ignore our loopback)
 static void        (*s_on_speaking)(int);
 static SceUID        s_rx_thread = -1;
 
-static struct { unsigned ssrc; OpusDecoder *dec; } s_spk[VA_MAX_SPEAKERS];
+typedef struct {
+    unsigned     ssrc;
+    OpusDecoder *dec;
+    unsigned     last_tick;
+    unsigned     speaking_until;
+    uint8_t      r_idx;
+    uint8_t      w_idx;
+    uint8_t      count;
+    int16_t      pcm[VA_JITTER_FRAMES][VA_FRAME_SAMPLES * 2];
+} spk_slot;
+static spk_slot s_spk[VA_MAX_SPEAKERS];
+
+void voice_audio_set_muted(int muted)       { s_muted = muted ? 1 : 0; }
+int  voice_audio_is_muted(void)             { return s_muted; }
+void voice_audio_set_deafened(int deafened) { s_deafened = deafened ? 1 : 0; }
+int  voice_audio_is_deafened(void)          { return s_deafened; }
+int  voice_audio_is_tx_speaking(void)       { return (!s_muted && !s_deafened && s_tx_speaking) ? 1 : 0; }
+
+int voice_audio_ssrc_speaking(unsigned ssrc)
+{
+    if (!ssrc || s_deafened) return 0;
+    unsigned tick = s_rx_tick;
+    for (int i = 0; i < VA_MAX_SPEAKERS; i++) {
+        if (s_spk[i].dec && s_spk[i].ssrc == ssrc &&
+            s_spk[i].speaking_until != 0 && (int)(s_spk[i].speaking_until - tick) >= 0)
+            return 1;
+    }
+    return 0;
+}
+
+unsigned voice_audio_speaking_mask(void)
+{
+    unsigned mask = 0;
+    unsigned tick = s_rx_tick;
+    if (!s_deafened) {
+        for (int i = 0; i < VA_MAX_SPEAKERS; i++) {
+            if (s_spk[i].dec && s_spk[i].speaking_until != 0 &&
+                (int)(s_spk[i].speaking_until - tick) >= 0)
+                mask |= (1u << i);
+        }
+    }
+    if (voice_audio_is_tx_speaking())
+        mask |= (1u << 8);
+    return mask;
+}
 
 #if VOICE_DAVE_ENABLE
 // DAVE inner-layer key resolvers (from voice.c) + derived-key caches, so the hooks
-// are called only on a generation change.
+// are called only on a generation or epoch change.
 static const voice_dave_hooks *s_dave_hooks;
+static volatile unsigned s_rx_epoch_gen;
+static volatile unsigned s_tx_epoch_gen;
 
 void voice_audio_set_dave(const voice_dave_hooks *h) { s_dave_hooks = h; }
+void voice_audio_invalidate_dave_keys(int tx_too)
+{
+    s_rx_epoch_gen++;
+    if (tx_too) s_tx_epoch_gen++;
+}
 
 // Our TX media key at the current generation.
 static uint32_t s_tx_nonce;  // monotonic 32-bit truncated sync nonce
 static int      s_tx_key_gen = -1;
 static int      s_tx_key_ok;
+static unsigned s_tx_epoch_seen;
 static uint8_t  s_tx_key[16];
 
 // Per-remote-SSRC RX media-key cache (ssrc==0 => unused slot).
-static struct { unsigned ssrc; int gen; uint8_t key[16]; int ok; } s_rxkey[VA_MAX_SPEAKERS];
+// Holds one prior epoch's key per SSRC so in-flight transition frames still decrypt.
+static struct {
+    unsigned ssrc;
+    int      gen;
+    uint8_t  key[16];
+    int      ok;
+    uint8_t  prev_key[16];
+    int      prev_ok;
+    unsigned last_tick;
+} s_rxkey[VA_MAX_SPEAKERS];
+static unsigned s_rx_epoch_seen;
 
-static int rxkey_get(unsigned ssrc, uint8_t gen, uint8_t out[16])
+static void rx_sync_epoch(void)
 {
+    unsigned eg = s_rx_epoch_gen;
+    if (eg == s_rx_epoch_seen) return;
+    for (int i = 0; i < VA_MAX_SPEAKERS; i++) {
+        if (s_rxkey[i].ssrc && s_rxkey[i].ok) {
+            memcpy(s_rxkey[i].prev_key, s_rxkey[i].key, 16);
+            s_rxkey[i].prev_ok = 1;
+        }
+        s_rxkey[i].ok = 0;
+        s_rxkey[i].gen = -1;
+    }
+    s_rx_epoch_seen = eg;
+}
+
+static int rxkey_get(unsigned ssrc, uint8_t gen, uint8_t out[16],
+                     uint8_t prev_out[16], int *has_prev)
+{
+    rx_sync_epoch();
+    if (has_prev) *has_prev = 0;
     if (!s_dave_hooks || !s_dave_hooks->sender_key) return 0;
+    unsigned tick = s_rx_tick;
     int slot = -1;
     for (int i = 0; i < VA_MAX_SPEAKERS; i++)
         if (s_rxkey[i].ssrc == ssrc) { slot = i; break; }
     if (slot < 0)
         for (int i = 0; i < VA_MAX_SPEAKERS; i++)
             if (s_rxkey[i].ssrc == 0) {
-                slot = i; s_rxkey[i].ssrc = ssrc; s_rxkey[i].gen = -1; s_rxkey[i].ok = 0; break;
+                slot = i;
+                memset(&s_rxkey[i], 0, sizeof(s_rxkey[i]));
+                s_rxkey[i].ssrc = ssrc;
+                s_rxkey[i].gen = -1;
+                break;
             }
-    if (slot < 0) return 0;  // cache full
+    if (slot < 0) {
+        int lru = 0;
+        unsigned oldest = (unsigned)(tick - s_rxkey[0].last_tick);
+        for (int i = 1; i < VA_MAX_SPEAKERS; i++) {
+            unsigned age = (unsigned)(tick - s_rxkey[i].last_tick);
+            if (age > oldest) { oldest = age; lru = i; }
+        }
+        slot = lru;
+        memset(&s_rxkey[slot], 0, sizeof(s_rxkey[slot]));
+        s_rxkey[slot].ssrc = ssrc;
+        s_rxkey[slot].gen = -1;
+    }
+    s_rxkey[slot].last_tick = tick;
     if (!s_rxkey[slot].ok || s_rxkey[slot].gen != (int)gen) {  // (re)derive only on change
         s_rxkey[slot].ok  = s_dave_hooks->sender_key(ssrc, gen, s_rxkey[slot].key);
         s_rxkey[slot].gen = (int)gen;
+    }
+    if (has_prev && prev_out && s_rxkey[slot].prev_ok) {
+        memcpy(prev_out, s_rxkey[slot].prev_key, 16);
+        *has_prev = 1;
     }
     if (!s_rxkey[slot].ok) return 0;
     memcpy(out, s_rxkey[slot].key, 16);
@@ -77,32 +184,87 @@ static int rxkey_get(unsigned ssrc, uint8_t gen, uint8_t out[16])
 }
 #endif  // VOICE_DAVE_ENABLE
 
-static OpusDecoder *decoder_for(unsigned ssrc)
+static spk_slot *speaker_for(unsigned ssrc, unsigned tick)
 {
-    for (int i = 0; i < VA_MAX_SPEAKERS; i++)
-        if (s_spk[i].dec && s_spk[i].ssrc == ssrc) return s_spk[i].dec;
-    for (int i = 0; i < VA_MAX_SPEAKERS; i++)
+    for (int i = 0; i < VA_MAX_SPEAKERS; i++) {
+        if (s_spk[i].dec && s_spk[i].ssrc == ssrc) {
+            s_spk[i].last_tick = tick;
+            return &s_spk[i];
+        }
+    }
+    for (int i = 0; i < VA_MAX_SPEAKERS; i++) {
         if (!s_spk[i].dec) {
             int err = 0;
             OpusDecoder *d = opus_decoder_create(48000, 2, &err);
-            if (d) { s_spk[i].dec = d; s_spk[i].ssrc = ssrc; }
-            return d;
+            if (!d) return NULL;
+            memset(&s_spk[i], 0, sizeof(s_spk[i]));
+            s_spk[i].dec = d;
+            s_spk[i].ssrc = ssrc;
+            s_spk[i].last_tick = tick;
+            return &s_spk[i];
         }
-    return NULL;  // table full: ignore further speakers
+    }
+    int lru = 0;
+    unsigned oldest = (unsigned)(tick - s_spk[0].last_tick);
+    for (int i = 1; i < VA_MAX_SPEAKERS; i++) {
+        unsigned age = (unsigned)(tick - s_spk[i].last_tick);
+        if (age > oldest) { oldest = age; lru = i; }
+    }
+    OpusDecoder *d = s_spk[lru].dec;
+    opus_decoder_ctl(d, OPUS_RESET_STATE);
+    s_spk[lru].ssrc = ssrc;
+    s_spk[lru].last_tick = tick;
+    s_spk[lru].speaking_until = 0;
+    s_spk[lru].r_idx = 0;
+    s_spk[lru].w_idx = 0;
+    s_spk[lru].count = 0;
+    return &s_spk[lru];
+}
+
+static volatile int s_cue_kind = -1;
+static volatile int s_cue_frames_left = 0;
+
+void voice_audio_play_cue(int kind)
+{
+    s_cue_kind = kind;
+    s_cue_frames_left = (kind == 0) ? 6 : 2;  // 120ms connect chime, 40ms toggle blip
+}
+
+static void mix_cue_into(int16_t *mix)
+{
+    int left = s_cue_frames_left;
+    if (left <= 0) return;
+    int kind = s_cue_kind;
+    int total = (kind == 0) ? 6 : 2;
+    int frame_idx = total - left;
+    float freq = (kind == 0) ? (frame_idx < 3 ? 523.25f : 783.99f) : 659.25f;
+    float phase_step = 2.0f * 3.14159265f * freq / 48000.0f;
+    static float s_phase = 0.0f;
+    for (int i = 0; i < VA_FRAME_SAMPLES; i++) {
+        float env = (left == 1 && i > VA_FRAME_SAMPLES / 2)
+                  ? (float)(VA_FRAME_SAMPLES - i) / (float)(VA_FRAME_SAMPLES / 2)
+                  : 1.0f;
+        int16_t s = (int16_t)(sinf(s_phase) * 1400.0f * env);
+        s_phase += phase_step;
+        if (s_phase > 6.2831853f) s_phase -= 6.2831853f;
+        int l = (int)mix[i * 2] + s;
+        int r = (int)mix[i * 2 + 1] + s;
+        mix[i * 2]     = (int16_t)(l > 32767 ? 32767 : (l < -32768 ? -32768 : l));
+        mix[i * 2 + 1] = (int16_t)(r > 32767 ? 32767 : (r < -32768 ? -32768 : r));
+    }
+    s_cue_frames_left = left - 1;
 }
 
 static int rx_worker(SceSize sz, void *p)
 {
     (void)sz; (void)p;
     static uint8_t pkt[1600], plain[1600];
-    static int16_t frame[VA_FRAME_SAMPLES * 2], mix[VA_FRAME_SAMPLES * 2];
+    static int16_t mix[VA_FRAME_SAMPLES * 2];
 
     while (s_run) {
-        memset(mix, 0, sizeof mix);
+        unsigned tick = ++s_rx_tick;
         for (int guard = 0; guard < 64 && s_run; guard++) {  // drain this tick's packets
-            net_lock();
             int n = (int)recv(s_udp, pkt, sizeof pkt, 0);  // O_NONBLOCK: returns fast
-            net_unlock();
             if (n <= 0) break;
             if (n < 12) continue;
             int ptype = pkt[1] & 0x7F;
@@ -129,26 +291,58 @@ static int rx_worker(SceSize sz, void *p)
             if (s_dave_hooks && s_dave_hooks->sender_key) {
                 uint32_t fnonce;
                 if (dave_frame_peek_nonce(opus, (size_t)olen, &fnonce) == 0) {
-                    uint8_t key[16];
-                    if (!rxkey_get(ssrc, (uint8_t)(fnonce >> 24), key))
-                        continue;  // no key for sender/gen: drop
-                    int dl = dave_frame_decrypt(key, opus, (size_t)olen,
+                    uint8_t key[16], prev_key[16];
+                    int has_prev = 0;
+                    int has_cur = rxkey_get(ssrc, (uint8_t)(fnonce >> 24),
+                                            key, prev_key, &has_prev);
+                    int dl = -1;
+                    if (has_cur)
+                        dl = dave_frame_decrypt(key, opus, (size_t)olen,
                                                 dave_plain, sizeof dave_plain, NULL);
-                    if (dl <= 0) continue;  // E2EE auth fail: drop
+                    if (dl <= 0 && has_prev)
+                        dl = dave_frame_decrypt(prev_key, opus, (size_t)olen,
+                                                dave_plain, sizeof dave_plain, NULL);
+                    if (dl <= 0) continue;  // E2EE auth fail or no key: drop
                     opus = dave_plain; olen = dl;
                 }
             }
 #endif
-            OpusDecoder *d = decoder_for(ssrc);
-            if (!d) continue;
-            int got = opus_decode(d, opus, olen, frame, VA_FRAME_SAMPLES, 0);
+            if (s_deafened) continue;
+            spk_slot *sp = speaker_for(ssrc, tick);
+            if (!sp) continue;
+            int is_sil = (olen == 3 && opus[0] == 0xF8 && opus[1] == 0xFF && opus[2] == 0xFE);
+            if (!is_sil) sp->speaking_until = tick + 12;
+            int16_t *dst = sp->pcm[sp->w_idx];
+            int got = opus_decode(sp->dec, opus, olen, dst, VA_FRAME_SAMPLES, 0);
             if (got <= 0) continue;
-            int ns = got * 2; if (ns > VA_FRAME_SAMPLES * 2) ns = VA_FRAME_SAMPLES * 2;
-            for (int i = 0; i < ns; i++) {  // sum + clip
-                int v = (int)mix[i] + (int)frame[i];
-                mix[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+            if (got < VA_FRAME_SAMPLES)
+                memset(dst + got * 2, 0, (size_t)(VA_FRAME_SAMPLES - got) * 2 * sizeof(int16_t));
+            sp->w_idx = (uint8_t)((sp->w_idx + 1) % VA_JITTER_FRAMES);
+            if (sp->count < VA_JITTER_FRAMES)
+                sp->count++;
+            else
+                sp->r_idx = (uint8_t)((sp->r_idx + 1) % VA_JITTER_FRAMES);
+        }
+        memset(mix, 0, sizeof mix);
+        if (s_deafened) {
+            for (int i = 0; i < VA_MAX_SPEAKERS; i++) {
+                s_spk[i].r_idx = s_spk[i].w_idx = s_spk[i].count = 0;
+                s_spk[i].speaking_until = 0;
+            }
+        } else {
+            for (int s = 0; s < VA_MAX_SPEAKERS; s++) {
+                spk_slot *sp = &s_spk[s];
+                if (!sp->dec || sp->count == 0) continue;
+                const int16_t *src = sp->pcm[sp->r_idx];
+                sp->r_idx = (uint8_t)((sp->r_idx + 1) % VA_JITTER_FRAMES);
+                sp->count--;
+                for (int i = 0; i < VA_FRAME_SAMPLES * 2; i++) {
+                    int v = (int)mix[i] + (int)src[i];
+                    mix[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+                }
             }
         }
+        mix_cue_into(mix);
         if (s_aport >= 0) sceAudioOutOutput(s_aport, mix);  // blocks ~20ms -> paces us
         else sceKernelDelayThread(20 * 1000);
     }
@@ -159,8 +353,25 @@ static int rx_worker(SceSize sz, void *p)
 // Opus-encoded -> sealed -> UDP. Five 0xF8FFFE silence frames end each utterance.
 
 #define VA_MIC_GRAIN   256  // sceAudioIn VOICE grain @ 16kHz (16ms)
-#define VA_VAD_MS2     700000  // mean-square energy gate
+#define VA_VAD_MS2     700000  // default mean-square energy gate (Medium)
 #define VA_VAD_HANG    25  // quiet frames before we stop (~500ms)
+
+static volatile int       s_ptt_enabled;
+static volatile int       s_ptt_down;
+static volatile long long s_vad_thresh = VA_VAD_MS2;
+
+void voice_audio_set_ptt(int enabled, int down)
+{
+    s_ptt_enabled = enabled ? 1 : 0;
+    s_ptt_down    = down ? 1 : 0;
+}
+
+void voice_audio_set_vad_sens(int sens_level)
+{
+    if (sens_level <= 0)      s_vad_thresh = 1600000;  // Low sensitivity (requires louder voice)
+    else if (sens_level >= 2) s_vad_thresh = 250000;   // High sensitivity (picks up softer voice)
+    else                      s_vad_thresh = VA_VAD_MS2;  // Medium (default)
+}
 
 static SceUID       s_tx_thread = -1;
 static int          s_mic = -1;
@@ -174,6 +385,13 @@ static void tx_send(const uint8_t *payload, int len, uint16_t *seq, uint32_t *ts
     // generation key before transport seal; passthrough until a key is established.
     uint8_t wrapped[1400];
     if (s_dave_hooks && s_dave_hooks->my_key) {
+        unsigned eg = s_tx_epoch_gen;
+        if (eg != s_tx_epoch_seen) {
+            s_tx_epoch_seen = eg;
+            s_tx_key_ok = 0;
+            s_tx_key_gen = -1;
+            s_tx_nonce = 0;
+        }
         uint8_t gen = (uint8_t)(s_tx_nonce >> 24);
         if (!s_tx_key_ok || s_tx_key_gen != (int)gen) {
             s_tx_key_ok  = s_dave_hooks->my_key(gen, s_tx_key);
@@ -188,7 +406,7 @@ static void tx_send(const uint8_t *payload, int len, uint16_t *seq, uint32_t *ts
 #endif
     voice_rtp_build(hdr, *seq, *ts, s_ssrc);
     int pn = voice_packet_seal(s_mode_id, s_key, hdr, 12, *ctr, payload, (size_t)len, pkt, sizeof pkt);
-    if (pn > 0) { net_lock(); send(s_udp, pkt, (size_t)pn, 0); net_unlock(); }
+    if (pn > 0) send(s_udp, pkt, (size_t)pn, 0);
     *seq = (uint16_t)(*seq + 1); *ts += VA_FRAME_SAMPLES; (*ctr)++;  // ctr (nonce) never reused
 }
 
@@ -219,15 +437,19 @@ static int tx_worker(SceSize sz, void *p)
         while (accn >= VA_FRAME_SAMPLES && s_run) {
             long long e = 0;
             for (int i = 0; i < VA_FRAME_SAMPLES; i++) { int v = acc[i]; e += (long long)v * v; }
-            int active = (e / VA_FRAME_SAMPLES) > VA_VAD_MS2;
+            int active = 0;
+            if (!s_muted && !s_deafened) {
+                if (s_ptt_enabled) active = s_ptt_down ? 1 : 0;
+                else               active = ((e / VA_FRAME_SAMPLES) > s_vad_thresh);
+            }
             if (active || (speaking && quiet < VA_VAD_HANG)) {
-                if (!speaking) { speaking = 1; quiet = 0; if (s_on_speaking) s_on_speaking(1); }
+                if (!speaking) { speaking = 1; s_tx_speaking = 1; quiet = 0; if (s_on_speaking) s_on_speaking(1); }
                 quiet = active ? 0 : quiet + 1;
                 int n = opus_encode(s_enc, acc, VA_FRAME_SAMPLES, opus, sizeof opus);
                 if (n > 0) tx_send(opus, n, &seq, &ts, &ctr);
             } else if (speaking) {  // trailing quiet -> stop
                 tx_silence(&seq, &ts, &ctr);
-                speaking = 0; quiet = 0;
+                speaking = 0; s_tx_speaking = 0; quiet = 0;
                 if (s_on_speaking) s_on_speaking(0);
             }
             memmove(acc, acc + VA_FRAME_SAMPLES, (accn - VA_FRAME_SAMPLES) * sizeof(acc[0]));
@@ -235,6 +457,7 @@ static int tx_worker(SceSize sz, void *p)
         }
     }
     if (speaking) { tx_silence(&seq, &ts, &ctr); if (s_on_speaking) s_on_speaking(0); }
+    s_tx_speaking = 0;
     return 0;
 }
 
@@ -247,9 +470,13 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
     memcpy(s_key, secret_key, 32);
     s_mode_id = voice_crypto_mode_id(mode);
     s_on_speaking = on_speaking;
+    s_tx_speaking = 0;
+    s_rx_tick = 0;
     memset(s_spk, 0, sizeof s_spk);
 #if VOICE_DAVE_ENABLE
     memset(s_rxkey, 0, sizeof s_rxkey);
+    s_rx_epoch_seen = s_rx_epoch_gen;
+    s_tx_epoch_seen = s_tx_epoch_gen;
     s_tx_nonce = 0; s_tx_key_gen = -1; s_tx_key_ok = 0;
 #endif
 
@@ -291,6 +518,7 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
 void voice_audio_stop(void)
 {
     s_run = 0;
+    s_tx_speaking = 0;
     if (s_tx_thread >= 0) {
         sceKernelWaitThreadEnd(s_tx_thread, NULL, NULL);
         sceKernelDeleteThread(s_tx_thread);
