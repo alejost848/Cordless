@@ -33,6 +33,13 @@ static int  s_dirty = 0;
 static char s_me_id[24];
 static char s_sess_id[64];
 
+/* Rolling overlap buffer for zero-alloc streaming scan of large READY frames */
+static char s_scan_tail[512];
+static size_t s_scan_tlen = 0;
+static int s_scan_got_sid = 0;
+static int s_scan_got_uid = 0;
+static int s_scan_is_ready = 0;
+
 static int64_t gw_now_ms(void) {
     SceRtcTick t;
     sceRtcGetCurrentTick(&t);
@@ -43,6 +50,90 @@ void main_gw_set_auth(const char *token, const char *cacert) {
     snprintf(s_token, sizeof(s_token), "%s", token ? token : "");
     snprintf(s_cacert, sizeof(s_cacert), "%s",
              (cacert && cacert[0]) ? cacert : "ur0:data/cordless_cacert.pem");
+}
+
+static void extract_quoted_after(const char *hay, size_t hlen, const char *needle,
+                                 char *out, size_t ocap) {
+    size_t nlen = strlen(needle);
+    if (hlen < nlen + 2) return;
+    for (size_t i = 0; i + nlen < hlen; i++) {
+        if (memcmp(hay + i, needle, nlen) == 0) {
+            size_t s = i + nlen;
+            size_t e = s;
+            while (e < hlen && hay[e] != '"' && e - s < ocap - 1) e++;
+            if (e < hlen && hay[e] == '"' && e > s) {
+                memcpy(out, hay + s, e - s);
+                out[e - s] = '\0';
+                return;
+            }
+        }
+    }
+}
+
+static void on_large_gw_chunk(const unsigned char *chunk, size_t len, int done, void *ctx) {
+    (void)ctx;
+    if (done) {
+        if (s_scan_is_ready && (s_sess_id[0] || s_me_id[0])) {
+            s_ready = 1;
+            if (s_seq < 0) s_seq = 1;
+            console_logf("[maingw] READY (streamed) uid=%s", s_me_id);
+        }
+        s_scan_tlen = 0;
+        s_scan_got_sid = 0;
+        s_scan_got_uid = 0;
+        s_scan_is_ready = 0;
+        return;
+    }
+
+    size_t off = 0;
+    while (off < len) {
+        char win[1024];
+        size_t take = len - off;
+        if (take > sizeof(win) - s_scan_tlen) take = sizeof(win) - s_scan_tlen;
+        if (s_scan_tlen > 0) memcpy(win, s_scan_tail, s_scan_tlen);
+        memcpy(win + s_scan_tlen, chunk + off, take);
+        size_t wlen = s_scan_tlen + take;
+
+        if (!s_scan_is_ready) {
+            for (size_t i = 0; i + 11 <= wlen; i++) {
+                if (memcmp(win + i, "\"t\":\"READY\"", 11) == 0) {
+                    s_scan_is_ready = 1;
+                    break;
+                }
+            }
+        }
+        if (!s_scan_got_sid) {
+            char sid[64] = {0};
+            extract_quoted_after(win, wlen, "\"session_id\":\"", sid, sizeof(sid));
+            if (sid[0]) {
+                snprintf(s_sess_id, sizeof(s_sess_id), "%s", sid);
+                s_scan_got_sid = 1;
+            }
+        }
+        if (!s_scan_got_uid) {
+            /* Match "user":{"id":"<digits>" or "user":{"username":...,"id":"<digits>" */
+            const char *pat = "\"user\":{\"";
+            size_t plen = 9;
+            for (size_t i = 0; i + plen < wlen; i++) {
+                if (memcmp(win + i, pat, plen) == 0) {
+                    size_t sub_len = wlen - i;
+                    if (sub_len > 256) sub_len = 256;
+                    char uid[24] = {0};
+                    extract_quoted_after(win + i, sub_len, "\"id\":\"", uid, sizeof(uid));
+                    if (uid[0]) {
+                        snprintf(s_me_id, sizeof(s_me_id), "%s", uid);
+                        s_scan_got_uid = 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        size_t keep = wlen > 256 ? 256 : wlen;
+        memcpy(s_scan_tail, win + wlen - keep, keep);
+        s_scan_tlen = keep;
+        off += take;
+    }
 }
 
 static void send_op4(ws_client *ws) {
@@ -68,10 +159,20 @@ static void send_identify(ws_client *ws) {
                               "os", "Windows",
                               "browser", "Discord Client",
                               "device", "Cordless");
-    json_t *d = json_pack("{ss,si,so}",
+    json_t *cs = json_pack("{s:{},s:s,s:i,s:i,s:i,s:s,s:i}",
+                           "guild_versions",
+                           "highest_last_message_id", "0",
+                           "read_state_version", 0,
+                           "user_guild_settings_version", -1,
+                           "user_settings_version", -1,
+                           "private_channels_version", "0",
+                           "api_code_version", 0);
+    json_t *d = json_pack("{ss,so,sb,si,so}",
                           "token", s_token,
-                          "intents", 0,
-                          "properties", props);
+                          "properties", props,
+                          "compress", 0,
+                          "capabilities", 30717,
+                          "client_state", cs);
     json_t *pkt = json_pack("{si,so}", "op", 2, "d", d);
     char *txt = json_dumps(pkt, JSON_COMPACT);
     json_decref(pkt);
@@ -103,6 +204,10 @@ static void close_ws(void) {
     s_ready = 0;
     s_identified = 0;
     s_seq = -1;
+    s_scan_tlen = 0;
+    s_scan_got_sid = 0;
+    s_scan_got_uid = 0;
+    s_scan_is_ready = 0;
 }
 
 void main_gw_tick(void) {
@@ -117,19 +222,24 @@ void main_gw_tick(void) {
         if (s_last_retry != 0 && now - s_last_retry < 3000) return;
         s_last_retry = now;
         s_ws = ws_open("wss://gateway.discord.gg/?v=10&encoding=json",
-                       s_cacert, NULL, NULL);
+                       s_cacert, "https://discord.com", NULL);
         if (!s_ws) {
             console_logf("[maingw] ws_open failed");
             return;
         }
+        ws_set_large_cb(s_ws, 16384, on_large_gw_chunk, NULL);
         s_hb_ms = 41250;
         s_last_hb = now;
         s_seq = -1;
         s_ready = 0;
         s_identified = 0;
+        s_scan_tlen = 0;
+        s_scan_got_sid = 0;
+        s_scan_got_uid = 0;
+        s_scan_is_ready = 0;
     }
 
-    for (int step = 0; step < 4 && s_ws; step++) {
+    for (int step = 0; step < 6 && s_ws; step++) {
         int is_bin = 0;
         int n = ws_recv_ex(s_ws, &s_buf, &s_cap, &is_bin);
         if (n < 0) {
@@ -140,6 +250,7 @@ void main_gw_tick(void) {
         if (n == 0) break;
         if (is_bin) continue;
 
+        /* Small frames (< 16 KiB) are parsed with jansson; huge READY went to on_large_gw_chunk */
         json_error_t jerr;
         json_t *root = json_loads(s_buf, 0, &jerr);
         if (!root) continue;
@@ -160,6 +271,11 @@ void main_gw_tick(void) {
         } else if (op == 1) {
             send_heartbeat(s_ws, s_seq);
             s_last_hb = now;
+        } else if (op == 7 || op == 9) {
+            console_logf("[maingw] op%d reconnect requested", op);
+            json_decref(root);
+            close_ws();
+            return;
         } else if (op == 0 && d) {
             const char *t = json_string_value(json_object_get(root, "t"));
             if (t && strcmp(t, "READY") == 0) {
@@ -169,10 +285,6 @@ void main_gw_tick(void) {
                 if (uid) snprintf(s_me_id, sizeof(s_me_id), "%s", uid);
                 s_ready = 1;
                 console_logf("[maingw] READY uid=%s", s_me_id);
-                if (s_chan[0]) {
-                    s_dirty = 0;
-                    send_op4(s_ws);
-                }
             } else if (t && strcmp(t, "VOICE_STATE_UPDATE") == 0) {
                 const char *uid = json_string_value(json_object_get(d, "user_id"));
                 if (uid && s_me_id[0] && strcmp(uid, s_me_id) == 0) {

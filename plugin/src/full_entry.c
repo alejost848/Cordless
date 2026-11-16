@@ -215,7 +215,7 @@ void _start() __attribute__((weak, alias("module_start")));
 int module_start(SceSize argc, const void *args) {
     (void)argc; (void)args;
     s_run = 1;
-    s_thread = sceKernelCreateThread("cv_full", full_thread, 0x10000100, 0x6000, 0, 0, NULL);
+    s_thread = sceKernelCreateThread("cv_full", full_thread, 0x10000100, 0x8000, 0, 0, NULL);
     if (s_thread >= 0) sceKernelStartThread(s_thread, 0, NULL);
     return SCE_KERNEL_START_SUCCESS;
 }

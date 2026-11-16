@@ -31,6 +31,13 @@ int ws_recv_ex(ws_client *w, char **buf, size_t *cap, int *is_binary);
 // if none. Valid after ws_recv() returns <0; read it before ws_close() frees the handle.
 int ws_last_close_code(ws_client *w);
 
+// Optional streaming hook for oversized text/binary frames (> max_buf bytes).
+// When set, frames exceeding max_buf are streamed directly to cb in chunks instead
+// of buffering the full payload in memory.
+void ws_set_large_cb(ws_client *w, size_t max_buf,
+                     void (*cb)(const unsigned char *chunk, size_t len, int done, void *ctx),
+                     void *ctx);
+
 // Send a close frame (best-effort) and tear everything down.
 void ws_close(ws_client *w);
 

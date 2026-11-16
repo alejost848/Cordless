@@ -895,7 +895,7 @@ int voice_join(const char *guild_id, const char *channel_id,
     gateway_voice_update_ex(s_guild, channel_id, 0, 0);
 
 #ifdef CORDLESS_PLUGIN
-    const SceSize worker_stack = 0x6000;
+    const SceSize worker_stack = 0x8000;
 #else
     const SceSize worker_stack = 0x40000;
 #endif

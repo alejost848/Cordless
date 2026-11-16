@@ -29,8 +29,13 @@ int voice_audio_selftest(void) { return voice_crypto_selftest(); }
 // decrypts + Opus-decodes per SSRC, mixes into 20ms stereo frames for sceAudioOut.
 
 #define VA_FRAME_SAMPLES 960  // 20ms @ 48kHz, per channel
+#ifdef CORDLESS_PLUGIN
+#define VA_MAX_SPEAKERS  4
+#define VA_JITTER_FRAMES 3
+#else
 #define VA_MAX_SPEAKERS  8
 #define VA_JITTER_FRAMES 8
+#endif
 #define VA_JITTER_PREBUF 2   // 40ms pre-buffer on utterance start
 #define VA_PLC_MAX_FRAMES 5  // up to 100ms of Opus PLC on packet loss
 
@@ -650,7 +655,7 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
 
     s_run = 1;
 #ifdef CORDLESS_PLUGIN
-    const SceSize rx_stack = 0x3000;
+    const SceSize rx_stack = 0x8000;
     const int rx_aff = 0;
 #else
     const SceSize rx_stack = 0x10000;
@@ -689,7 +694,7 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
                                SCE_AUDIO_IN_PARAM_FORMAT_S16_MONO);
     if (s_mic < 0) console_logf("[voice] mic open failed 0x%08x", (unsigned)s_mic);
 #ifdef CORDLESS_PLUGIN
-    const SceSize tx_stack = 0x3000;
+    const SceSize tx_stack = 0x8000;
     const int tx_aff = 0;
 #else
     const SceSize tx_stack = 0x10000;

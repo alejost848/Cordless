@@ -158,6 +158,7 @@ if(BUILD_VOICE_FULL)
     src/voice_shim.c
     src/main_gw.c
     src/pool_alloc.c
+    src/reent_shim.c
     ${ROOT_DIR}/src/net_common.c
     ${ROOT_DIR}/src/util/b64.c
     ${ROOT_DIR}/src/tls/vita_mbedtls_port.c

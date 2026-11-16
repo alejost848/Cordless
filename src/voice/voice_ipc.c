@@ -125,14 +125,16 @@ static int ipc_rpc(json_t *req) {
 }
 
 int voice_ipc_available(void) {
-    if (s_avail >= 0) return s_avail;
+    if (s_avail == 1) return 1;
+    uint64_t now = sceKernelGetProcessTimeWide();
+    if (s_avail == 0 && (now - s_last_poll_us) < 3000000ULL) return 0;
     json_t *req = json_object();
     json_object_set_new(req, "cmd", json_string("status"));
     int ok = (ipc_rpc(req) == 0);
     json_decref(req);
     s_avail = ok ? 1 : 0;
-    s_last_poll_us = sceKernelGetProcessTimeWide();
-    console_logf("[voice-ipc] background plugin %s", s_avail ? "DETECTED" : "not running");
+    s_last_poll_us = now;
+    if (s_avail) console_logf("[voice-ipc] background plugin DETECTED");
     return s_avail;
 }
 

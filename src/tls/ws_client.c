@@ -47,6 +47,14 @@ struct ws_client {
     z_stream zs;
     unsigned char *zbuf; size_t zbuf_len, zbuf_cap;  // compressed accumulator
     unsigned char *infl; size_t infl_cap;  // inflated (JSON) output
+
+    // Optional streaming callback for oversized frames (avoids buffering huge READY).
+    size_t max_msg_buf;
+    void (*large_cb)(const unsigned char *chunk, size_t len, int fin, void *ctx);
+    void *large_ctx;
+    int streaming_large;
+    unsigned long long stream_rem;
+    int stream_fin;
 };
 
 // Map recv/send errors: would-block/interrupt becomes WANT_*, real errors
@@ -299,10 +307,36 @@ static int msg_append(ws_client *w, const unsigned char *p, size_t n)
     return 0;
 }
 
+// Drain currently buffered bytes belonging to an active streaming large frame.
+static void drain_large_stream(ws_client *w)
+{
+    while (w->streaming_large && w->stream_rem > 0) {
+        size_t avail = w->rx_len - w->rx_off;
+        if (avail == 0) break;
+        size_t take = avail;
+        if ((unsigned long long)take > w->stream_rem) take = (size_t)w->stream_rem;
+        w->large_cb(w->rx + w->rx_off, take, 0, w->large_ctx);
+        w->rx_off += take;
+        w->stream_rem -= take;
+        if (w->rx_off >= w->rx_len) { w->rx_off = 0; w->rx_len = 0; }
+    }
+    if (w->streaming_large && w->stream_rem == 0) {
+        if (w->stream_fin) {
+            w->large_cb(NULL, 0, 1, w->large_ctx);
+            w->streaming_large = 0;
+            w->msg_started = 0;
+        }
+    }
+}
+
 // Consume one frame from rx + rx_off. Returns 1 if parsed, 0 if
 // more bytes needed, -1 on close/error; sets *done=1 on a completed app message.
 static int consume_frame(ws_client *w, int *done)
 {
+    if (w->streaming_large && w->stream_rem > 0) {
+        drain_large_stream(w);
+        if (w->stream_rem > 0) return 0;
+    }
     size_t avail = w->rx_len - w->rx_off;
     if (avail < 2) return 0;
     unsigned char *b = w->rx + w->rx_off;
@@ -327,6 +361,24 @@ static int consume_frame(ws_client *w, int *done)
     if ((opcode == 0x8 || opcode == 0x9 || opcode == 0xA) && paylen > 125) return -1;
     size_t mask_off = off;
     if (masked) off += 4;
+
+    // Stream oversized unmasked non-control frames directly without buffering whole payload.
+    if (w->large_cb && !masked && (opcode == 0x1 || opcode == 0x2 || opcode == 0x0) &&
+        (w->streaming_large || paylen > w->max_msg_buf || w->msg_len + paylen > w->max_msg_buf)) {
+        if (avail < off) return 0;  // need full header first
+        if (w->msg_len > 0) {
+            w->large_cb(w->msg, w->msg_len, 0, w->large_ctx);
+            w->msg_len = 0;
+        }
+        w->streaming_large = 1;
+        w->stream_rem = paylen;
+        w->stream_fin = fin;
+        w->rx_off += off;
+        if (w->rx_off >= w->rx_len) { w->rx_off = 0; w->rx_len = 0; }
+        drain_large_stream(w);
+        return (w->stream_rem == 0) ? 1 : 0;
+    }
+
     if (avail < off + paylen) return 0;  // frame incomplete
 
     unsigned char *pl = b + off;
@@ -469,6 +521,18 @@ int ws_recv(ws_client *w, char **buf, size_t *cap)
 }
 
 int ws_last_close_code(ws_client *w) { return w ? w->last_close_code : 0; }
+
+void ws_set_large_cb(ws_client *w, size_t max_buf,
+                     void (*cb)(const unsigned char *chunk, size_t len, int fin, void *ctx),
+                     void *ctx)
+{
+    if (!w) return;
+    ws_lock(w);
+    w->max_msg_buf = max_buf;
+    w->large_cb = cb;
+    w->large_ctx = ctx;
+    ws_unlock(w);
+}
 
 void ws_close(ws_client *w)
 {

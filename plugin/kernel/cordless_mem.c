@@ -40,6 +40,11 @@ SceUID cordless_mem_alloc_pool(uint32_t size, uint32_t *out_addr, uint32_t *out_
     uint32_t state;
     ENTER_SYSCALL(state);
 
+    if (s_pool_uid >= 0) {
+        ksceKernelFreeMemBlock(s_pool_uid);
+        s_pool_uid = -1;
+    }
+
     if (size == 0 || (size & 0xFFF) != 0) {
         size = (size + 0xFFF) & ~0xFFFu;
     }
