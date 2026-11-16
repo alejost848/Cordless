@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include <vita2d.h>
+#include <psp2/kernel/processmgr.h>
 
 static vita2d_texture *s_emoji_atlas;
 
@@ -219,7 +220,8 @@ static void draw_emoji_cdn(const char *key, int x, int y, int box)
     vita2d_texture *t = imagecache_get(url);
     if (!t) return;
     float tw = vita2d_texture_get_width(t), th = vita2d_texture_get_height(t);
-    if (tw < 1) tw = 1; if (th < 1) th = 1;
+    if (tw < 1) tw = 1;
+    if (th < 1) th = 1;
     vita2d_draw_texture_part_scale(t, x, y, 0, 0, tw, th,
                                    (float)box / tw, (float)box / th);
 }
@@ -254,6 +256,7 @@ static int draw_mixed(vita2d_font *f, int x, int y, int size, unsigned color,
     while (*p) {
         // Custom server emoji: <:name:id> or <a:name:id>.
         if (p[0] == '<' && (p[1] == ':' || (p[1] == 'a' && p[2] == ':'))) {
+            bool anim = (p[1] == 'a' && p[2] == ':');
             const char *gt = strchr(p, '>');
             if (gt && gt - p < 64) {
                 const char *colon = gt;
@@ -269,12 +272,21 @@ static int draw_mixed(vita2d_font *f, int x, int y, int size, unsigned color,
                               cx += vita2d_font_text_width(f, size, run); rl = 0; }
                     if (draw) {
                         char url[96];
-                        snprintf(url, sizeof(url),
-                                 "https://cdn.discordapp.com/emojis/%s.png?size=48", id);
-                        vita2d_texture *t = imagecache_get(url);
+                        vita2d_texture *t = NULL;
+                        if (anim) {
+                            snprintf(url, sizeof(url),
+                                     "https://cdn.discordapp.com/emojis/%s.gif?size=48", id);
+                            t = imagecache_get_anim(url, (long long)(sceKernelGetProcessTimeWide() / 1000));
+                        }
+                        if (!t) {
+                            snprintf(url, sizeof(url),
+                                     "https://cdn.discordapp.com/emojis/%s.png?size=48", id);
+                            t = imagecache_get(url);
+                        }
                         if (t) { float tw = vita2d_texture_get_width(t);
                                  float th = vita2d_texture_get_height(t);
-                                 if (tw < 1) tw = 1; if (th < 1) th = 1;
+                                 if (tw < 1) tw = 1;
+    if (th < 1) th = 1;
                                  int ex = cx + (adv - box) / 2, ey = y - (int)(size * 0.84f);
                                  vita2d_draw_texture_part_scale(t, ex, ey, 0, 0, tw, th,
                                                                 (float)box / tw, (float)box / th); }

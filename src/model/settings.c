@@ -23,6 +23,8 @@ static void defaults(void)
     g_settings.clock_24h   = 0;  // 12-hour
     g_settings.open_last   = 0;  // Home
     g_settings.low_battery = 1;  // idle skip on
+    g_settings.voice_mode  = 0;  // Voice Activity
+    g_settings.mic_sens    = 1;  // Medium
 }
 
 void settings_load(void)
@@ -31,11 +33,11 @@ void settings_load(void)
     SceUID fd = sceIoOpen(SETTINGS_PATH, SCE_O_RDONLY, 0);
     if (fd >= 0) {
         unsigned magic = 0;
-        app_settings s;
+        app_settings s = g_settings;
         int m = sceIoRead(fd, &magic, sizeof magic);
         int r = sceIoRead(fd, &s, sizeof s);
         sceIoClose(fd);
-        if (m == (int)sizeof magic && magic == SETTINGS_MAGIC && r == (int)sizeof s)
+        if (m == (int)sizeof magic && magic == SETTINGS_MAGIC && r > 0)
             g_settings = s;
     }
     theme_apply_all();

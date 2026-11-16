@@ -6,6 +6,7 @@
 
 #include <psp2/kernel/clib.h>  // sceClibPrintf
 #include <psp2/kernel/processmgr.h>  // sceKernelGetProcessTimeWide
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 
@@ -34,9 +35,12 @@ static void logfile_open(void)
 static char       s_lines[CON_MAX_LINES][CON_LINE_LEN];
 static int        s_count;  // total lines written
 static vita2d_pgf *s_font;
+static SceUID     s_con_mtx = -1;
 
 void console_init(vita2d_pgf *font)
 {
+    if (s_con_mtx < 0)
+        s_con_mtx = sceKernelCreateMutex("console_log", 0, 0, NULL);
     s_font  = font;
     s_count = 0;
     memset(s_lines, 0, sizeof(s_lines));
@@ -54,6 +58,8 @@ static void console_vlogf(const char *fmt, va_list ap)
 {
     char buf[640];  // fits full URLs
     vsnprintf(buf, sizeof(buf), fmt, ap);
+
+    if (s_con_mtx >= 0) sceKernelLockMutex(s_con_mtx, 1, NULL);
 
     // Mirror to the debug channel (Vita3K stdout).
     sceClibPrintf("[cordless] %s\n", buf);
@@ -82,6 +88,8 @@ static void console_vlogf(const char *fmt, va_list ap)
             start = p + 1;
         }
     }
+
+    if (s_con_mtx >= 0) sceKernelUnlockMutex(s_con_mtx, 1);
 }
 
 void console_logf(const char *fmt, ...)
@@ -109,6 +117,7 @@ void console_draw(void)
 {
     if (!s_font) return;
 
+    if (s_con_mtx >= 0) sceKernelLockMutex(s_con_mtx, 1, NULL);
     int first = s_count > CON_VISIBLE ? s_count - CON_VISIBLE : 0;
     int row = 0;
     for (int i = first; i < s_count; i++, row++) {
@@ -117,4 +126,5 @@ void console_draw(void)
                              CON_MARGIN_Y + row * CON_LINE_H,
                              0xFFFFFFFF, CON_FONT_SCALE, line);
     }
+    if (s_con_mtx >= 0) sceKernelUnlockMutex(s_con_mtx, 1);
 }
