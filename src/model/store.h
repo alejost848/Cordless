@@ -2,6 +2,7 @@
 #define CORDLESS_MODEL_STORE_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 // Shared, mutex-protected model of the user's Discord state. Bracket all
 // access with store_lock()/store_unlock().
@@ -100,6 +101,11 @@ typedef struct {
     long long file_size;  // bytes
     bool has_video;  // first attachment is a video (mp4/webm/mov)
     char video_url[600];  // direct video URL (poster still is in image_url)
+    bool has_audio;  // first attachment is a voice message / Ogg Opus audio
+    char audio_url[600];  // direct audio URL
+    int  audio_secs;  // duration_secs (0 if unknown)
+    uint8_t audio_wave[32];  // downsampled 0..255 waveform bars
+    int  audio_wave_n;  // number of waveform bars (0 if none)
     bool has_invite;  // content has a discord.gg / invite link
     char invite_code[40];  // the invite code (rendered as a rich tile)
     reaction reactions[MAX_REACTIONS];

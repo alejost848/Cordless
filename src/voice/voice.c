@@ -189,7 +189,7 @@ void voice_set_muted(int muted)
 void voice_toggle_mute(void)
 {
     voice_set_muted(!s_muted);
-    if (s_connected) voice_audio_play_cue(1);
+    if (s_connected) voice_audio_play_cue(s_muted ? 1 : 2);
 }
 
 void voice_set_deafened(int deafened)
@@ -214,7 +214,7 @@ void voice_set_deafened(int deafened)
 void voice_toggle_deaf(void)
 {
     voice_set_deafened(!s_deafened);
-    if (s_connected) voice_audio_play_cue(1);
+    if (s_connected) voice_audio_play_cue(s_deafened ? 1 : 2);
 }
 
 int voice_is_speaking(const char *user_id)
@@ -439,6 +439,7 @@ static void dave_handle_binary(ws_client *ws, const uint8_t *msg, size_t n)
         if (pn < 2) { console_logf("[dave] welcome short"); break; }
         int tid = ((int)pl[0] << 8) | pl[1];
         if (dave_on_welcome(s_dave, pl + 2, pn - 2, NULL, 0) == 0) {
+            console_logf("[dave] welcome ok (tid=%d est=%d)", tid, dave_established(s_dave));
             s_dave_pending_tid = tid;
             s_dave_pending_ver = s_dave_ver;
             voice_audio_invalidate_dave_keys(tid == 0 ? 1 : 0);

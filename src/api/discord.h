@@ -49,6 +49,11 @@ int discord_send_bytes(const char *channel_id, const char *content,
                        const void *data, int len, const char *filename,
                        const char *token, const char *cacert_path);
 
+// Upload a Discord voice message (Ogg/Opus with flags=8192, duration_secs, waveform).
+int discord_send_voice_message(const char *channel_id, const void *ogg_data, int ogg_len,
+                               double duration_secs, const char *waveform_b64,
+                               const char *token, const char *cacert_path);
+
 int discord_send_reply(const char *channel_id, const char *content,
                        const char *reply_to_id, const char *token,
                        const char *cacert_path);

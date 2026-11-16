@@ -9,6 +9,7 @@
 #include "ui/imagecache.h"
 #include "auth/tokenstore.h"
 #include "media/video_player.h"
+#include "media/audio_player.h"
 #include "model/store.h"
 #include "model/settings.h"
 #include "api/discord.h"
@@ -86,7 +87,7 @@ static void toggle_cat(const char *id)
 }
 static int  s_rail_scroll = 0;
 
-#define RAIL_G0   106  // = home hy(40) + 66
+#define RAIL_G0   110  // = home hy(40) + 70 (clears @ divider + focus pill)
 #define RAIL_PITCH 60
 static int rail_max_scroll(int gcount)
 {
@@ -222,6 +223,9 @@ static int     s_ninvhit;
 typedef struct { int x0, y0, x1, y1; char url[600]; } vid_hit;
 static vid_hit s_vidhit[8];
 static int     s_nvidhit;
+typedef struct { int x0, y0, x1, y1; char id[24], url[600]; } aud_hit;
+static aud_hit s_audhit[16];
+static int     s_naudhit;
 
 static int  s_menu = 0;  // 0 closed, 1 action menu, 2 quick reactions, 3 emoji grid
 static int  s_menu_sel = 0;
@@ -298,6 +302,37 @@ static char     s_msg_sel_id[24];
 static bool     s_msg_sel_follow;
 static bool     s_rail_focus;
 static int      s_rail_sel_slot = -1;
+static bool     s_member_focus;
+static int      s_member_sel;
+
+static void member_scroll_to_row(int row_idx)
+{
+    int top = TOPBAR_H + 8;
+    int bot = SCREEN_H - 4;
+    int y_top = row_idx * 28;
+    int y_bot = y_top + 28;
+    int vis_h = bot - top;
+    if (y_top < s_member_scroll) s_member_scroll = y_top;
+    if (y_bot > s_member_scroll + vis_h) s_member_scroll = y_bot - vis_h;
+    if (s_member_scroll < 0) s_member_scroll = 0;
+    if (s_member_scroll > s_member_max) s_member_scroll = s_member_max;
+}
+
+// Map a visual row index (online first, then offline) in the Friends panel to
+// its store_friends() index, or -1 if out of range. Caller holds store_lock().
+static int friend_vis_to_store(const member_row *fr, int fc, int vis_idx)
+{
+    int cur = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < fc; i++) {
+            bool offline = (store_member_status(fr[i].id) <= 0);
+            if ((pass == 0) == offline) continue;
+            if (cur == vis_idx) return i;
+            cur++;
+        }
+    }
+    return -1;
+}
 
 static void rail_scroll_to_slot(int slot, int gcount)
 {
@@ -764,6 +799,17 @@ static void open_channel(const channel *c)
     if (s_cur_guild_id[0]) {
         const char *sub_cid = (ch_is_thread(c->type) && c->parent_id[0]) ? c->parent_id : c->id;
         gateway_request_members(s_cur_guild_id, sub_cid);
+    } else if (s_guild >= 0) {
+        char gid[24] = "";
+        store_lock();
+        int gc = 0; guild *gs = store_guilds(&gc);
+        if (s_guild < gc) snprintf(gid, sizeof(gid), "%s", gs[s_guild].id);
+        store_unlock();
+        if (gid[0]) {
+            snprintf(s_cur_guild_id, sizeof(s_cur_guild_id), "%s", gid);
+            const char *sub_cid = (ch_is_thread(c->type) && c->parent_id[0]) ? c->parent_id : c->id;
+            gateway_request_members(s_cur_guild_id, sub_cid);
+        }
     }
     console_dbgf("[ui] open #%s", c->name);
 }
@@ -937,7 +983,10 @@ void browser_ime_pump(void)
 
 static volatile int s_uploading;  // an upload is in flight
 static int          s_attach_open;  // attachment source sheet
-static int          s_attach_r[2][4];  // [0]=library [1]=camera hit rects
+static int          s_attach_sel;
+static int          s_attach_r[3][4];  // [0]=library [1]=camera [2]=voice msg
+static bool         s_vrec_open;
+static int          s_vrec_cancel_r[4], s_vrec_send_r[4];
 // an upload carries either a file path (photo library) or an in-memory
 // bytes/len buffer (camera JPEG)
 struct upload { char cid[24]; char path[1024]; unsigned char *bytes; int len; };
@@ -1867,6 +1916,19 @@ static void open_search(void)
     SceUID th = sceKernelCreateThread("cl_search", search_worker, 0x40, 0x100000, 0, SCE_KERNEL_CPU_MASK_USER_1, NULL);
     if (th >= 0) sceKernelStartThread(th, 0, NULL); else s_search_loading = false;
 }
+
+static void handle_square_shortcut(void)
+{
+    if (s_msg_sel_id[0] && !s_forum_view) {
+        snprintf(s_reply_to, sizeof(s_reply_to), "%s", s_msg_sel_id);
+        compose_message();
+    } else if (s_jump_show) {
+        s_want_bottom = true;
+        s_want_unread = false;
+    } else if (s_cur_guild_id[0]) {
+        open_search();
+    }
+}
 static void jump_to_message(const char *cid, const char *mid)
 {
     channel pc; bool found = false;
@@ -1985,9 +2047,10 @@ static const char *k_emoji[] = {
 static void open_forward(const char *src_cid, const char *src_mid);
 // action-menu items in display order; draw_action_menu builds s_menu_acts[]
 // and menu_do dispatches on it
-enum { ACT_REACT, ACT_REPLY, ACT_THREAD, ACT_FORWARD, ACT_PIN, ACT_COPY, ACT_COPYLINK,
+enum { ACT_AUDIO, ACT_IMAGE, ACT_VIDEO, ACT_INVITE, ACT_JUMP_REPLY,
+       ACT_REACT, ACT_REPLY, ACT_THREAD, ACT_FORWARD, ACT_PIN, ACT_COPY, ACT_COPYLINK,
        ACT_PUBLISH, ACT_EDIT, ACT_DELETE };
-static int s_menu_acts[10];
+static int s_menu_acts[15];
 static void menu_do(int sel)
 {
     // target the channel being viewed (thread/forum post != sidebar selection)
@@ -1995,6 +2058,88 @@ static void menu_do(int sel)
     if (!cid || !cid[0] || !s_act_msg[0]) { s_menu = 0; return; }
     if (sel < 0 || sel >= s_menu_rows) { s_menu = 0; return; }
     switch (s_menu_acts[sel]) {
+    case ACT_AUDIO: {
+        char aurl[600] = "";
+        store_lock();
+        int mc = 0; message *msgs = store_messages(&mc);
+        for (int i = 0; i < mc; i++) {
+            if (strcmp(msgs[i].id, s_act_msg) == 0 && msgs[i].has_audio) {
+                snprintf(aurl, sizeof(aurl), "%s", msgs[i].audio_url);
+                break;
+            }
+        }
+        store_unlock();
+        if (aurl[0]) audio_player_toggle(s_act_msg, aurl, s_cacert);
+        s_menu = 0; return;
+    }
+    case ACT_IMAGE: {
+        char iurl[600] = "";
+        store_lock();
+        int mc = 0; message *msgs = store_messages(&mc);
+        for (int i = 0; i < mc; i++) {
+            if (strcmp(msgs[i].id, s_act_msg) == 0 && msgs[i].has_image) {
+                snprintf(iurl, sizeof(iurl), "%s", msgs[i].image_url);
+                break;
+            }
+        }
+        store_unlock();
+        if (iurl[0]) {
+            make_view_url(iurl, s_lightbox_url, sizeof(s_lightbox_url), 1280);
+            s_lightbox_open = true;
+        }
+        s_menu = 0; return;
+    }
+    case ACT_VIDEO: {
+        char vurl[600] = "";
+        store_lock();
+        int mc = 0; message *msgs = store_messages(&mc);
+        for (int i = 0; i < mc; i++) {
+            if (strcmp(msgs[i].id, s_act_msg) == 0 && msgs[i].has_video) {
+                snprintf(vurl, sizeof(vurl), "%s", msgs[i].video_url);
+                break;
+            }
+        }
+        store_unlock();
+        s_menu = 0;
+        if (vurl[0]) video_play(vurl, s_cacert);
+        return;
+    }
+    case ACT_INVITE: {
+        char code[40] = "";
+        store_lock();
+        int mc = 0; message *msgs = store_messages(&mc);
+        for (int i = 0; i < mc; i++) {
+            if (strcmp(msgs[i].id, s_act_msg) == 0 && msgs[i].has_invite) {
+                snprintf(code, sizeof(code), "%s", msgs[i].invite_code);
+                break;
+            }
+        }
+        store_unlock();
+        s_menu = 0;
+        if (code[0]) {
+            snprintf(s_join_code, sizeof(s_join_code), "%s", code);
+            SceUID th = sceKernelCreateThread("cl_join", join_worker, 0x40, 0x40000, 0,
+                                              SCE_KERNEL_CPU_MASK_USER_1, NULL);
+            if (th >= 0) sceKernelStartThread(th, 0, NULL);
+        }
+        return;
+    }
+    case ACT_JUMP_REPLY: {
+        char rcid[24] = "", rmid[24] = "";
+        store_lock();
+        int mc = 0; message *msgs = store_messages(&mc);
+        for (int i = 0; i < mc; i++) {
+            if (strcmp(msgs[i].id, s_act_msg) == 0 && msgs[i].is_reply) {
+                snprintf(rcid, sizeof(rcid), "%s", msgs[i].channel_id);
+                snprintf(rmid, sizeof(rmid), "%s", msgs[i].reply_to_id);
+                break;
+            }
+        }
+        store_unlock();
+        s_menu = 0;
+        if (rcid[0] && rmid[0]) jump_to_message(rcid, rmid);
+        return;
+    }
     case ACT_REACT: s_menu = 2; s_menu_sel = 0; return;  // emoji picker
     case ACT_REPLY:
         snprintf(s_reply_to, sizeof(s_reply_to), "%s", s_act_msg);
@@ -2070,9 +2215,25 @@ static void menu_react(int idx)
 
 void browser_input(unsigned pressed, unsigned held, int ly, int ry)
 {
-    (void)held;
     // compose is modal: ignore app buttons while the inline keyboard is up
     if (s_compose_active) return;
+
+    // Key repeat for D-pad Up/Down: 300ms initial delay, then 70ms repeat.
+    static unsigned s_rep_dir;
+    static long long s_rep_next;
+    unsigned ud_held = held & (SCE_CTRL_UP | SCE_CTRL_DOWN);
+    long long rnow = now_ms();
+    if (pressed & (SCE_CTRL_UP | SCE_CTRL_DOWN)) {
+        s_rep_dir = ud_held;
+        s_rep_next = rnow + 300;
+    } else if (ud_held != 0 && ud_held == s_rep_dir) {
+        if (rnow >= s_rep_next) {
+            pressed |= ud_held;
+            s_rep_next = rnow + 70;
+        }
+    } else {
+        s_rep_dir = 0;
+    }
 
     // first frame after READY: restore the last view per the Open To pref
     if (!s_restored) { s_restored = true; browser_apply_open_pref(); }
@@ -2149,11 +2310,14 @@ void browser_input(unsigned pressed, unsigned held, int ly, int ry)
 
     // L toggles the channel list, R toggles the member list
     if (pressed & SCE_CTRL_LTRIGGER) s_channels_collapsed = !s_channels_collapsed;
-    if (pressed & SCE_CTRL_RTRIGGER) s_members_collapsed  = !s_members_collapsed;
+    if (pressed & SCE_CTRL_RTRIGGER) {
+        s_members_collapsed  = !s_members_collapsed;
+        if (s_members_collapsed) s_member_focus = false;
+    }
 
     // Message selection via D-pad Up/Down when in Message Pane (or sidebar collapsed).
     int mdir = 0;
-    if ((s_channels_collapsed || s_msg_sel_id[0]) && !s_rail_focus && !s_forum_view) {
+    if ((s_channels_collapsed || s_msg_sel_id[0]) && !s_rail_focus && !s_member_focus && !s_forum_view) {
         if (pressed & SCE_CTRL_UP)   mdir = -1;
         if (pressed & SCE_CTRL_DOWN) mdir = 1;
     }
@@ -2183,6 +2347,35 @@ void browser_input(unsigned pressed, unsigned held, int ly, int ry)
             s_want_unread = false; s_pin_anchor[0] = '\0';
         }
         store_unlock();
+    }
+
+    if (s_vrec_open) {
+        int rst = audio_rec_status(NULL, NULL);
+        if (rst == 0) { s_vrec_open = false; return; }
+        if (rst == 1) {
+            if ((pressed & SCE_CTRL_CIRCLE) != 0) {
+                audio_rec_stop(0, NULL, NULL, NULL);
+                s_vrec_open = false;
+            } else if ((pressed & SCE_CTRL_CROSS) != 0 && s_have_open) {
+                audio_rec_stop(1, s_open_ch.id, s_token, s_cacert[0] ? s_cacert : NULL);
+                s_vrec_open = false;
+            }
+        }
+        return;
+    }
+    if (s_attach_open) {
+        if (pressed & SCE_CTRL_UP)   { if (s_attach_sel > 0) s_attach_sel--; }
+        if (pressed & SCE_CTRL_DOWN) { if (s_attach_sel < 2) s_attach_sel++; }
+        if (pressed & SCE_CTRL_CIRCLE) s_attach_open = 0;
+        if (pressed & SCE_CTRL_CROSS) {
+            int sel = s_attach_sel;
+            s_attach_open = 0;
+            if (sel == 0) attach_photo();
+            else if (sel == 1) attach_camera();
+            else if (sel == 2 && !voice_active() && s_have_open && audio_rec_start() == 0)
+                s_vrec_open = true;
+        }
+        return;
     }
 
     if (s_rail_focus) {
@@ -2215,14 +2408,186 @@ void browser_input(unsigned pressed, unsigned held, int ly, int ry)
             s_rail_focus = false;
         }
         if (pressed & SCE_CTRL_TRIANGLE) compose_message();
-        if ((pressed & SCE_CTRL_SQUARE) && voice_active()) voice_toggle_mute();
-        if ((pressed & SCE_CTRL_SELECT) && voice_active()) voice_toggle_deaf();
+        if (pressed & SCE_CTRL_SQUARE)   handle_square_shortcut();
+        if ((pressed & SCE_CTRL_SELECT) && voice_active()) voice_toggle_mute();
+        if ((pressed & SCE_CTRL_START)  && voice_active()) voice_leave();
         return;
+    }
+
+    if (s_member_focus) {
+        if (s_members_collapsed || !s_member_w) {
+            s_member_focus = false;
+        } else if (s_guild < 0) {
+            // Friends panel (Home view): s_member_sel is visual row 0..fc-1.
+            store_lock();
+            int fc = 0;
+            member_row *fr = store_friends(&fc);
+            if (fc <= 0) {
+                store_unlock();
+                s_member_focus = false;
+            } else {
+                if (s_member_sel < 0 || s_member_sel >= fc) s_member_sel = 0;
+                if (pressed & SCE_CTRL_UP) {
+                    if (s_member_sel > 0) {
+                        s_member_sel--;
+                        member_scroll_to_row(s_member_sel);
+                    }
+                }
+                if (pressed & SCE_CTRL_DOWN) {
+                    if (s_member_sel + 1 < fc) {
+                        s_member_sel++;
+                        member_scroll_to_row(s_member_sel);
+                    }
+                }
+                bool open_prof = false;
+                char pid[24] = "", pname[80] = "", pav[40] = "";
+                if (pressed & SCE_CTRL_CROSS) {
+                    int fi = friend_vis_to_store(fr, fc, s_member_sel);
+                    if (fi >= 0) {
+                        snprintf(pid, sizeof(pid), "%s", fr[fi].id);
+                        snprintf(pname, sizeof(pname), "%s", fr[fi].text);
+                        snprintf(pav, sizeof(pav), "%s", fr[fi].avatar);
+                        open_prof = (pid[0] != '\0');
+                    }
+                }
+                store_unlock();
+                if (open_prof) open_profile(pid, pname, pav);
+                if (pressed & (SCE_CTRL_LEFT | SCE_CTRL_CIRCLE)) {
+                    s_member_focus = false;
+                    if ((pressed & SCE_CTRL_LEFT) && s_have_open && !s_forum_view) {
+                        store_lock();
+                        int nmsgs = 0;
+                        message *msgs = store_messages(&nmsgs);
+                        if (nmsgs > 0) {
+                            int cur = nmsgs - 1;
+                            if (s_nmhit > 0) {
+                                for (int i = 0; i < nmsgs; i++)
+                                    if (strcmp(msgs[i].id, s_mhit[s_nmhit - 1].id) == 0) { cur = i; break; }
+                            }
+                            snprintf(s_msg_sel_id, sizeof(s_msg_sel_id), "%s", msgs[cur].id);
+                            s_msg_sel_follow = true;
+                        }
+                        store_unlock();
+                    }
+                }
+                if (pressed & SCE_CTRL_TRIANGLE) compose_message();
+                if (pressed & SCE_CTRL_SQUARE)   handle_square_shortcut();
+                if ((pressed & SCE_CTRL_SELECT) && voice_active()) voice_toggle_mute();
+                if ((pressed & SCE_CTRL_START)  && voice_active()) voice_leave();
+                return;
+            }
+        } else {
+            store_lock();
+            int mc = 0;
+            member_row *rows = store_members(&mc);
+            bool valid = (strcmp(store_members_guild(), s_cur_guild_id) == 0);
+            if (!valid || mc <= 0) {
+                store_unlock();
+                s_member_focus = false;
+            } else {
+                if (s_member_sel < 0 || s_member_sel >= mc || rows[s_member_sel].is_group) {
+                    s_member_sel = -1;
+                    for (int i = 0; i < mc; i++) {
+                        if (!rows[i].is_group) { s_member_sel = i; break; }
+                    }
+                }
+                if (pressed & SCE_CTRL_UP) {
+                    for (int i = s_member_sel - 1; i >= 0; i--) {
+                        if (!rows[i].is_group) {
+                            s_member_sel = i;
+                            member_scroll_to_row(s_member_sel);
+                            break;
+                        }
+                    }
+                }
+                if (pressed & SCE_CTRL_DOWN) {
+                    for (int i = s_member_sel + 1; i < mc; i++) {
+                        if (!rows[i].is_group) {
+                            s_member_sel = i;
+                            member_scroll_to_row(s_member_sel);
+                            break;
+                        }
+                    }
+                }
+                bool open_prof = false;
+                char pid[24] = "", pname[80] = "", pav[40] = "";
+                if ((pressed & SCE_CTRL_CROSS) && s_member_sel >= 0 &&
+                    s_member_sel < mc && !rows[s_member_sel].is_group) {
+                    snprintf(pid, sizeof(pid), "%s", rows[s_member_sel].id);
+                    snprintf(pname, sizeof(pname), "%s", rows[s_member_sel].text);
+                    snprintf(pav, sizeof(pav), "%s", rows[s_member_sel].avatar);
+                    open_prof = (pid[0] != '\0');
+                }
+                store_unlock();
+                if (open_prof) open_profile(pid, pname, pav);
+                if (pressed & (SCE_CTRL_LEFT | SCE_CTRL_CIRCLE)) {
+                    s_member_focus = false;
+                    if ((pressed & SCE_CTRL_LEFT) && s_have_open && !s_forum_view) {
+                        store_lock();
+                        int nmsgs = 0;
+                        message *msgs = store_messages(&nmsgs);
+                        if (nmsgs > 0) {
+                            int cur = nmsgs - 1;
+                            if (s_nmhit > 0) {
+                                for (int i = 0; i < nmsgs; i++)
+                                    if (strcmp(msgs[i].id, s_mhit[s_nmhit - 1].id) == 0) { cur = i; break; }
+                            }
+                            snprintf(s_msg_sel_id, sizeof(s_msg_sel_id), "%s", msgs[cur].id);
+                            s_msg_sel_follow = true;
+                        }
+                        store_unlock();
+                    }
+                }
+                if (pressed & SCE_CTRL_TRIANGLE) compose_message();
+                if (pressed & SCE_CTRL_SQUARE)   handle_square_shortcut();
+                if ((pressed & SCE_CTRL_SELECT) && voice_active()) voice_toggle_mute();
+                if ((pressed & SCE_CTRL_START)  && voice_active()) voice_leave();
+                return;
+            }
+        }
     }
 
     if (!s_channels_collapsed && !s_msg_sel_id[0]) {
         if (pressed & SCE_CTRL_UP)   { if (s_chan_sel > 0) s_chan_sel--; }
         if (pressed & SCE_CTRL_DOWN) { if (s_chan_sel < s_sel_count - 1) s_chan_sel++; }
+    }
+    if (s_msg_sel_id[0] && (pressed & SCE_CTRL_RIGHT) &&
+        !s_members_collapsed && s_member_w > 0) {
+        if (s_guild < 0) {
+            store_lock();
+            int fc = 0;
+            store_friends(&fc);
+            store_unlock();
+            if (fc > 0) {
+                if (s_member_sel < 0 || s_member_sel >= fc) s_member_sel = 0;
+                s_msg_sel_id[0] = '\0';
+                s_member_focus = true;
+                member_scroll_to_row(s_member_sel);
+                return;
+            }
+        } else {
+            store_lock();
+            int mc = 0;
+            member_row *rows = store_members(&mc);
+            int idx = -1;
+            if (strcmp(store_members_guild(), s_cur_guild_id) == 0 && mc > 0) {
+                if (s_member_sel >= 0 && s_member_sel < mc && !rows[s_member_sel].is_group) {
+                    idx = s_member_sel;
+                } else {
+                    for (int i = 0; i < mc; i++) {
+                        if (!rows[i].is_group) { idx = i; break; }
+                    }
+                }
+            }
+            store_unlock();
+            if (idx >= 0) {
+                s_msg_sel_id[0] = '\0';
+                s_member_focus = true;
+                s_member_sel = idx;
+                member_scroll_to_row(s_member_sel);
+                return;
+            }
+        }
     }
     if ((pressed & SCE_CTRL_RIGHT) && !s_msg_sel_id[0] && s_have_open && !s_forum_view) {
         store_lock();
@@ -2278,8 +2643,9 @@ void browser_input(unsigned pressed, unsigned held, int ly, int ry)
         }
     }
     if (pressed & SCE_CTRL_TRIANGLE) compose_message();
-    if ((pressed & SCE_CTRL_SQUARE) && voice_active()) voice_toggle_mute();
-    if ((pressed & SCE_CTRL_SELECT) && voice_active()) voice_toggle_deaf();
+    if (pressed & SCE_CTRL_SQUARE)   handle_square_shortcut();
+    if ((pressed & SCE_CTRL_SELECT) && voice_active()) voice_toggle_mute();
+    if ((pressed & SCE_CTRL_START)  && voice_active()) voice_leave();
 
     // left stick scrolls messages; right stick scrolls member / friends list
     if (ly > 40 || ly < -40) { s_msg_scroll += ly / 12; s_want_unread = false; s_pin_anchor[0] = '\0'; }
@@ -2312,7 +2678,7 @@ void browser_touch(int x, int y, int dy, bool tap)
 {
     // Modal while composing: the inline keyboard owns input; ignore app taps.
     if (s_compose_active) return;
-    if (tap) s_rail_focus = false;
+    if (tap) { s_rail_focus = false; s_member_focus = false; }
 
     bool home = (s_guild < 0);
     g_msg_x = SIDE_X + (s_channels_collapsed ? 0 : SIDE_W);  // channel drawer state
@@ -2496,13 +2862,35 @@ void browser_touch(int x, int y, int dy, bool tap)
         return;
     }
 
-    // Attachment sheet: tap Photo Library / Camera, else dismiss. The picker
-    // dialogs block (drive their own render loop), so run them on this thread.
+    if (s_vrec_open) {
+        int rst = audio_rec_status(NULL, NULL);
+        if (rst == 0) { s_vrec_open = false; return; }
+        if (rst == 1 && tap) {
+            if (x >= s_vrec_cancel_r[0] && x < s_vrec_cancel_r[0] + s_vrec_cancel_r[2] &&
+                y >= s_vrec_cancel_r[1] && y < s_vrec_cancel_r[1] + s_vrec_cancel_r[3]) {
+                audio_rec_stop(0, NULL, NULL, NULL);
+                s_vrec_open = false;
+            } else if (x >= s_vrec_send_r[0] && x < s_vrec_send_r[0] + s_vrec_send_r[2] &&
+                       y >= s_vrec_send_r[1] && y < s_vrec_send_r[1] + s_vrec_send_r[3] &&
+                       s_have_open) {
+                audio_rec_stop(1, s_open_ch.id, s_token, s_cacert[0] ? s_cacert : NULL);
+                s_vrec_open = false;
+            }
+        }
+        return;
+    }
+
+    // Attachment sheet: tap Photo Library / Camera / Voice Message, else dismiss.
     if (s_attach_open) {
         if (tap) {
             #define IN_AR(r) (x>=(r)[0] && x<(r)[0]+(r)[2] && y>=(r)[1] && y<(r)[1]+(r)[3])
             if (IN_AR(s_attach_r[0]))      { s_attach_open = 0; attach_photo();  }
             else if (IN_AR(s_attach_r[1])) { s_attach_open = 0; attach_camera(); }
+            else if (IN_AR(s_attach_r[2])) {
+                s_attach_open = 0;
+                if (!voice_active() && s_have_open && audio_rec_start() == 0)
+                    s_vrec_open = true;
+            }
             else                             s_attach_open = 0;
             #undef IN_AR
         }
@@ -2756,6 +3144,11 @@ void browser_touch(int x, int y, int dy, bool tap)
                     y >= s_vidhit[i].y0 && y < s_vidhit[i].y1) {
                     video_play(s_vidhit[i].url, s_cacert); return;
                 }
+            for (int i = 0; i < s_naudhit; i++)
+                if (x >= s_audhit[i].x0 && x < s_audhit[i].x1 &&
+                    y >= s_audhit[i].y0 && y < s_audhit[i].y1) {
+                    audio_player_toggle(s_audhit[i].id, s_audhit[i].url, s_cacert); return;
+                }
             // Tapping an inline image opens the lightbox at a sharper size.
             for (int i = 0; i < s_nimghit; i++)
                 if (x >= s_imghit[i].x0 && x < s_imghit[i].x1 &&
@@ -2801,7 +3194,8 @@ void browser_touch(int x, int y, int dy, bool tap)
                     toggle_reaction(s_rhit[i].mid, s_rhit[i].emoji, s_rhit[i].me); return;
                 }
             // Tapping the avatar opens the author's profile; tapping the message
-            // body opens the action menu.
+            // body selects the message (attachments/reactions/replies/spoilers
+            // were already handled above).
             for (int i = 0; i < s_nmhit; i++) {
                 msg_hit *hb = &s_mhit[i];
                 if (y < hb->y0 || y >= hb->y1) continue;
@@ -2811,12 +3205,12 @@ void browser_touch(int x, int y, int dy, bool tap)
                 } else if (hb->has_spoiler && !spoiler_shown(hb->id)) {
                     spoiler_reveal(hb->id);  // first tap reveals spoilers
                 } else {
-                    snprintf(s_act_msg, sizeof(s_act_msg), "%s", hb->id);
-                    s_act_own = hb->own;
-                    s_menu = 1; s_menu_sel = 0; s_menu_x = x; s_menu_y = y;
+                    snprintf(s_msg_sel_id, sizeof(s_msg_sel_id), "%s", hb->id);
+                    s_msg_sel_follow = false;
                 }
                 return;
             }
+            s_msg_sel_id[0] = '\0';
             return;
         }
         if (x < RAIL_W) {  // server rail
@@ -2960,7 +3354,7 @@ static void draw_rail(guild *gs, int gcount)
         else if (gunread)      ui_rounded_rect(0, cy - 5, 4, 10, 2, COL_WHITE);
 
         if (s_rail_focus && slot == s_rail_sel_slot)
-            ui_rounded_rect(RAIL_W / 2 - 25, cy - 25, 50, 50, 17, COL_WHITE);
+            ui_rounded_rect(6, cy - 26, RAIL_W - 12, 52, 12, COL_SELECTED);
 
         char url[256] = "";
         if (gs[gi].icon[0])
@@ -2997,7 +3391,7 @@ static void draw_rail(guild *gs, int gcount)
     ui_rect(0, 0, RAIL_W, hy + 34, COL_GUILDBAR);
     if (home_sel) ui_rect(0, hy - 22, 4, 44, COL_WHITE);
     if (s_rail_focus && s_rail_sel_slot < 0)
-        ui_rounded_rect(RAIL_W / 2 - 25, hy - 25, 50, 50, 17, COL_WHITE);
+        ui_rounded_rect(6, hy - 26, RAIL_W - 12, 52, 12, COL_SELECTED);
     ui_rounded_rect(RAIL_W / 2 - 22, hy - 22, 44, 44, home_sel ? 15 : 22,
                     home_sel ? COL_BLURPLE : COL_ELEVATED);
     ui_text_bold(RAIL_W / 2 - aw / 2, hy - 12, FS_HEADER, COL_WHITE, "@");
@@ -3096,11 +3490,13 @@ static void draw_sidebar(guild *g, bool home)
                              spk ? COL_TEXT_BRIGHT : COL_TEXT, row->vm.name, avail);
         } else {
             bool sel = (s_chan_sel < s_sel_count && s_selectable[s_chan_sel] == r);
+            bool chan_focus = (!s_rail_focus && !s_msg_sel_id[0] && !s_member_focus);
             bool unread = row->ch->unread;
             int  mentions = row->ch->mentions;
-            if (sel) ui_rounded_rect(SIDE_X + 6, y - 2, SIDE_W - 12, rowh - 2, 6, COL_SELECTED);
+            if (sel && chan_focus)
+                ui_rounded_rect(SIDE_X + 6, y - 2, SIDE_W - 12, rowh - 2, 6, COL_SELECTED);
             // unread pill on the far left
-            if (unread && !sel)
+            if (unread && !(sel && chan_focus))
                 ui_rounded_rect(SIDE_X + 2, y + rowh / 2 - 5, 4, 8, 2, COL_WHITE);
             unsigned col = (sel || unread) ? COL_TEXT_BRIGHT : COL_TEXT_MUTED;
 
@@ -3559,6 +3955,76 @@ static void human_size(long long b, char *out, size_t cap)
     else                     snprintf(out, cap, "%lld B", b);
 }
 
+// A voice message / Ogg Opus audio attachment card with play/stop + progress bar.
+static void draw_message_audio(int x, int y, const message *m, int tw)
+{
+    int cw = tw < 320 ? tw : 320, ch = 52;
+    ui_rounded_rect(x, y, cw, ch, 8, COL_SIDEBAR);
+
+    int pos_ms = 0, dur_ms = m->audio_secs * 1000;
+    int st = audio_player_status(m->id, &pos_ms, &dur_ms);
+    if (dur_ms <= 0 && m->audio_secs > 0) dur_ms = m->audio_secs * 1000;
+
+    // Circular play / stop button on the left.
+    int bx = x + 26, by = y + ch / 2;
+    vita2d_draw_fill_circle((float)bx, (float)by, 15.0f, COL_BLURPLE);
+    if (st == 2) {
+        ui_rect(bx - 5, by - 5, 10, 10, COL_WHITE);  // stop square
+    } else if (st == 1) {
+        ui_text_bold(bx - 6, by - 10, FS_SMALL, COL_WHITE, "...");
+    } else {
+        for (int dy = -6; dy <= 6; dy++) {
+            int w = 10 - (dy < 0 ? -dy : dy) * 10 / 6;
+            if (w > 0) ui_rect(bx - 4, by + dy, w, 1, COL_WHITE);
+        }
+    }
+
+    // Waveform bars (if decoded from Discord's waveform field) or progress bar.
+    int bar_x = x + 52, bar_w = cw - 66;
+    if (m->audio_wave_n > 0) {
+        int nb = m->audio_wave_n;
+        int step = bar_w / nb;
+        if (step < 3) step = 3;
+        int bw = step > 4 ? step - 2 : 2;
+        int base_y = y + 26;
+        for (int b = 0; b < nb && b * step + bw <= bar_w; b++) {
+            int bh = 3 + ((int)m->audio_wave[b] * 17) / 255;
+            bool played = (st == 2 && dur_ms > 0 && ((long long)(b + 1) * dur_ms / nb) <= pos_ms);
+            ui_rounded_rect(bar_x + b * step, base_y - bh, bw, bh, 1,
+                            played ? COL_BLURPLE : COL_TEXT_MUTED);
+        }
+    } else {
+        int bar_y = y + 18;
+        ui_rounded_rect(bar_x, bar_y, bar_w, 6, 3, COL_ELEVATED);
+        if (st == 2 && dur_ms > 0) {
+            int fw = (int)((long long)bar_w * pos_ms / dur_ms);
+            if (fw > bar_w) fw = bar_w;
+            if (fw > 0) ui_rounded_rect(bar_x, bar_y, fw, 6, 3, COL_BLURPLE);
+        }
+    }
+
+    char lbl[96];
+    if (st == 1) {
+        snprintf(lbl, sizeof(lbl), "Loading audio...");
+    } else if (st == 2) {
+        int ps = pos_ms / 1000, ds = dur_ms / 1000;
+        if (ds > 0) snprintf(lbl, sizeof(lbl), "%d:%02d / %d:%02d", ps / 60, ps % 60, ds / 60, ds % 60);
+        else        snprintf(lbl, sizeof(lbl), "%d:%02d", ps / 60, ps % 60);
+    } else if (m->audio_secs > 0) {
+        snprintf(lbl, sizeof(lbl), "Voice message (%d:%02d)", m->audio_secs / 60, m->audio_secs % 60);
+    } else {
+        snprintf(lbl, sizeof(lbl), "%s", m->file_name[0] ? m->file_name : "Voice message");
+    }
+    ui_text_clip(bar_x, y + 30, FS_TINY, COL_TEXT_MUTED, lbl, bar_w);
+
+    if (m->audio_url[0] && s_naudhit < 16) {
+        aud_hit *ah = &s_audhit[s_naudhit++];
+        ah->x0 = x; ah->y0 = y; ah->x1 = x + cw; ah->y1 = y + ch;
+        snprintf(ah->id, sizeof(ah->id), "%s", m->id);
+        snprintf(ah->url, sizeof(ah->url), "%s", m->audio_url);
+    }
+}
+
 // A non-image attachment shown as a Discord-style file card.
 static void draw_message_file(int x, int y, const message *m, int tw)
 {
@@ -3879,6 +4345,7 @@ static void draw_friends_panel(void)
     if (s_member_scroll > s_member_max) s_member_scroll = s_member_max;
     if (s_member_scroll < 0) s_member_scroll = 0;
     int y = top - s_member_scroll;
+    int vis_idx = 0;
     for (int pass = 0; pass < 2; pass++) {  // 0 = online, 1 = offline
         for (int i = 0; i < fc; i++) {
             int st = store_member_status(fr[i].id);
@@ -3886,17 +4353,22 @@ static void draw_friends_panel(void)
             if ((pass == 0) == offline) continue;  // pass 0 skips offline; pass 1 skips online
             member_row *r = &fr[i];
             if (y + 28 > TOPBAR_H && y < SCREEN_H) {
+                bool sel = (s_member_focus && vis_idx == s_member_sel);
+                if (sel) ui_rounded_rect(x0 + 6, y - 2, MEMBER_W - 12, 26, 6, COL_SELECTED);
                 char url[256] = "";
                 if (r->avatar[0] && r->id[0])
                     snprintf(url, sizeof(url),
                              "https://cdn.discordapp.com/avatars/%s/%s.png?size=64",
                              r->id, r->avatar);
                 draw_avatar(x0 + 20, y + 12, 12, url, r->text, COL_BLURPLE);
-                draw_status_dot(x0 + 29, y + 21, offline ? 0 : st, COL_SIDEBAR);
+                draw_status_dot(x0 + 29, y + 21, offline ? 0 : st,
+                                sel ? COL_SELECTED : COL_SIDEBAR);
                 ui_text_clip(x0 + 40, y + 4, FS_SMALL,
-                             offline ? COL_TEXT_MUTED : COL_TEXT, r->text, MEMBER_W - 50);
+                             sel ? COL_TEXT_BRIGHT : (offline ? COL_TEXT_MUTED : COL_TEXT),
+                             r->text, MEMBER_W - 50);
             }
             y += 28;
+            vis_idx++;
         }
     }
     store_unlock();
@@ -3909,6 +4381,7 @@ static void draw_friends_panel(void)
     char hdr[40]; snprintf(hdr, sizeof(hdr), "FRIENDS \xE2\x80\x94 %d online", online);
     ui_text_bold(x0 + 14, 14, FS_TINY, COL_TEXT_MUTED, fc ? hdr : "FRIENDS");
     ui_rect(x0, TOPBAR_H, MEMBER_W, 1, COL_GUILDBAR);
+    ui_rect(x0, 0, 1, SCREEN_H, COL_GUILDBAR);
 }
 
 // Right-side member list (guild view only).
@@ -3926,9 +4399,11 @@ static void draw_members(void)
     if (stale) mc = 0;
     // Large/restricted servers never return a member list (Discord ignores op14).
     // Time the wait to show a message instead of a forever "loading".
-    static char s_ml_g[24]; static long long s_ml_since; static bool s_ml_retried;
-    if (strcmp(s_ml_g, s_cur_guild_id) != 0) {
+    static char s_ml_g[24], s_ml_c[24]; static long long s_ml_since; static bool s_ml_retried;
+    if (strcmp(s_ml_g, s_cur_guild_id) != 0 ||
+        (stale && s_have_open && strcmp(s_ml_c, s_open_ch.id) != 0)) {
         snprintf(s_ml_g, sizeof(s_ml_g), "%s", s_cur_guild_id);
+        snprintf(s_ml_c, sizeof(s_ml_c), "%s", s_have_open ? s_open_ch.id : "");
         s_ml_since = now_ms();
         s_ml_retried = false;
     }
@@ -3958,6 +4433,8 @@ static void draw_members(void)
                 snprintf(gh, sizeof(gh), "%s \xE2\x80\x94 %d", r->text, r->count);
                 ui_text_bold(x0 + 14, y + 8, FS_TINY, COL_TEXT_MUTED, gh);
             } else {
+                bool sel = (s_member_focus && i == s_member_sel);
+                if (sel) ui_rounded_rect(x0 + 6, y - 2, MEMBER_W - 12, 26, 6, COL_SELECTED);
                 bool offline = (r->status == 0);
                 char url[256] = "";
                 if (r->avatar[0] && r->id[0])
@@ -3965,9 +4442,10 @@ static void draw_members(void)
                              "https://cdn.discordapp.com/avatars/%s/%s.png?size=64",
                              r->id, r->avatar);
                 draw_avatar(x0 + 20, y + 12, 12, url, r->text, COL_BLURPLE);
-                draw_status_dot(x0 + 29, y + 21, r->status, COL_SIDEBAR);
+                draw_status_dot(x0 + 29, y + 21, r->status, sel ? COL_SELECTED : COL_SIDEBAR);
                 ui_text_clip(x0 + 40, y + 4, FS_SMALL,
-                             offline ? COL_TEXT_MUTED : COL_TEXT, r->text, MEMBER_W - 50);
+                             sel ? COL_TEXT_BRIGHT : (offline ? COL_TEXT_MUTED : COL_TEXT),
+                             r->text, MEMBER_W - 50);
             }
         }
         y += 28;
@@ -3986,6 +4464,7 @@ static void draw_members(void)
     char hdr[32]; snprintf(hdr, sizeof(hdr), "MEMBERS \xE2\x80\x94 %d", members);
     ui_text_bold(x0 + 14, 14, FS_TINY, COL_TEXT_MUTED, mc ? hdr : "MEMBERS");
     ui_rect(x0, TOPBAR_H, MEMBER_W, 1, COL_GUILDBAR);
+    ui_rect(x0, 0, 1, SCREEN_H, COL_GUILDBAR);
 }
 
 // The channel top bar, drawn after the messages so it sits on top of anything
@@ -4191,7 +4670,8 @@ static void draw_messages(void)
     // (embed/attachment-only). Consecutive same-author normals share one header.
     #define MSG_IS_SYSTEM(m) ((m).type == 7 || \
         ((m).content[0] == '\0' && !(m).has_image && !(m).has_file && \
-         !(m).has_embed && !(m).has_poll && !(m).has_video && !(m).has_invite))
+         !(m).has_embed && !(m).has_poll && !(m).has_video && \
+         !(m).has_audio && !(m).has_invite))
 
     // Block heights cached; recomputed only when the message set changes.
     static int      s_bh[MAX_MESSAGES];
@@ -4228,6 +4708,7 @@ static void draw_messages(void)
             else if (msgs[i].has_image || msgs[i].has_video) {
                 int dw, dh; image_dims(&msgs[i], tw, &dw, &dh); imgh = dh + 8; }
             if (msgs[i].has_file) imgh += 60;
+            if (msgs[i].has_audio) imgh += 60;
             if (msgs[i].has_invite) imgh += INV_TILE_H + 8;
             if (msgs[i].has_poll) imgh += poll_height(&msgs[i], tw) + 8;
             if (msgs[i].reaction_count)
@@ -4307,7 +4788,7 @@ static void draw_messages(void)
     int y = pane_top - s_msg_scroll;
     const char *pa = "";
     const char *me = store_me_id();
-    s_nmhit = 0; s_nphit = 0; s_nrhit = 0; s_nimghit = 0; s_nrephit = 0; s_ninvhit = 0; s_nvidhit = 0;
+    s_nmhit = 0; s_nphit = 0; s_nrhit = 0; s_nimghit = 0; s_nrephit = 0; s_ninvhit = 0; s_nvidhit = 0; s_naudhit = 0;
     for (int i = 0; i < mc; i++) {
         bool blk = store_is_blocked(msgs[i].author_id);
         bool sys = MSG_IS_SYSTEM(msgs[i]) || blk;
@@ -4380,6 +4861,8 @@ static void draw_messages(void)
                 }
                 if (msgs[i].has_file) { draw_message_file(txt_x, cy + 4, &msgs[i], tw);
                                         cy += 60; }
+                if (msgs[i].has_audio) { draw_message_audio(txt_x, cy + 4, &msgs[i], tw);
+                                         cy += 60; }
                 if (msgs[i].has_invite) { draw_invite_tile(txt_x, cy + 4, &msgs[i], tw);
                                           cy += INV_TILE_H + 8; }
                 if (msgs[i].has_poll) { draw_poll(txt_x, cy + 4, &msgs[i], tw);
@@ -4460,6 +4943,8 @@ static void draw_messages(void)
                 }
                 if (msgs[i].has_file) { draw_message_file(txt_x, cy + 4, &msgs[i], tw);
                                         cy += 60; }
+                if (msgs[i].has_audio) { draw_message_audio(txt_x, cy + 4, &msgs[i], tw);
+                                         cy += 60; }
                 if (msgs[i].has_invite) { draw_invite_tile(txt_x, cy + 4, &msgs[i], tw);
                                           cy += INV_TILE_H + 8; }
                 if (msgs[i].has_poll) { draw_poll(txt_x, cy + 4, &msgs[i], tw);
@@ -4539,17 +5024,33 @@ static void draw_messages(void)
         bool dm = (c->type == CH_DM || c->type == CH_GROUP_DM);
         char ph[128];
         snprintf(ph, sizeof(ph), "Message %s%s", dm ? "" : "#", c->name);
-        int ph_max = msg_w - 76 - 166;
+        int ph_max = msg_w - 76 - (s_msg_sel_id[0] ? 236 : 166);
         if (ph_max > 24)
             ui_text_clip(g_msg_x + 76, cb_y + 8, FS_BODY, COL_TEXT_MUTED, ph, ph_max);
     }
-    if (s_uploading)
-        ui_text(msg_right - 150, cb_y + 10, FS_SMALL, COL_TEXT_LINK, "Uploading image...");
+    if (s_uploading || audio_rec_status(NULL, NULL) == 2)
+        ui_text(msg_right - 150, cb_y + 10, FS_SMALL, COL_TEXT_LINK, "Uploading...");
     else if (s_msg_sel_id[0]) {
-        int hy = cb_y + 10, hx = msg_right - 166;
-        hx += ui_pad_glyph(hx, hy, FS_SMALL, COL_TEXT_MUTED, UI_PAD_CROSS, "[X]");
+        int hy = cb_y + 10, hx = msg_right - 228, cy = cb_y + cb_h / 2, r = 8;
+        // Match UI_PAD_TRIANGLE's filled circle + dark icon cutout style.
+        float cx = (float)(hx + r);
+        vita2d_draw_fill_circle(cx, (float)cy, (float)r, COL_TEXT_MUTED);
+        vita2d_draw_line(cx - 3.5f, (float)cy - 3.5f, cx + 3.5f, (float)cy + 3.5f, COL_ELEVATED);
+        vita2d_draw_line(cx - 2.5f, (float)cy - 3.5f, cx + 4.5f, (float)cy + 3.5f, COL_ELEVATED);
+        vita2d_draw_line(cx - 3.5f, (float)cy + 3.5f, cx + 3.5f, (float)cy - 3.5f, COL_ELEVATED);
+        vita2d_draw_line(cx - 2.5f, (float)cy + 3.5f, cx + 4.5f, (float)cy - 3.5f, COL_ELEVATED);
+        hx += r * 2 + 2;
         hx += ui_text(hx, hy, FS_SMALL, COL_TEXT_MUTED, " Actions  ");
-        hx += ui_pad_glyph(hx, hy, FS_SMALL, COL_TEXT_MUTED, UI_PAD_CIRCLE, "[O]");
+        float sx = (float)(hx + r);
+        vita2d_draw_fill_circle(sx, (float)cy, (float)r, COL_TEXT_MUTED);
+        ui_rect((int)sx - 3, cy - 3, 7, 7, COL_ELEVATED);
+        hx += r * 2 + 2;
+        hx += ui_text(hx, hy, FS_SMALL, COL_TEXT_MUTED, " Reply  ");
+        float ox = (float)(hx + r);
+        vita2d_draw_fill_circle(ox, (float)cy, (float)r, COL_TEXT_MUTED);
+        vita2d_draw_fill_circle(ox, (float)cy, 4.5f, COL_ELEVATED);
+        vita2d_draw_fill_circle(ox, (float)cy, 2.5f, COL_TEXT_MUTED);
+        hx += r * 2 + 2;
         ui_text(hx, hy, FS_SMALL, COL_TEXT_MUTED, " Cancel");
     } else {
         // "tap or [triangle] to type" -- real PS button glyph from psexchar.pvf,
@@ -4567,8 +5068,30 @@ static void draw_action_menu(void)
 {
     if (!s_menu) return;
     if (s_menu == 1) {
-        const char *items[10]; int n = 0;
+        const char *items[15]; int n = 0;
         #define ADD_ACT(lbl, code) do { items[n] = (lbl); s_menu_acts[n] = (code); n++; } while (0)
+        bool has_aud = false, has_img = false, has_vid = false, has_inv = false, has_rep = false;
+        store_lock();
+        int amc = 0; message *amsgs = store_messages(&amc);
+        for (int i = 0; i < amc; i++) {
+            if (strcmp(amsgs[i].id, s_act_msg) == 0) {
+                has_aud = amsgs[i].has_audio && amsgs[i].audio_url[0];
+                has_img = amsgs[i].has_image && amsgs[i].image_url[0];
+                has_vid = amsgs[i].has_video && amsgs[i].video_url[0];
+                has_inv = amsgs[i].has_invite && amsgs[i].invite_code[0];
+                has_rep = amsgs[i].is_reply && amsgs[i].reply_to_id[0];
+                break;
+            }
+        }
+        store_unlock();
+        if (has_aud) {
+            ADD_ACT(audio_player_status(s_act_msg, NULL, NULL) ? "Stop Audio" : "Play Audio",
+                    ACT_AUDIO);
+        }
+        if (has_img) ADD_ACT("View Image", ACT_IMAGE);
+        if (has_vid) ADD_ACT("Play Video", ACT_VIDEO);
+        if (has_inv) ADD_ACT("Join Invite", ACT_INVITE);
+        if (has_rep) ADD_ACT("Jump to Reply", ACT_JUMP_REPLY);
         ADD_ACT("Add Reaction", ACT_REACT);
         ADD_ACT("Reply", ACT_REPLY);
         ADD_ACT("Create Thread", ACT_THREAD);
@@ -5336,16 +5859,53 @@ static void draw_forward(void)
 
 static void draw_attach_sheet(void)
 {
+    if (s_vrec_open) {
+        int ms = 0, lv = 0;
+        int st = audio_rec_status(&ms, &lv);
+        if (st == 0) { s_vrec_open = false; return; }
+        ui_rect(0, 0, SCREEN_W, SCREEN_H, RGBA8(0, 0, 0, 0xB0));
+        int cw = 320, ch = 152, cx = (SCREEN_W - cw) / 2, cy = (SCREEN_H - ch) / 2;
+        ui_rounded_rect(cx, cy, cw, ch, 12, COL_SIDEBAR);
+        vita2d_draw_fill_circle((float)(cx + 22), (float)(cy + 22), 6.0f, COL_RED);
+        int secs = ms / 1000;
+        char hdr[48];
+        snprintf(hdr, sizeof(hdr), "Recording  %d:%02d / 1:00", secs / 60, secs % 60);
+        ui_text_bold(cx + 36, cy + 12, FS_BODY, COL_TEXT_BRIGHT, hdr);
+
+        // Live mic level meter.
+        int mx = cx + 18, mw = cw - 36, my = cy + 52;
+        ui_rounded_rect(mx, my, mw, 14, 7, COL_ELEVATED);
+        int fw = (mw * lv) / 255;
+        if (fw > 0) ui_rounded_rect(mx, my, fw, 14, 7, COL_BLURPLE);
+
+        int bw = (cw - 44) / 2, by = cy + 92, bh = 40;
+        ui_rounded_rect(cx + 16, by, bw, bh, 8, COL_ELEVATED);
+        ui_text_bold(cx + 16 + bw / 2 - 28, by + 11, FS_BODY, COL_TEXT_BRIGHT, "Cancel");
+        s_vrec_cancel_r[0] = cx + 16; s_vrec_cancel_r[1] = by;
+        s_vrec_cancel_r[2] = bw; s_vrec_cancel_r[3] = bh;
+
+        ui_rounded_rect(cx + 28 + bw, by, bw, bh, 8, COL_BLURPLE);
+        ui_text_bold(cx + 28 + bw + bw / 2 - 20, by + 11, FS_BODY, COL_WHITE, "Send");
+        s_vrec_send_r[0] = cx + 28 + bw; s_vrec_send_r[1] = by;
+        s_vrec_send_r[2] = bw; s_vrec_send_r[3] = bh;
+        return;
+    }
     if (!s_attach_open) return;
     ui_rect(0, 0, SCREEN_W, SCREEN_H, RGBA8(0, 0, 0, 0xB0));
-    int cw = 300, ch = 150, cx = (SCREEN_W - cw) / 2, cy = (SCREEN_H - ch) / 2;
+    int cw = 300, ch = 198, cx = (SCREEN_W - cw) / 2, cy = (SCREEN_H - ch) / 2;
     ui_rounded_rect(cx, cy, cw, ch, 12, COL_SIDEBAR);
     ui_text_bold(cx + 16, cy + 12, FS_BODY, COL_TEXT_BRIGHT, "Add attachment");
-    const char *labels[2] = { "\xF0\x9F\x96\xBC  Photo Library", "\xF0\x9F\x93\xB7  Camera" };
-    for (int i = 0; i < 2; i++) {
+    const char *labels[3] = {
+        "\xF0\x9F\x96\xBC  Photo Library",
+        "\xF0\x9F\x93\xB7  Camera",
+        voice_active() ? "\xF0\x9F\x8E\xA4  Voice Message (leave call first)"
+                       : "\xF0\x9F\x8E\xA4  Voice Message"
+    };
+    for (int i = 0; i < 3; i++) {
         int bx = cx + 16, by = cy + 44 + i * 48, bw = cw - 32, bh = 40;
-        ui_rounded_rect(bx, by, bw, bh, 8, COL_ELEVATED);
-        ui_text(bx + 14, by + 11, FS_BODY, COL_TEXT_BRIGHT, labels[i]);
+        ui_rounded_rect(bx, by, bw, bh, 8, (i == s_attach_sel) ? COL_SELECTED : COL_ELEVATED);
+        unsigned col = (i == 2 && voice_active()) ? COL_TEXT_MUTED : COL_TEXT_BRIGHT;
+        ui_text_clip(bx + 14, by + 11, FS_BODY, col, labels[i], bw - 28);
         s_attach_r[i][0] = bx; s_attach_r[i][1] = by; s_attach_r[i][2] = bw; s_attach_r[i][3] = bh;
     }
 }

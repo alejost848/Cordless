@@ -30,7 +30,7 @@ int  voice_audio_is_deafened(void);
 int  voice_audio_is_tx_speaking(void);
 int  voice_audio_ssrc_speaking(unsigned ssrc);
 unsigned voice_audio_speaking_mask(void);
-void voice_audio_play_cue(int kind);  // 0 = connect chime, 1 = mute/deafen blip
+void voice_audio_play_cue(int kind);  // 0 = connect chime, 1 = mute, 2 = unmute
 
 #if VOICE_DAVE_ENABLE
 // DAVE inner-layer key resolvers registered by voice.c (NULL restores passthrough).

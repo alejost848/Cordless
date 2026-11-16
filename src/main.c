@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <math.h>
 
 #include <vita2d.h>
 #include <psp2/ctrl.h>
@@ -205,24 +206,44 @@ static const char *ra_status(ra_state st)
     }
 }
 
-// Loading screen: wordmark, animated dot ring, status line.
+// Loading screen: centered Vita-Clyde mark, status text below, Windows 11-style
+// breathing arc spinner at the bottom.
 static void draw_loading(const char *msg, int frame)
 {
-    int cx = SCREEN_W / 2, cy = SCREEN_H / 2 - 10;
-    int tw = ui_text_bold_w(FS_TITLE, "Cordless");
-    ui_text_bold(cx - tw / 2, cy - 66, FS_TITLE, COL_TEXT_BRIGHT, "Cordless");
-    // spinner: 8 dots on a circle, brightness trailing a rotating head
-    static const int ox[8] = { 18, 13, 0, -13, -18, -13, 0, 13 };
-    static const int oy[8] = { 0, 13, 18, 13, 0, -13, -18, -13 };
-    int head = (frame / 5) % 8;
-    for (int i = 0; i < 8; i++) {
-        int dist = (head - i + 8) % 8;
-        int b = 255 - dist * 26; if (b < 45) b = 45;
-        vita2d_draw_fill_circle(cx + ox[i], cy + oy[i], 4, RGBA8(0x58, 0x65, 0xf2, b));
+    static vita2d_texture *s_mark;
+    static int s_mark_tried;
+    if (!s_mark_tried) {
+        s_mark_tried = 1;
+        s_mark = vita2d_load_PNG_file("app0:/data/vita_clyde_mark.png");
+    }
+    int cx = SCREEN_W / 2, cy = SCREEN_H / 2 - 28;
+    if (s_mark) {
+        float tw = (float)vita2d_texture_get_width(s_mark);
+        float th = (float)vita2d_texture_get_height(s_mark);
+        if (tw < 1.0f) tw = 1.0f;
+        float sc = 140.0f / tw;
+        float dw = 140.0f, dh = th * sc;
+        vita2d_draw_texture_scale(s_mark, (float)cx - dw * 0.5f, (float)cy - dh * 0.5f, sc, sc);
+    } else {
+        int tw = ui_text_bold_w(FS_TITLE, "Cordless");
+        ui_text_bold(cx - tw / 2, cy - 18, FS_TITLE, COL_TEXT_BRIGHT, "Cordless");
     }
     if (msg && msg[0]) {
         int mw = ui_text_w(FS_BODY, msg);
-        ui_text(cx - mw / 2, cy + 52, FS_BODY, COL_TEXT_MUTED, msg);
+        ui_text(cx - mw / 2, cy + 62, FS_BODY, COL_TEXT_MUTED, msg);
+    }
+    // Windows 11-style progress ring at the bottom: rotating, breathing arc.
+    float t = (float)frame / 60.0f;
+    float base = t * 4.4f;
+    float sweep = 1.6f + 1.15f * sinf(t * 2.4f);  // ~26 deg .. ~158 deg.. ~260 deg
+    float head = base + 0.8f * (1.0f - cosf(t * 2.4f));
+    float sx = (float)cx, sy = (float)(SCREEN_H - 72);
+    const float rad = 14.0f;
+    const int steps = 40;
+    unsigned col = RGBA8(0x58, 0x65, 0xf2, 0xFF);
+    for (int i = 0; i <= steps; i++) {
+        float a = head + sweep * ((float)i / (float)steps);
+        vita2d_draw_fill_circle(sx + cosf(a) * rad, sy + sinf(a) * rad, 1.8f, col);
     }
 }
 
@@ -515,6 +536,11 @@ int main(void)
             validate_token();
             continue;
         }
+
+        // Keep the Vita from auto-suspending during an active voice call (screen
+        // can still dim normally; Power button still sleeps manually).
+        if ((frame % 60) == 0 && voice_active())
+            sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
 
         // Idle skip: redraw home only on input, change, or animation.
         if (g_state == ST_HOME && store_ready()) {

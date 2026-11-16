@@ -1,5 +1,6 @@
 #include "api/discord.h"
 #include "util/b64.h"
+#include "util/b64.h"
 #include "model/store.h"
 #include "model/settings.h"  // g_settings.clock_24h for timestamp formatting
 #include "net_common.h"
@@ -398,17 +399,47 @@ void discord_json_to_message(json_t *m, message *out)
                     snprintf(out->image_url, sizeof(out->image_url),
                              "%s%cwidth=%d&height=%d&format=png", purl,
                              strchr(purl, '?') ? '&' : '?', rw, rh);
-            } else if (fn) {  // non-image -> a file attachment
-                out->has_file = true;
-                snprintf(out->file_name, sizeof(out->file_name), "%s", fn);
-                out->file_size = (long long)json_integer_value(json_object_get(a0, "size"));
+            } else {
+                // Voice message / Ogg Opus audio attachment.
+                bool aud = (json_object_get(a0, "duration_secs") != NULL) ||
+                           (ct && (strncmp(ct, "audio/ogg", 9) == 0 ||
+                                   strncmp(ct, "audio/opus", 10) == 0));
+                if (!aud && fn) {
+                    const char *e = strrchr(fn, '.');
+                    aud = e && (!strcasecmp(e, ".ogg") || !strcasecmp(e, ".opus"));
+                }
+                if (aud && (url || purl)) {
+                    out->has_audio = true;
+                    snprintf(out->audio_url, sizeof(out->audio_url), "%s", url ? url : purl);
+                    double ds = json_number_value(json_object_get(a0, "duration_secs"));
+                    out->audio_secs = ds > 0.0 ? (int)(ds + 0.5) : 0;
+                    const char *wf = json_string_value(json_object_get(a0, "waveform"));
+                    if (wf && wf[0]) {
+                        unsigned char raw[256];
+                        int wn = b64_decode(wf, raw, sizeof(raw));
+                        if (wn > 0) {
+                            int nb = wn < 32 ? wn : 32;
+                            for (int b = 0; b < nb; b++) {
+                                int idx = (b * wn) / nb;
+                                out->audio_wave[b] = raw[idx];
+                            }
+                            out->audio_wave_n = nb;
+                        }
+                    }
+                    if (fn) snprintf(out->file_name, sizeof(out->file_name), "%s", fn);
+                    out->file_size = (long long)json_integer_value(json_object_get(a0, "size"));
+                } else if (fn) {  // non-image -> a file attachment
+                    out->has_file = true;
+                    snprintf(out->file_name, sizeof(out->file_name), "%s", fn);
+                    out->file_size = (long long)json_integer_value(json_object_get(a0, "size"));
+                }
             }
         }
     }
 
     // Stickers arrive as sticker_items (id + format_type). PNG(1)/APNG(2) -> .png,
     // GIF(4) -> .gif; Lottie(3) is vector we can't decode (skipped).
-    if (!out->has_image && !out->has_file) {
+    if (!out->has_image && !out->has_file && !out->has_video && !out->has_audio) {
         json_t *stk = json_object_get(m, "sticker_items");
         if (json_is_array(stk) && json_array_size(stk) >= 1) {
             json_t *s0 = json_array_get(stk, 0);
@@ -1355,25 +1386,24 @@ int discord_send_message(const char *channel_id, const char *content,
 
 // Multipart upload: POST data/len as attachment filename with optional text
 // content.
-static int post_multipart(const char *channel_id, const char *content,
-                          const void *data, size_t len, const char *filename,
-                          const char *token, const char *cacert_path)
+static int post_multipart_ex(const char *channel_id, const char *payload_json,
+                             const void *data, size_t len, const char *filename,
+                             const char *file_ct, const char *token,
+                             const char *cacert_path)
 {
     char url[128];
     snprintf(url, sizeof(url), DISCORD_API_BASE "/channels/%s/messages", channel_id);
 
     static const char BND[] = "----CordlessBoundaryZ29vZEJvdW5kYXJ5";
-    json_t *pl = json_pack("{s:s}", "content", content ? content : "");
-    char *pls = json_dumps(pl, JSON_COMPACT);
-    json_decref(pl);
-    if (!pls) return -1;
+    if (!payload_json || !payload_json[0]) return -1;
     if (!filename || !filename[0]) filename = "file.bin";
+    if (!file_ct || !file_ct[0]) file_ct = "application/octet-stream";
 
     // Assemble the multipart body: payload_json part, file part header, raw
     // bytes, closing boundary.
-    size_t prelen_cap = strlen(pls) + strlen(filename) + sizeof(BND) * 2 + 256;
+    size_t prelen_cap = strlen(payload_json) + strlen(filename) + strlen(file_ct) + sizeof(BND) * 2 + 256;
     char *pre = malloc(prelen_cap);
-    if (!pre) { free(pls); return -1; }
+    if (!pre) return -1;
     int prelen = snprintf(pre, prelen_cap,
         "--%s\r\n"
         "Content-Disposition: form-data; name=\"payload_json\"\r\n"
@@ -1381,9 +1411,8 @@ static int post_multipart(const char *channel_id, const char *content,
         "%s\r\n"
         "--%s\r\n"
         "Content-Disposition: form-data; name=\"files[0]\"; filename=\"%s\"\r\n"
-        "Content-Type: application/octet-stream\r\n\r\n",
-        BND, pls, BND, filename);
-    free(pls);
+        "Content-Type: %s\r\n\r\n",
+        BND, payload_json, BND, filename, file_ct);
     char post[64];
     int postlen = snprintf(post, sizeof(post), "\r\n--%s--\r\n", BND);
     if (prelen <= 0 || postlen <= 0) { free(pre); return -1; }
@@ -1412,6 +1441,20 @@ static int post_multipart(const char *channel_id, const char *content,
     free(bodybuf);
     if (r != 0) console_logf("[api] upload transport err");
     return (int)code;
+}
+
+static int post_multipart(const char *channel_id, const char *content,
+                          const void *data, size_t len, const char *filename,
+                          const char *token, const char *cacert_path)
+{
+    json_t *pl = json_pack("{s:s}", "content", content ? content : "");
+    char *pls = json_dumps(pl, JSON_COMPACT);
+    json_decref(pl);
+    if (!pls) return -1;
+    int code = post_multipart_ex(channel_id, pls, data, len, filename,
+                                 "application/octet-stream", token, cacert_path);
+    free(pls);
+    return code;
 }
 
 int discord_send_file(const char *channel_id, const char *content,
@@ -1449,6 +1492,28 @@ int discord_send_bytes(const char *channel_id, const char *content,
     return post_multipart(channel_id, content, data, (size_t)len,
                           filename && filename[0] ? filename : "upload.bin",
                           token, cacert_path);
+}
+
+int discord_send_voice_message(const char *channel_id, const void *ogg_data, int ogg_len,
+                               double duration_secs, const char *waveform_b64,
+                               const char *token, const char *cacert_path)
+{
+    if (!channel_id || !channel_id[0] || !ogg_data || ogg_len <= 0) return -1;
+    json_t *att = json_pack("{s:s, s:s, s:f, s:s}",
+                            "id", "0",
+                            "filename", "voice-message.ogg",
+                            "duration_secs", duration_secs > 0.1 ? duration_secs : 0.1,
+                            "waveform", waveform_b64 ? waveform_b64 : "");
+    json_t *pl = json_pack("{s:i, s:[O]}", "flags", 8192, "attachments", att);
+    json_decref(att);
+    char *pls = json_dumps(pl, JSON_COMPACT);
+    json_decref(pl);
+    if (!pls) return -1;
+    int code = post_multipart_ex(channel_id, pls, ogg_data, (size_t)ogg_len,
+                                 "voice-message.ogg", "audio/ogg",
+                                 token, cacert_path);
+    free(pls);
+    return code;
 }
 
 int discord_ring_call(const char *channel_id, const char *token,

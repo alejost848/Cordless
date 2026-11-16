@@ -8,12 +8,18 @@
 
 #include <vita2d.h>
 #include <psp2/kernel/processmgr.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
 
 static vita2d_texture *s_emoji_atlas;
 
 static char s_reg_path[256], s_semi_path[256];
 static vita2d_font *s_base_reg, *s_base_semi;
 static vita2d_pvf  *s_pad_pvf;
+static vita2d_pgf  *s_sys_pgf;
+static float        s_pgf_h1;
+static FT_Library   s_ft_lib;
+static FT_Face      s_ft_face;
 
 #define FONT_MAX_SLOTS 32
 static struct { int size; bool bold; vita2d_font *f; } s_fslots[FONT_MAX_SLOTS];
@@ -53,8 +59,17 @@ bool ui_init(const char *regular_ttf, const char *semibold_ttf,
     if (!s_base_semi) s_base_semi = s_base_reg;
     if (emoji_atlas_png)
         s_emoji_atlas = vita2d_load_PNG_file(emoji_atlas_png);
-    // System font with the PS button glyphs.
+    // System font with the PS button glyphs + full-Unicode PGF fallback.
     s_pad_pvf = vita2d_load_custom_pvf("sa0:data/font/pvf/psexchar.pvf");
+    s_sys_pgf = vita2d_load_default_pgf();
+    if (s_sys_pgf) {
+        int h = vita2d_pgf_text_height(s_sys_pgf, 1.0f, "A");
+        s_pgf_h1 = h > 0 ? (float)h : 16.0f;
+    }
+    if (FT_Init_FreeType(&s_ft_lib) == 0) {
+        if (FT_New_Face(s_ft_lib, s_reg_path, 0, &s_ft_face) != 0)
+            s_ft_face = NULL;
+    }
     // Pre-create a handle per UI text size; rasterization happens in ui_prime_glyphs.
     for (unsigned i = 0; i < sizeof(s_ui_sizes) / sizeof(s_ui_sizes[0]); i++) {
         font_for(s_ui_sizes[i], false);
@@ -93,7 +108,11 @@ void ui_fini(void)
     if (s_base_reg) vita2d_free_font(s_base_reg);
     if (s_emoji_atlas) vita2d_free_texture(s_emoji_atlas);
     if (s_pad_pvf) vita2d_free_pvf(s_pad_pvf);
-    s_base_reg = s_base_semi = NULL; s_emoji_atlas = NULL; s_pad_pvf = NULL;
+    if (s_sys_pgf) vita2d_free_pgf(s_sys_pgf);
+    if (s_ft_face) { FT_Done_Face(s_ft_face); s_ft_face = NULL; }
+    if (s_ft_lib)  { FT_Done_FreeType(s_ft_lib); s_ft_lib = NULL; }
+    s_base_reg = s_base_semi = NULL; s_emoji_atlas = NULL;
+    s_pad_pvf = NULL; s_sys_pgf = NULL;
 }
 
 // Emoji draw from a bundled Twemoji atlas texture (assets/emoji_atlas.png).
@@ -314,7 +333,38 @@ static int draw_mixed(vita2d_font *f, int x, int y, int size, unsigned color,
             cx += adv;
             continue;
         }
+        if (cp == 0xFE0E || cp == 0xFE0F || (cp >= 0x200B && cp <= 0x200D) ||
+            cp == 0x2060 || cp == 0xFEFF) {
+            continue;  // invisible format / variation selector
+        }
+        if (cp >= 0x1D400 && cp <= 0x1D7FF) {
+            // Fold Unicode mathematical styled letters/digits to plain ASCII.
+            unsigned ascii = 0;
+            if (cp <= 0x1D6A3) {
+                unsigned idx = (cp - 0x1D400) % 52;
+                ascii = (idx < 26) ? ('A' + idx) : ('a' + idx - 26);
+            } else if (cp >= 0x1D7CE) {
+                ascii = '0' + (cp - 0x1D7CE) % 10;
+            }
+            if (ascii) {
+                if (rl + 1 < (int)sizeof(run) - 1) run[rl++] = (char)ascii;
+                continue;
+            }
+        }
         int l = (int)(p - start);
+        if (cp >= 0x80 && s_ft_face && s_sys_pgf && FT_Get_Char_Index(s_ft_face, cp) == 0) {
+            if (rl) { run[rl] = '\0';
+                      if (draw) vita2d_font_draw_text(f, cx, y, color, size, run);
+                      cx += vita2d_font_text_width(f, size, run); rl = 0; }
+            char gbuf[8];
+            int gl = l < 7 ? l : 7;
+            memcpy(gbuf, start, (size_t)gl);
+            gbuf[gl] = '\0';
+            float pscale = (s_pgf_h1 > 0.0f) ? ((float)size / s_pgf_h1) * 0.9f : 1.0f;
+            if (draw) vita2d_pgf_draw_text(s_sys_pgf, cx, y, color, pscale, gbuf);
+            cx += vita2d_pgf_text_width(s_sys_pgf, pscale, gbuf);
+            continue;
+        }
         if (rl + l < (int)sizeof(run) - 1) { memcpy(run + rl, start, l); rl += l; }
     }
     if (rl) { run[rl] = '\0';

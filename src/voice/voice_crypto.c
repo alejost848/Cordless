@@ -86,28 +86,48 @@ static int xchacha_open(const uint8_t key[32], const uint8_t nonce24[24],
     return rc;
 }
 
+typedef struct {
+    int                 valid;
+    uint8_t             key[32];
+    mbedtls_gcm_context gcm;
+} vc_gcm_cache;
+
+static mbedtls_gcm_context *vc_gcm_get(vc_gcm_cache *c, const uint8_t key[32])
+{
+    if (c->valid && memcmp(c->key, key, 32) == 0)
+        return &c->gcm;
+    if (c->valid) {
+        mbedtls_gcm_free(&c->gcm);
+        c->valid = 0;
+    }
+    mbedtls_gcm_init(&c->gcm);
+    if (mbedtls_gcm_setkey(&c->gcm, MBEDTLS_CIPHER_ID_AES, key, 256) != 0) {
+        mbedtls_gcm_free(&c->gcm);
+        return NULL;
+    }
+    memcpy(c->key, key, 32);
+    c->valid = 1;
+    return &c->gcm;
+}
+
 static int aesgcm_seal(const uint8_t key[32], const uint8_t iv[12],
                        const uint8_t *aad, size_t aadn,
                        const uint8_t *pt, size_t n, uint8_t *ct, uint8_t tag[16])
 {
-    mbedtls_gcm_context g; mbedtls_gcm_init(&g);
-    int rc = mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, key, 256);
-    if (rc == 0)
-        rc = mbedtls_gcm_crypt_and_tag(&g, MBEDTLS_GCM_ENCRYPT, n, iv, 12,
-                                       aad, aadn, pt, ct, 16, tag);
-    mbedtls_gcm_free(&g);
-    return rc;
+    static vc_gcm_cache s_seal_gcm;
+    mbedtls_gcm_context *g = vc_gcm_get(&s_seal_gcm, key);
+    if (!g) return -1;
+    return mbedtls_gcm_crypt_and_tag(g, MBEDTLS_GCM_ENCRYPT, n, iv, 12,
+                                     aad, aadn, pt, ct, 16, tag);
 }
 static int aesgcm_open(const uint8_t key[32], const uint8_t iv[12],
                        const uint8_t *aad, size_t aadn, const uint8_t tag[16],
                        const uint8_t *ct, size_t n, uint8_t *pt)
 {
-    mbedtls_gcm_context g; mbedtls_gcm_init(&g);
-    int rc = mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, key, 256);
-    if (rc == 0)
-        rc = mbedtls_gcm_auth_decrypt(&g, n, iv, 12, aad, aadn, tag, 16, ct, pt);
-    mbedtls_gcm_free(&g);
-    return rc;
+    static vc_gcm_cache s_open_gcm;
+    mbedtls_gcm_context *g = vc_gcm_get(&s_open_gcm, key);
+    if (!g) return -1;
+    return mbedtls_gcm_auth_decrypt(g, n, iv, 12, aad, aadn, tag, 16, ct, pt);
 }
 
 

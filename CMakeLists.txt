@@ -21,7 +21,7 @@ set(VITA_VERSION   "01.00")
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-add_compile_options(-Wall -Wextra -Wno-unused-parameter -O2 -g)
+add_compile_options(-Wall -Wextra -Wno-unused-parameter -O2 -g -ffunction-sections -fdata-sections)
 # Enable RTTI and exceptions; silence psabi notes.
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -frtti -fexceptions -Wno-psabi")
 
@@ -46,6 +46,7 @@ add_executable(${PROJECT_NAME}
   src/tls/ws_client.c
   src/media/mp4.c
   src/media/video_player.c
+  src/media/audio_player.c
   src/util/b64.c
   src/util/clipboard.c
   src/auth/racrypto.c
@@ -71,12 +72,31 @@ add_executable(${PROJECT_NAME}
   src/ui/imagecache.c
   third_party/qrcodegen.c
   third_party/stb_impl.c
+  third_party/speexdsp/preprocess.c
+  third_party/speexdsp/fftwrap.c
+  third_party/speexdsp/kiss_fft.c
+  third_party/speexdsp/kiss_fftr.c
+  third_party/speexdsp/filterbank.c
+  third_party/speexdsp/smallft.c
+)
+
+set_source_files_properties(
+  third_party/speexdsp/preprocess.c
+  third_party/speexdsp/fftwrap.c
+  third_party/speexdsp/kiss_fft.c
+  third_party/speexdsp/kiss_fftr.c
+  third_party/speexdsp/filterbank.c
+  third_party/speexdsp/smallft.c
+  PROPERTIES COMPILE_FLAGS "-DHAVE_CONFIG_H -w"
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
   src
   third_party
+  third_party/speexdsp
+  third_party/speexdsp/include
   third_party/mbedtls/include
+  $ENV{VITASDK}/arm-vita-eabi/include/freetype2
   # vendored mlspp headers plus bytes/tls/hpke helpers
   third_party/mlspp/include
   third_party/mlspp/lib/bytes/include
@@ -111,6 +131,7 @@ endif()
 
 ## Link libraries.
 target_link_libraries(${PROJECT_NAME}
+  -Wl,--gc-sections
   # JSON
   jansson
   # MLS engine for DAVE voice E2EE (mlspp core + mbedTLS HPKE shim).
@@ -150,6 +171,7 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   FILE    sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
   FILE    sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
   FILE    assets/cacert.pem            data/cacert.pem
+  FILE    assets/vita_clyde_mark.png   data/vita_clyde_mark.png
   FILE    assets/fonts/Inter-Regular.ttf   data/fonts/Inter-Regular.ttf
   FILE    assets/fonts/Inter-SemiBold.ttf  data/fonts/Inter-SemiBold.ttf
   FILE    assets/emoji_atlas.png           data/emoji_atlas.png

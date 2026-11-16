@@ -40,14 +40,49 @@ static int uleb128_decode(const uint8_t *p, const uint8_t *limit, uint32_t *out)
 }
 
 // Build the 96-bit GCM nonce: 8 zero bytes then the 32-bit truncated nonce
-// big-endian in the 4 least-significant bytes.
+// little-endian in the 4 trailing bytes (matching libdave's memcpy on LE).
 static void full_nonce(uint32_t trunc, uint8_t iv[12])
 {
     memset(iv, 0, 12);
-    iv[8]  = (uint8_t)(trunc >> 24);
-    iv[9]  = (uint8_t)(trunc >> 16);
-    iv[10] = (uint8_t)(trunc >> 8);
-    iv[11] = (uint8_t)(trunc);
+    iv[8]  = (uint8_t)(trunc);
+    iv[9]  = (uint8_t)(trunc >> 8);
+    iv[10] = (uint8_t)(trunc >> 16);
+    iv[11] = (uint8_t)(trunc >> 24);
+}
+
+// Per-direction AES-128-GCM key-schedule cache (TX and RX run on separate
+// threads, so each direction keeps its own cache with zero lock contention).
+typedef struct {
+    int                 valid;
+    uint8_t             key[16];
+    mbedtls_gcm_context gcm;
+} dave_gcm_slot;
+
+static mbedtls_gcm_context *gcm_cache_get(dave_gcm_slot *slots, int nslots,
+                                          int *next_evict, const uint8_t key[16])
+{
+    for (int i = 0; i < nslots; i++) {
+        if (slots[i].valid && memcmp(slots[i].key, key, 16) == 0)
+            return &slots[i].gcm;
+    }
+    int idx = 0;
+    for (int i = 0; i < nslots; i++) {
+        if (!slots[i].valid) { idx = i; goto init_slot; }
+    }
+    idx = *next_evict;
+    *next_evict = (*next_evict + 1) % nslots;
+    mbedtls_gcm_free(&slots[idx].gcm);
+    slots[idx].valid = 0;
+
+init_slot:
+    mbedtls_gcm_init(&slots[idx].gcm);
+    if (mbedtls_gcm_setkey(&slots[idx].gcm, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
+        mbedtls_gcm_free(&slots[idx].gcm);
+        return NULL;
+    }
+    memcpy(slots[idx].key, key, 16);
+    slots[idx].valid = 1;
+    return &slots[idx].gcm;
 }
 
 int dave_frame_encrypt(const uint8_t key[16], uint32_t nonce,
@@ -62,16 +97,13 @@ int dave_frame_encrypt(const uint8_t key[16], uint32_t nonce,
     // Encrypt the whole Opus frame (no unencrypted ranges); 8-byte tag follows the
     // ciphertext. AAD is empty: the frame layer authenticates only the payload.
     uint8_t tag[DAVE_FRAME_TAG_SIZE];
-    mbedtls_gcm_context gcm;
-    mbedtls_gcm_init(&gcm);
-    if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
-        mbedtls_gcm_free(&gcm);
-        return -1;
-    }
-    int rc = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, len,
+    static dave_gcm_slot s_enc_slot;
+    static int s_enc_evict;
+    mbedtls_gcm_context *gcm = gcm_cache_get(&s_enc_slot, 1, &s_enc_evict, key);
+    if (!gcm) return -1;
+    int rc = mbedtls_gcm_crypt_and_tag(gcm, MBEDTLS_GCM_ENCRYPT, len,
                                        iv, sizeof(iv), NULL, 0,
                                        in, out, DAVE_FRAME_TAG_SIZE, tag);
-    mbedtls_gcm_free(&gcm);
     if (rc != 0) return -1;
 
     size_t pos = len;
@@ -151,16 +183,13 @@ int dave_frame_decrypt(const uint8_t key[16],
     uint8_t iv[12];
     full_nonce(nonce, iv);
 
-    mbedtls_gcm_context gcm;
-    mbedtls_gcm_init(&gcm);
-    if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
-        mbedtls_gcm_free(&gcm);
-        return -1;
-    }
-    int rc = mbedtls_gcm_auth_decrypt(&gcm, cipher_len, iv, sizeof(iv),
+    static dave_gcm_slot s_dec_slots[4];
+    static int s_dec_evict;
+    mbedtls_gcm_context *gcm = gcm_cache_get(s_dec_slots, 4, &s_dec_evict, key);
+    if (!gcm) return -1;
+    int rc = mbedtls_gcm_auth_decrypt(gcm, cipher_len, iv, sizeof(iv),
                                       NULL, 0, tag, DAVE_FRAME_TAG_SIZE,
                                       in, out);
-    mbedtls_gcm_free(&gcm);
     if (rc != 0) return -1;
 
     return (int)cipher_len;

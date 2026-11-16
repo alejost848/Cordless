@@ -1833,6 +1833,7 @@ static int run_connection(bool resuming)
                         store_touch();
                     } else if (t && strcmp(t, "RESUMED") == 0) {
                         console_dbgf("[gw] RESUMED"); s_status = "Connected";
+                        if (s_mem_guild[0] && s_mem_channel[0]) s_want_members = 1;
                         s_made_progress = true;
                     } else if (t && strcmp(t, "VOICE_STATE_UPDATE") == 0) {
                         parse_voice_state_update(d);
@@ -1860,23 +1861,33 @@ static int run_connection(bool resuming)
             last_hb = now_ms(); acked = false;
         }
 
-        if (s_want_members && s_mem_guild[0] && s_mem_channel[0]) {
+        if (s_want_members && store_ready()) {
+            char mg[24] = "", mc[24] = "";
+            store_lock();
+            snprintf(mg, sizeof(mg), "%s", s_mem_guild);
+            snprintf(mc, sizeof(mc), "%s", s_mem_channel);
             s_want_members = 0;
-            json_t *arr = json_array();
-            json_array_append_new(arr, json_pack("[i,i]", 0, 99));
-            json_t *channels = json_object();
-            json_object_set_new(channels, s_mem_channel, arr);
-            json_t *dd = json_pack("{s:s, s:b, s:b, s:b, s:o}",
-                                   "guild_id", s_mem_guild,
-                                   "typing", 1,
-                                   "activities", 1,
-                                   "threads", 1,
-                                   "channels", channels);
-            json_t *p = json_pack("{s:i, s:o}", "op", 14, "d", dd);
-            char *txt = json_dumps(p, JSON_COMPACT);
-            json_decref(p);
-            if (txt) { ws_send(ws, txt); free(txt); }
-            console_dbgf("[gw] op14 member request g=%s", s_mem_guild);
+            store_unlock();
+            if (mg[0] && mc[0]) {
+                json_t *arr = json_array();
+                json_array_append_new(arr, json_pack("[i,i]", 0, 99));
+                json_t *channels = json_object();
+                json_object_set_new(channels, mc, arr);
+                json_t *dd = json_pack("{s:s, s:b, s:b, s:b, s:o}",
+                                       "guild_id", mg,
+                                       "typing", 1,
+                                       "activities", 1,
+                                       "threads", 1,
+                                       "channels", channels);
+                json_t *p = json_pack("{s:i, s:o}", "op", 14, "d", dd);
+                char *txt = json_dumps(p, JSON_COMPACT);
+                json_decref(p);
+                if (txt) {
+                    if (ws_send(ws, txt) < 0) s_want_members = 1;
+                    free(txt);
+                }
+                console_dbgf("[gw] op14 member request g=%s", mg);
+            }
         }
 
         if (s_want_status) {
@@ -1976,9 +1987,11 @@ bool gateway_auth_failed(void) { return s_auth_failed; }
 
 void gateway_request_members(const char *guild_id, const char *channel_id)
 {
+    store_lock();
     snprintf(s_mem_guild, sizeof(s_mem_guild), "%s", guild_id ? guild_id : "");
     snprintf(s_mem_channel, sizeof(s_mem_channel), "%s", channel_id ? channel_id : "");
     s_want_members = 1;
+    store_unlock();
 }
 
 void gateway_set_status(const char *status)
