@@ -151,12 +151,13 @@ void voice_ipc_poll(void) {
 }
 
 int voice_ipc_join(const char *guild_id, const char *channel_id,
-                   const char *token, const char *cacert_path) {
+                   const char *user_id, const char *token, const char *cacert_path) {
     ensure_ur0_cacert(cacert_path);
     json_t *req = json_object();
     json_object_set_new(req, "cmd",        json_string("join"));
     json_object_set_new(req, "guild_id",   json_string(guild_id ? guild_id : ""));
     json_object_set_new(req, "channel_id", json_string(channel_id ? channel_id : ""));
+    json_object_set_new(req, "user_id",    json_string(user_id ? user_id : ""));
     json_object_set_new(req, "token",      json_string(token ? token : ""));
     json_object_set_new(req, "cacert",     json_string(PLUGIN_CACERT_PATH));
     int rc = ipc_rpc(req);

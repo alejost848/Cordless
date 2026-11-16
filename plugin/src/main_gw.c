@@ -33,12 +33,30 @@ static int  s_dirty = 0;
 static char s_me_id[24];
 static char s_sess_id[64];
 
-/* Rolling overlap buffer for zero-alloc streaming scan of large READY frames */
-static char s_scan_tail[512];
-static size_t s_scan_tlen = 0;
-static int s_scan_got_sid = 0;
-static int s_scan_got_uid = 0;
-static int s_scan_is_ready = 0;
+/* Brace-depth aware streaming JSON scanner for large READY frames (0 extra heap) */
+typedef enum {
+    ST_SEEK_KEY = 0,
+    ST_IN_KEY,
+    ST_AFTER_KEY,
+    ST_VAL_STR,
+    ST_VAL_SKIP,
+} scan_state_t;
+
+static struct {
+    int depth;          /* { } nesting depth (1 = root object, 2 = root "d") */
+    int arr_depth;      /* [ ] nesting depth */
+    int esc;
+    int in_str;
+    scan_state_t st;
+    char key[32];
+    size_t klen;
+    char val[80];
+    size_t vlen;
+    int capture;        /* 1 = "t", 2 = "session_id" (depth==2, arr_depth==0), 3 = "id" */
+    int is_ready;
+    int got_sid;
+    int got_uid;
+} s_sc;
 
 static int64_t gw_now_ms(void) {
     SceRtcTick t;
@@ -46,93 +64,123 @@ static int64_t gw_now_ms(void) {
     return (int64_t)(t.tick / 1000);
 }
 
-void main_gw_set_auth(const char *token, const char *cacert) {
+void main_gw_set_auth(const char *token, const char *cacert, const char *user_id) {
     snprintf(s_token, sizeof(s_token), "%s", token ? token : "");
     snprintf(s_cacert, sizeof(s_cacert), "%s",
              (cacert && cacert[0]) ? cacert : "ur0:data/cordless_cacert.pem");
+    if (user_id && user_id[0]) {
+        snprintf(s_me_id, sizeof(s_me_id), "%s", user_id);
+    }
 }
 
-static void extract_quoted_after(const char *hay, size_t hlen, const char *needle,
-                                 char *out, size_t ocap) {
-    size_t nlen = strlen(needle);
-    if (hlen < nlen + 2) return;
-    for (size_t i = 0; i + nlen < hlen; i++) {
-        if (memcmp(hay + i, needle, nlen) == 0) {
-            size_t s = i + nlen;
-            size_t e = s;
-            while (e < hlen && hay[e] != '"' && e - s < ocap - 1) e++;
-            if (e < hlen && hay[e] == '"' && e > s) {
-                memcpy(out, hay + s, e - s);
-                out[e - s] = '\0';
-                return;
-            }
-        }
-    }
+static void scan_reset(void) {
+    memset(&s_sc, 0, sizeof(s_sc));
 }
 
 static void on_large_gw_chunk(const unsigned char *chunk, size_t len, int done, void *ctx) {
     (void)ctx;
     if (done) {
-        if (s_scan_is_ready && (s_sess_id[0] || s_me_id[0])) {
+        if (s_sc.is_ready && (s_sess_id[0] || s_me_id[0])) {
             s_ready = 1;
             if (s_seq < 0) s_seq = 1;
-            console_logf("[maingw] READY (streamed) uid=%s", s_me_id);
+            console_logf("[maingw] READY (streamed) uid=%s sid=%s",
+                         s_me_id, s_sess_id[0] ? "ok" : "none");
         }
-        s_scan_tlen = 0;
-        s_scan_got_sid = 0;
-        s_scan_got_uid = 0;
-        s_scan_is_ready = 0;
+        scan_reset();
         return;
     }
 
-    size_t off = 0;
-    while (off < len) {
-        char win[1024];
-        size_t take = len - off;
-        if (take > sizeof(win) - s_scan_tlen) take = sizeof(win) - s_scan_tlen;
-        if (s_scan_tlen > 0) memcpy(win, s_scan_tail, s_scan_tlen);
-        memcpy(win + s_scan_tlen, chunk + off, take);
-        size_t wlen = s_scan_tlen + take;
+    for (size_t i = 0; i < len; i++) {
+        char c = (char)chunk[i];
 
-        if (!s_scan_is_ready) {
-            for (size_t i = 0; i + 11 <= wlen; i++) {
-                if (memcmp(win + i, "\"t\":\"READY\"", 11) == 0) {
-                    s_scan_is_ready = 1;
-                    break;
-                }
+        if (s_sc.st == ST_IN_KEY) {
+            if (s_sc.esc) { s_sc.esc = 0; continue; }
+            if (c == '\\') { s_sc.esc = 1; continue; }
+            if (c == '"') {
+                s_sc.key[s_sc.klen] = '\0';
+                s_sc.st = ST_AFTER_KEY;
+            } else if (s_sc.klen + 1 < sizeof(s_sc.key)) {
+                s_sc.key[s_sc.klen++] = c;
             }
-        }
-        if (!s_scan_got_sid) {
-            char sid[64] = {0};
-            extract_quoted_after(win, wlen, "\"session_id\":\"", sid, sizeof(sid));
-            if (sid[0]) {
-                snprintf(s_sess_id, sizeof(s_sess_id), "%s", sid);
-                s_scan_got_sid = 1;
-            }
-        }
-        if (!s_scan_got_uid) {
-            /* Match "user":{"id":"<digits>" or "user":{"username":...,"id":"<digits>" */
-            const char *pat = "\"user\":{\"";
-            size_t plen = 9;
-            for (size_t i = 0; i + plen < wlen; i++) {
-                if (memcmp(win + i, pat, plen) == 0) {
-                    size_t sub_len = wlen - i;
-                    if (sub_len > 256) sub_len = 256;
-                    char uid[24] = {0};
-                    extract_quoted_after(win + i, sub_len, "\"id\":\"", uid, sizeof(uid));
-                    if (uid[0]) {
-                        snprintf(s_me_id, sizeof(s_me_id), "%s", uid);
-                        s_scan_got_uid = 1;
-                        break;
-                    }
-                }
-            }
+            continue;
         }
 
-        size_t keep = wlen > 256 ? 256 : wlen;
-        memcpy(s_scan_tail, win + wlen - keep, keep);
-        s_scan_tlen = keep;
-        off += take;
+        if (s_sc.st == ST_VAL_STR) {
+            if (s_sc.esc) { s_sc.esc = 0; continue; }
+            if (c == '\\') { s_sc.esc = 1; continue; }
+            if (c == '"') {
+                s_sc.val[s_sc.vlen] = '\0';
+                if (s_sc.capture == 1 && strcmp(s_sc.val, "READY") == 0) {
+                    s_sc.is_ready = 1;
+                } else if (s_sc.capture == 2 && !s_sc.got_sid && s_sc.val[0]) {
+                    snprintf(s_sess_id, sizeof(s_sess_id), "%.63s", s_sc.val);
+                    s_sc.got_sid = 1;
+                } else if (s_sc.capture == 3 && !s_sc.got_uid && !s_me_id[0] && s_sc.val[0]) {
+                    snprintf(s_me_id, sizeof(s_me_id), "%.23s", s_sc.val);
+                    s_sc.got_uid = 1;
+                }
+                s_sc.capture = 0;
+                s_sc.st = ST_SEEK_KEY;
+            } else if (s_sc.capture && s_sc.vlen + 1 < sizeof(s_sc.val)) {
+                s_sc.val[s_sc.vlen++] = c;
+            }
+            continue;
+        }
+
+        if (s_sc.st == ST_VAL_SKIP) {
+            if (s_sc.in_str) {
+                if (s_sc.esc) s_sc.esc = 0;
+                else if (c == '\\') s_sc.esc = 1;
+                else if (c == '"') s_sc.in_str = 0;
+                continue;
+            }
+            if (c == '"') { s_sc.in_str = 1; continue; }
+            if (c == '{') s_sc.depth++;
+            else if (c == '}') { if (s_sc.depth > 0) s_sc.depth--; }
+            else if (c == '[') s_sc.arr_depth++;
+            else if (c == ']') { if (s_sc.arr_depth > 0) s_sc.arr_depth--; }
+            if (c == ',' || c == '}' || c == ']') s_sc.st = ST_SEEK_KEY;
+            continue;
+        }
+
+        if (s_sc.st == ST_AFTER_KEY) {
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ':') continue;
+            if (c == '"') {
+                s_sc.capture = 0;
+                s_sc.vlen = 0;
+                if (s_sc.depth == 1 && s_sc.arr_depth == 0 && strcmp(s_sc.key, "t") == 0)
+                    s_sc.capture = 1;
+                else if (s_sc.depth == 2 && s_sc.arr_depth == 0 && strcmp(s_sc.key, "session_id") == 0)
+                    s_sc.capture = 2;
+                else if (s_sc.depth == 3 && s_sc.arr_depth == 0 && strcmp(s_sc.key, "id") == 0)
+                    s_sc.capture = 3;
+                s_sc.st = ST_VAL_STR;
+            } else if (c == '{') {
+                s_sc.depth++;
+                s_sc.st = ST_SEEK_KEY;
+            } else if (c == '[') {
+                s_sc.arr_depth++;
+                s_sc.st = ST_SEEK_KEY;
+            } else {
+                s_sc.st = ST_VAL_SKIP;
+            }
+            continue;
+        }
+
+        /* ST_SEEK_KEY */
+        if (c == '{') s_sc.depth++;
+        else if (c == '}') { if (s_sc.depth > 0) s_sc.depth--; }
+        else if (c == '[') s_sc.arr_depth++;
+        else if (c == ']') { if (s_sc.arr_depth > 0) s_sc.arr_depth--; }
+        else if (c == '"') {
+            if (s_sc.arr_depth == 0 && s_sc.depth <= 3) {
+                s_sc.klen = 0;
+                s_sc.st = ST_IN_KEY;
+            } else {
+                s_sc.in_str = 1;
+                s_sc.st = ST_VAL_SKIP;
+            }
+        }
     }
 }
 
@@ -149,7 +197,8 @@ static void send_op4(ws_client *ws) {
     char *txt = json_dumps(pkt, JSON_COMPACT);
     json_decref(pkt);
     if (txt) {
-        ws_send_text(ws, txt, (int)strlen(txt));
+        int rc = ws_send_text(ws, txt, (int)strlen(txt));
+        console_logf("[maingw] OP4 sent chan=%s rc=%d", s_chan[0] ? s_chan : "(null)", rc);
         free(txt);
     }
 }
@@ -177,7 +226,8 @@ static void send_identify(ws_client *ws) {
     char *txt = json_dumps(pkt, JSON_COMPACT);
     json_decref(pkt);
     if (txt) {
-        ws_send_text(ws, txt, (int)strlen(txt));
+        int rc = ws_send_text(ws, txt, (int)strlen(txt));
+        console_logf("[maingw] IDENTIFY sent rc=%d", rc);
         free(txt);
     }
 }
@@ -204,10 +254,7 @@ static void close_ws(void) {
     s_ready = 0;
     s_identified = 0;
     s_seq = -1;
-    s_scan_tlen = 0;
-    s_scan_got_sid = 0;
-    s_scan_got_uid = 0;
-    s_scan_is_ready = 0;
+    scan_reset();
 }
 
 void main_gw_tick(void) {
@@ -221,6 +268,7 @@ void main_gw_tick(void) {
     if (!s_ws) {
         if (s_last_retry != 0 && now - s_last_retry < 3000) return;
         s_last_retry = now;
+        console_logf("[maingw] connecting...");
         s_ws = ws_open("wss://gateway.discord.gg/?v=10&encoding=json",
                        s_cacert, "https://discord.com", NULL);
         if (!s_ws) {
@@ -233,10 +281,7 @@ void main_gw_tick(void) {
         s_seq = -1;
         s_ready = 0;
         s_identified = 0;
-        s_scan_tlen = 0;
-        s_scan_got_sid = 0;
-        s_scan_got_uid = 0;
-        s_scan_is_ready = 0;
+        scan_reset();
     }
 
     for (int step = 0; step < 6 && s_ws; step++) {
@@ -250,7 +295,6 @@ void main_gw_tick(void) {
         if (n == 0) break;
         if (is_bin) continue;
 
-        /* Small frames (< 16 KiB) are parsed with jansson; huge READY went to on_large_gw_chunk */
         json_error_t jerr;
         json_t *root = json_loads(s_buf, 0, &jerr);
         if (!root) continue;
@@ -263,6 +307,7 @@ void main_gw_tick(void) {
         if (op == 10 && d) {
             int iv = (int)json_integer_value(json_object_get(d, "heartbeat_interval"));
             if (iv > 1000) s_hb_ms = iv;
+            console_logf("[maingw] HELLO hb=%d", s_hb_ms);
             s_last_hb = now;
             if (!s_identified) {
                 s_identified = 1;
@@ -287,11 +332,12 @@ void main_gw_tick(void) {
                 console_logf("[maingw] READY uid=%s", s_me_id);
             } else if (t && strcmp(t, "VOICE_STATE_UPDATE") == 0) {
                 const char *uid = json_string_value(json_object_get(d, "user_id"));
-                if (uid && s_me_id[0] && strcmp(uid, s_me_id) == 0) {
+                if (uid && (!s_me_id[0] || strcmp(uid, s_me_id) == 0)) {
                     const char *gid = json_string_value(json_object_get(d, "guild_id"));
                     const char *cid = json_string_value(json_object_get(d, "channel_id"));
                     const char *sid = json_string_value(json_object_get(d, "session_id"));
                     if (sid && sid[0]) snprintf(s_sess_id, sizeof(s_sess_id), "%s", sid);
+                    console_logf("[maingw] VOICE_STATE_UPDATE chan=%s", cid ? cid : "(null)");
                     voice_on_state_update(gid ? gid : "", cid ? cid : "", s_sess_id);
                 }
             } else if (t && strcmp(t, "VOICE_SERVER_UPDATE") == 0) {
@@ -299,6 +345,7 @@ void main_gw_tick(void) {
                 const char *ep  = json_string_value(json_object_get(d, "endpoint"));
                 const char *gid = json_string_value(json_object_get(d, "guild_id"));
                 const char *cid = json_string_value(json_object_get(d, "channel_id"));
+                console_logf("[maingw] VOICE_SERVER_UPDATE ep=%s", ep ? ep : "(null)");
                 voice_on_server(tok ? tok : "", ep ? ep : "", s_sess_id,
                                 gid ? gid : "", cid ? cid : s_chan, s_me_id);
             }

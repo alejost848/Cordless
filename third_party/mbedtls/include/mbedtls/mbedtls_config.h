@@ -4243,12 +4243,16 @@
 //#define MBEDTLS_X509_MAX_FILE_PATH_LEN     512 /**< Maximum length of a path/filename string in bytes including the null terminator character ('\0'). */
 
 /** \} name SECTION: Module configuration options */
-/* --- CORDLESS_VITA_TLS: Vita port tweaks --- */
-#define MBEDTLS_PLATFORM_MS_TIME_ALT       /* our mbedtls_ms_time */
-#define MBEDTLS_NO_PLATFORM_ENTROPY        /* no /dev/urandom on Vita */
-#define MBEDTLS_ENTROPY_HARDWARE_ALT       /* use our mbedtls_hardware_poll */
-#undef  MBEDTLS_NET_C                      /* bring our own sceNet transport */
-#undef  MBEDTLS_TIMING_C                   /* no gettimeofday/select reliance */
-#undef  MBEDTLS_THREADING_C                /* app serializes TLS via net_lock */
+/* --- CORDLESS_VITA_TLS + CORDLESS_CLIENT_ONLY_TLS --- */
+#define MBEDTLS_NO_PLATFORM_ENTROPY
+#define MBEDTLS_ENTROPY_HARDWARE_ALT
+#define MBEDTLS_PLATFORM_MS_TIME_ALT
+#undef  MBEDTLS_NET_C
+#undef  MBEDTLS_TIMING_C
+#undef  MBEDTLS_THREADING_C
+#undef  MBEDTLS_SSL_SRV_C
+#undef  MBEDTLS_SSL_PROTO_DTLS
+#undef  MBEDTLS_SSL_COOKIE_C
+#undef  MBEDTLS_SSL_TICKET_C
 
 

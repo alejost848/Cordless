@@ -12,7 +12,7 @@ void voice_ipc_poll(void);
 
 // IPC-backed equivalents of voice.h operations (used when plugin is active).
 int  voice_ipc_join(const char *guild_id, const char *channel_id,
-                    const char *token, const char *cacert_path);
+                    const char *user_id, const char *token, const char *cacert_path);
 void voice_ipc_leave(void);
 void voice_ipc_on_server(const char *token, const char *endpoint,
                          const char *session_id, const char *guild_id,

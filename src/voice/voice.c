@@ -598,8 +598,13 @@ static int worker(SceSize argsz, void *argp)
 
     // wait for the main gateway to deliver the voice server assignment
     int64_t start = now_ms();
+#ifdef CORDLESS_PLUGIN
+    int server_wait_ms = 20000;
+#else
+    int server_wait_ms = 10000;
+#endif
     while (s_run && !s_have_server) {
-        if (now_ms() - start > 10000) { console_logf("[voice] no server update"); goto done; }
+        if (now_ms() - start > server_wait_ms) { console_logf("[voice] no server update"); goto done; }
         sceKernelDelayThread(30 * 1000);
     }
     if (!s_run) goto done;
@@ -847,6 +852,24 @@ void voice_on_state_update(const char *guild_id, const char *channel_id,
     }
 }
 
+#ifndef CORDLESS_PLUGIN
+typedef struct {
+    char chan[24];
+    char token[160];
+    char cacert[256];
+} ring_call_args_t;
+
+static int ring_call_worker(SceSize args, void *argp)
+{
+    (void)args;
+    const ring_call_args_t *ra = (const ring_call_args_t *)argp;
+    if (ra) {
+        discord_ring_call(ra->chan, ra->token, ra->cacert);
+    }
+    return sceKernelExitDeleteThread(0);
+}
+#endif
+
 int voice_join(const char *guild_id, const char *channel_id,
                const char *token, const char *cacert_path)
 {
@@ -857,9 +880,20 @@ int voice_join(const char *guild_id, const char *channel_id,
     }
 #ifndef CORDLESS_PLUGIN
     if (voice_ipc_available()) {
-        int rc = voice_ipc_join(guild_id, channel_id, token, cacert_path);
-        if (rc == 0 && (!guild_id || !guild_id[0])) {
-            discord_ring_call(channel_id, token, cacert_path);
+        int rc = voice_ipc_join(guild_id, channel_id, store_me_id(), token, cacert_path);
+        if (rc == 0 && (!guild_id || !guild_id[0]) && token && token[0]) {
+            ring_call_args_t *ra = (ring_call_args_t *)calloc(1, sizeof(*ra));
+            if (ra) {
+                snprintf(ra->chan, sizeof(ra->chan), "%s", channel_id);
+                snprintf(ra->token, sizeof(ra->token), "%s", token);
+                snprintf(ra->cacert, sizeof(ra->cacert), "%s", cacert_path ? cacert_path : "");
+                SceUID rth = sceKernelCreateThread("cl_ring", ring_call_worker, 0x10000100,
+                                                   0x8000, 0, 0, NULL);
+                if (rth >= 0) {
+                    sceKernelStartThread(rth, sizeof(*ra), ra);
+                }
+                free(ra);
+            }
         }
         return rc;
     }

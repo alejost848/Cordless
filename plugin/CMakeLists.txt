@@ -186,6 +186,7 @@ if(BUILD_VOICE_FULL)
     PROPERTIES COMPILE_FLAGS "-DHAVE_CONFIG_H -w"
   )
   target_include_directories(cordless_voice_full PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${ROOT_DIR}/src
     ${ROOT_DIR}/third_party
     ${ROOT_DIR}/third_party/speexdsp

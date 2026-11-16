@@ -13,20 +13,41 @@
 #include <psp2/appmgr.h>
 
 // sceNet memory pool shared by all sockets (gateway WSS + image + REST).
+#ifndef CORDLESS_PLUGIN
 #define NET_MEMPOOL_SIZE (6 * 1024 * 1024)
 
 static char s_net_mempool[NET_MEMPOOL_SIZE];
 static int  s_net_up;
+#endif
 
 // Serializes all blocking network operations across threads (see header).
 static SceUID s_net_mutex = -1;
-void net_lock(void)   { if (s_net_mutex >= 0) sceKernelLockMutex(s_net_mutex, 1, NULL); }
+static volatile int s_net_mtx_state = 0;
+
+static void ensure_net_mutex(void)
+{
+    int st = __atomic_load_n(&s_net_mtx_state, __ATOMIC_ACQUIRE);
+    if (st == 2) return;
+    int expected = 0;
+    if (__atomic_compare_exchange_n(&s_net_mtx_state, &expected, 1, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        if (s_net_mutex < 0)
+            s_net_mutex = sceKernelCreateMutex("net_serialize", 0, 0, NULL);
+        __atomic_store_n(&s_net_mtx_state, 2, __ATOMIC_RELEASE);
+    } else {
+        while (__atomic_load_n(&s_net_mtx_state, __ATOMIC_ACQUIRE) != 2) {
+            sceKernelDelayThread(100);
+        }
+    }
+}
+
+void net_lock(void)   { ensure_net_mutex(); if (s_net_mutex >= 0) sceKernelLockMutex(s_net_mutex, 1, NULL); }
 void net_unlock(void) { if (s_net_mutex >= 0) sceKernelUnlockMutex(s_net_mutex, 1); }
 
+#ifndef CORDLESS_PLUGIN
 int net_init(void)
 {
-    if (s_net_mutex < 0)
-        s_net_mutex = sceKernelCreateMutex("net_serialize", 0, 0, NULL);
+    ensure_net_mutex();
 
     int ret = sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
     if (ret < 0) return ret;
@@ -84,3 +105,4 @@ void net_app_path(char *out, unsigned out_len, const char *rel)
     // Files packed in the vpk land under ux0:app/<TITLEID>/.
     snprintf(out, out_len, "ux0:app/%s/%s", APP_TITLEID, rel);
 }
+#endif

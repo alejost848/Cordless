@@ -22,7 +22,7 @@
 
 extern void console_logf(const char *fmt, ...);
 extern void pool_alloc_shutdown(void);
-extern void main_gw_set_auth(const char *token, const char *cacert);
+extern void main_gw_set_auth(const char *token, const char *cacert, const char *user_id);
 extern void main_gw_tick(void);
 extern void main_gw_stop(void);
 
@@ -76,9 +76,10 @@ static void handle_ipc_line(int fd, const char *line) {
     if (strcmp(cmd, "join") == 0) {
         const char *guild_id = json_string_value(json_object_get(req, "guild_id"));
         const char *chan_id  = json_string_value(json_object_get(req, "channel_id"));
+        const char *user_id  = json_string_value(json_object_get(req, "user_id"));
         const char *token    = json_string_value(json_object_get(req, "token"));
         const char *cacert   = json_string_value(json_object_get(req, "cacert"));
-        main_gw_set_auth(token, cacert);
+        main_gw_set_auth(token, cacert, user_id);
         int rc = voice_join(guild_id, chan_id, token, cacert);
         json_object_set_new(resp, "rc", json_integer(rc));
     } else if (strcmp(cmd, "server") == 0) {

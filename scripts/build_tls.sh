@@ -37,6 +37,10 @@ add="""
 #undef  MBEDTLS_NET_C                      /* bring our own sceNet transport */
 #undef  MBEDTLS_TIMING_C                   /* no gettimeofday/select reliance */
 #undef  MBEDTLS_THREADING_C                /* app serializes TLS via net_lock */
+#undef  MBEDTLS_SSL_SRV_C                  /* client-only: save ~200 KiB */
+#undef  MBEDTLS_SSL_PROTO_DTLS
+#undef  MBEDTLS_SSL_COOKIE_C
+#undef  MBEDTLS_SSL_TICKET_C
 """
 i=s.rfind("#endif"); open(p,"w").write(s[:i]+add+"\n"+s[i:])
 print("config patched")
@@ -46,8 +50,10 @@ fi
 cmake -B build_vita -G "Unix Makefiles" \
   -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" \
   -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \
+  -DMBEDTLS_FATAL_WARNINGS=OFF \
   -DUSE_SHARED_MBEDTLS_LIBRARY=OFF -DUSE_STATIC_MBEDTLS_LIBRARY=ON \
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_BUILD_TYPE=MinSizeRel \
+  -DCMAKE_C_FLAGS="-ffunction-sections -fdata-sections -Os -Wno-unterminated-string-initialization"
 cmake --build build_vita -j4
 
 mkdir -p "$DST/lib" "$DST/include"
