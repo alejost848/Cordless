@@ -1,5 +1,7 @@
 # Cordless
 
+![Cordless LiveArea cover](sce_sys/livearea/contents/bg.png)
+
 A native homebrew Discord client for the PlayStation Vita. It talks straight to
 Discord's REST API and gateway over TLS, with no bridge server and nothing
 self-hosted. Every network call runs on a vendored mbedTLS stack over raw
