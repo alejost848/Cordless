@@ -3078,12 +3078,18 @@ static void draw_sidebar(guild *g, bool home)
             draw_avatar(SIDE_X + 34, y + 10, 8, vurl, row->vm.name, COL_BLURPLE);
             int avail = SIDE_W - 56;
             if (row->vm.deaf || row->vm.mute) {
-                const char *tag = row->vm.deaf ? "DEAF" : "MUTE";
-                int bw = ui_text_bold_w(FS_TINY, tag) + 8;
-                int bx = SIDE_X + SIDE_W - bw - 8;
-                ui_rounded_rect(bx, y + 3, bw, 14, 4, COL_RED);
-                ui_text_bold(bx + 4, y + 3, FS_TINY, COL_WHITE, tag);
-                avail = bx - (SIDE_X + 48) - 4;
+                int ix = SIDE_X + SIDE_W - 18, iy = y + 10;
+                if (row->vm.deaf) {
+                    // Compact headphones + slash icon in COL_RED.
+                    ui_rounded_rect(ix - 5, iy - 5, 10, 4, 3, COL_RED);
+                    ui_rounded_rect(ix - 6, iy - 2, 3, 6, 1, COL_RED);
+                    ui_rounded_rect(ix + 3, iy - 2, 3, 6, 1, COL_RED);
+                    vita2d_draw_line((float)(ix - 6), (float)(iy - 5), (float)(ix + 6), (float)(iy + 5), COL_RED);
+                    vita2d_draw_line((float)(ix - 6), (float)(iy - 4), (float)(ix + 6), (float)(iy + 6), COL_RED);
+                } else {
+                    draw_mic_icon(ix, iy, COL_RED, true);
+                }
+                avail = (ix - 12) - (SIDE_X + 48);
             }
             if (avail > 0)
                 ui_text_clip(SIDE_X + 48, y + 2, FS_SMALL,
