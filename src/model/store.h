@@ -23,6 +23,7 @@
 #define CH_ANNOUNCE_THREAD 10
 #define CH_PUBLIC_THREAD   11
 #define CH_PRIVATE_THREAD  12
+#define CH_STAGE           13
 #define CH_FORUM           15
 
 static inline int ch_is_thread(int type)
@@ -248,5 +249,26 @@ const char *store_get_note(const char *user_id);
 // Mark a channel read / unread (updates unread + mentions).
 void store_mark_read(const char *id);
 void store_bump_unread(const char *id, const char *last_message_id, bool mention);
+
+#define MAX_VOICE_STATES 256
+
+typedef struct {
+    char guild_id[24];
+    char channel_id[24];
+    char user_id[24];
+    char name[80];
+    char avatar[40];
+    bool mute;  // mute || self_mute || suppress
+    bool deaf;  // deaf || self_deaf
+} voice_member;
+
+// Voice channel participants (READY guild.voice_states + VOICE_STATE_UPDATE).
+// Caller holds store_lock().
+void store_voice_clear_all(void);
+void store_voice_clear_guild(const char *guild_id);
+void store_voice_set(const char *guild_id, const char *channel_id,
+                     const char *user_id, const char *name,
+                     const char *avatar, bool mute, bool deaf);
+int  store_voice_for_channel(const char *channel_id, voice_member *out, int max);
 
 #endif  // CORDLESS_MODEL_STORE_H

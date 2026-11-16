@@ -149,6 +149,8 @@ int discord_crosspost(const char *channel_id, const char *message_id,
 int discord_forward_message(const char *to_channel_id, const char *from_channel_id,
                             const char *message_id, const char *token,
                             const char *cacert_path);
+int discord_ring_call(const char *channel_id, const char *token,
+                      const char *cacert_path);
 
 void discord_json_to_message(json_t *m, message *out);
 

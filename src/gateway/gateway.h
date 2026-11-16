@@ -19,7 +19,10 @@ void gateway_set_status(const char *status);
 // Empty text clears the custom status.
 void gateway_set_custom_status(const char *text);
 
-// Op 4 Voice State Update; an empty channel_id leaves the voice channel.
+// Op 4 Voice State Update; an empty channel_id leaves the voice channel, and
+// an empty/NULL guild_id targets a DM / Group DM call.
 void gateway_voice_update(const char *guild_id, const char *channel_id);
+void gateway_voice_update_ex(const char *guild_id, const char *channel_id,
+                             int self_mute, int self_deaf);
 
 #endif  // CORDLESS_GATEWAY_GATEWAY_H

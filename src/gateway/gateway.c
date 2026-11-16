@@ -52,6 +52,8 @@ static char   s_custom_status[128];
 static volatile int s_want_voice;
 static char   s_voice_guild[24];
 static char   s_voice_chan[24];  // empty = disconnect
+static int    s_voice_mute;
+static int    s_voice_deaf;
 
 static int64_t now_ms(void)
 {
@@ -65,9 +67,7 @@ static int ws_read_message(ws_client *ws, char **buf, size_t *cap, int timeout_m
     int64_t start = now_ms();
     for (;;) {
         if (!s_run) return -1;
-        net_lock();
         int r = ws_recv(ws, buf, cap);
-        net_unlock();
         if (r > 0) return r;
         if (r < 0) return -1;
         if (now_ms() - start > timeout_ms) return 0;
@@ -77,10 +77,7 @@ static int ws_read_message(ws_client *ws, char **buf, size_t *cap, int timeout_m
 
 static int ws_send(ws_client *ws, const char *txt)
 {
-    net_lock();
-    int r = ws_send_text(ws, txt, -1);
-    net_unlock();
-    return r;
+    return ws_send_text(ws, txt, -1);
 }
 
 static void send_identify(ws_client *ws)
@@ -140,6 +137,57 @@ static const char *user_display(json_t *u)
     const char *gn = json_string_value(json_object_get(u, "global_name"));
     const char *un = json_string_value(json_object_get(u, "username"));
     return (gn && gn[0]) ? gn : un;
+}
+
+static json_t *find_member(json_t *members, const char *uid)
+{
+    if (!json_is_array(members) || !uid || !uid[0]) return NULL;
+    size_t n = json_array_size(members);
+    for (size_t i = 0; i < n; i++) {
+        json_t *mem = json_array_get(members, i);
+        const char *muid = json_string_value(json_object_get(mem, "user_id"));
+        if (!muid) muid = json_string_value(
+            json_object_get(json_object_get(mem, "user"), "id"));
+        if (muid && strcmp(muid, uid) == 0) return mem;
+    }
+    return NULL;
+}
+
+static void extract_voice_member_info(json_t *vs, json_t *users, json_t *members,
+                                      const char *uid, char *name, size_t ncap,
+                                      char *av, size_t acap)
+{
+    name[0] = '\0'; av[0] = '\0';
+    json_t *mem = json_object_get(vs, "member");
+    if (!json_is_object(mem)) mem = find_member(members, uid);
+    const char *nick = json_is_object(mem) ? json_string_value(json_object_get(mem, "nick")) : NULL;
+    json_t *u = json_is_object(mem) ? json_object_get(mem, "user") : NULL;
+    if (!json_is_object(u)) u = find_user(users, uid);
+    const char *disp = (nick && nick[0]) ? nick : user_display(u);
+    if (disp && disp[0]) snprintf(name, ncap, "%s", disp);
+    const char *uav = u ? json_string_value(json_object_get(u, "avatar")) : NULL;
+    if (uav && uav[0]) snprintf(av, acap, "%s", uav);
+}
+
+static void seed_voice_states(const char *guild_id, json_t *vstates,
+                              json_t *users, json_t *members)
+{
+    if (!guild_id || !guild_id[0] || !json_is_array(vstates)) return;
+    size_t vn = json_array_size(vstates);
+    for (size_t i = 0; i < vn; i++) {
+        json_t *vs = json_array_get(vstates, i);
+        const char *uid = json_string_value(json_object_get(vs, "user_id"));
+        const char *cid = json_string_value(json_object_get(vs, "channel_id"));
+        if (!uid || !uid[0] || !cid || !cid[0]) continue;
+        bool mute = json_is_true(json_object_get(vs, "mute")) ||
+                    json_is_true(json_object_get(vs, "self_mute")) ||
+                    json_is_true(json_object_get(vs, "suppress"));
+        bool deaf = json_is_true(json_object_get(vs, "deaf")) ||
+                    json_is_true(json_object_get(vs, "self_deaf"));
+        char name[80], av[40];
+        extract_voice_member_info(vs, users, members, uid, name, sizeof(name), av, sizeof(av));
+        store_voice_set(guild_id, cid, uid, name, av, mute, deaf);
+    }
 }
 
 // snowflake ids are decimal numbers: longer string = larger, else strcmp order
@@ -215,7 +263,8 @@ static int chan_can_view(json_t *cj, const char *guild_id, const char *my_id,
 
 // gate==0 skips VIEW_CHANNEL hiding. Caller holds the store lock.
 static void populate_guild(guild *g, json_t *gj, const char *guild_id,
-                           char myroles[][24], int nmy, int gate)
+                           char myroles[][24], int nmy, int gate,
+                           json_t *users, json_t *members)
 {
     const char *my_id = store_me_id();
 
@@ -295,6 +344,9 @@ static void populate_guild(guild *g, json_t *gj, const char *guild_id,
             json_string_value(json_object_get(cj, "parent_id")),
             json_string_value(json_object_get(cj, "last_message_id")));
     }
+
+    store_voice_clear_guild(guild_id);
+    seed_voice_states(guild_id, json_object_get(gj, "voice_states"), users, members);
 }
 
 // returns 1 if our member was found, else 0
@@ -328,9 +380,10 @@ static void parse_guild_create(json_t *d)
     if (!id) return;
     guild *g = store_add_guild(id, guild_name(d), guild_icon(d));
     if (!g) return;
+    json_t *members = json_object_get(d, "members");
     char myroles[64][24]; int nmy = 0;
-    int gate = my_roles_from_members(json_object_get(d, "members"), myroles, &nmy);
-    populate_guild(g, d, id, myroles, nmy, gate);
+    int gate = my_roles_from_members(members, myroles, &nmy);
+    populate_guild(g, d, id, myroles, nmy, gate, NULL, members);
     console_dbgf("[gw] GUILD_CREATE %.8s '%s'", id, guild_name(d) ? guild_name(d) : "?");
 }
 
@@ -554,6 +607,10 @@ static void jt_str(int t, char *out, int cap)
     out[o] = 0;
 }
 static void jt_gets(int obj, const char *key, char *out, int cap) { jt_str(jt_get(obj, key), out, cap); }
+static int  jt_bool(int t)
+{
+    return jt_is_prim(t) && s_jt[t].end > s_jt[t].start && s_js[s_jt[t].start] == 't';
+}
 
 // Walk array `arr`'s elements in one forward pass; `el` is each element token.
 // `arr` must be a plain int variable, not an expression.
@@ -569,6 +626,43 @@ static int find_user_js(int users, const char *id)
         if (uid[0] && strcmp(uid, id) == 0) return u;
     }
     return -1;
+}
+static int find_member_js(int members, const char *uid)
+{
+    if (!jt_is_arr(members) || !uid || !uid[0]) return -1;
+    JT_FOREACH(members, mem) {
+        char muid[24]; jt_gets(mem, "user_id", muid, sizeof muid);
+        if (!muid[0]) { int u = jt_get(mem, "user"); if (u >= 0) jt_gets(u, "id", muid, sizeof muid); }
+        if (muid[0] && strcmp(muid, uid) == 0) return mem;
+    }
+    return -1;
+}
+static void seed_voice_states_js(const char *guild_id, int vstates, int users, int members)
+{
+    if (!guild_id || !guild_id[0] || !jt_is_arr(vstates)) return;
+    JT_FOREACH(vstates, vs) {
+        char uid[24], cid[24];
+        jt_gets(vs, "user_id", uid, sizeof uid);
+        jt_gets(vs, "channel_id", cid, sizeof cid);
+        if (!uid[0] || !cid[0]) continue;
+        bool mute = jt_bool(jt_get(vs, "mute")) ||
+                    jt_bool(jt_get(vs, "self_mute")) ||
+                    jt_bool(jt_get(vs, "suppress"));
+        bool deaf = jt_bool(jt_get(vs, "deaf")) ||
+                    jt_bool(jt_get(vs, "self_deaf"));
+        char name[80] = "", av[40] = "";
+        int mem = jt_get(vs, "member");
+        if (mem < 0) mem = find_member_js(members, uid);
+        if (mem >= 0) jt_gets(mem, "nick", name, sizeof name);
+        int u = (mem >= 0) ? jt_get(mem, "user") : -1;
+        if (u < 0) u = find_user_js(users, uid);
+        if (u >= 0) {
+            if (!name[0]) jt_gets(u, "global_name", name, sizeof name);
+            if (!name[0]) jt_gets(u, "username", name, sizeof name);
+            jt_gets(u, "avatar", av, sizeof av);
+        }
+        store_voice_set(guild_id, cid, uid, name, av, mute, deaf);
+    }
 }
 static void activity_text_js(int d, char *out, int cap)
 {
@@ -635,7 +729,8 @@ static int chan_can_view_js(int cj, const char *guild_id, const char *my_id,
     return (perms & PERM_VIEW) != 0;
 }
 static void populate_guild_js(guild *g, int gj, const char *guild_id,
-                              char myroles[][24], int nmy, int gate)
+                              char myroles[][24], int nmy, int gate,
+                              int users, int members)
 {
     const char *my_id = store_me_id();
     int props = jt_get(gj, "properties");
@@ -698,6 +793,11 @@ static void populate_guild_js(guild *g, int gj, const char *guild_id,
         store_add_channel(g, chid, cname, (int)jt_int(jt_get(ct, "type")),
                           (int)jt_int(jt_get(ct, "position")), parent, lmid);
     }
+
+    if (guild_id && guild_id[0]) {
+        store_voice_clear_guild(guild_id);
+        seed_voice_states_js(guild_id, jt_get(gj, "voice_states"), users, members);
+    }
 }
 static void parse_ready_js(int d)
 {
@@ -712,13 +812,15 @@ static void parse_ready_js(int d)
         store_set_me(un, gn, uid, av);
     }
 
+    int users = jt_get(d, "users");
     int guilds = jt_get(d, "guilds");
     int gn = jt_len(guilds);
     int mm = jt_get(d, "merged_members");
+    int mmn = jt_len(mm);
     // merged_members is a parallel array to guilds; walk both with cursors.
     int gj  = jt_is_arr(guilds) ? guilds + 1 : -1;
     int mlc = jt_is_arr(mm) ? mm + 1 : -1;
-    for (int i = 0; i < gn; i++, gj = jt_skip(gj), mlc = (mlc >= 0 ? jt_skip(mlc) : -1)) {
+    for (int i = 0; i < gn; i++, gj = jt_skip(gj), mlc = (mlc >= 0 && i < mmn ? jt_skip(mlc) : -1)) {
         int props = jt_get(gj, "properties");
         char gid[24], gname[100], gicon[64];
         jt_gets(gj, "id", gid, sizeof gid);
@@ -730,9 +832,9 @@ static void parse_ready_js(int d)
         if (!g) continue;
         const char *my_id = store_me_id();
         char myroles[64][24]; int nmy = 0;
+        int ml = (mlc >= 0 && i < mmn) ? mlc : -1;
         int gate = jt_is_arr(mm);
         if (gate) {
-            int ml = mlc;  // merged_members[i]
             int meMem = -1;
             if (jt_is_arr(ml)) {
                 JT_FOREACH(ml, mem) {
@@ -751,10 +853,10 @@ static void parse_ready_js(int d)
                 }
             } else gate = 0;
         }
-        populate_guild_js(g, gj, gid[0] ? gid : NULL, myroles, nmy, gate);
+        int gmembers = jt_is_arr(ml) ? ml : jt_get(gj, "members");
+        populate_guild_js(g, gj, gid[0] ? gid : NULL, myroles, nmy, gate, users, gmembers);
     }
 
-    int users = jt_get(d, "users");
     store_clear_dms();
 
     store_clear_notes();
@@ -876,12 +978,26 @@ static void parse_ready_js(int d)
 static void parse_ready_supplemental_js(int d)
 {
     int mp = jt_get(d, "merged_presences");
-    if (!jt_is_obj(mp)) { console_dbgf("[gw] READY_SUPPLEMENTAL(jsmn): no merged_presences"); return; }
-    int nf, ng = 0;
+    int sg = jt_get(d, "guilds");
+    int nf = 0, ng = 0;
     store_lock();
-    nf = seed_presences_js(jt_get(mp, "friends"));
-    int gp = jt_get(mp, "guilds");
-    JT_FOREACH(gp, garr) ng += seed_presences_js(garr);
+    if (jt_is_obj(mp)) {
+        nf = seed_presences_js(jt_get(mp, "friends"));
+        int gp = jt_get(mp, "guilds");
+        JT_FOREACH(gp, garr) ng += seed_presences_js(garr);
+    } else {
+        console_dbgf("[gw] READY_SUPPLEMENTAL(jsmn): no merged_presences");
+    }
+    if (jt_is_arr(sg)) {
+        JT_FOREACH(sg, g) {
+            char gid[24]; jt_gets(g, "id", gid, sizeof gid);
+            int vs = jt_get(g, "voice_states");
+            if (gid[0] && jt_is_arr(vs) && jt_len(vs) > 0) {
+                store_voice_clear_guild(gid);
+                seed_voice_states_js(gid, vs, -1, -1);
+            }
+        }
+    }
     store_unlock();
     store_touch();
     console_dbgf("[gw] READY_SUPPLEMENTAL(jsmn): seeded %d friend + %d member presences", nf, ng);
@@ -950,6 +1066,7 @@ static void parse_ready(json_t *d)
                      json_string_value(json_object_get(user, "avatar")));
     }
 
+    json_t *users = json_object_get(d, "users");
     json_t *guilds = json_object_get(d, "guilds");
     size_t gn = json_is_array(guilds) ? json_array_size(guilds) : 0;
     for (size_t i = 0; i < gn; i++) {
@@ -964,9 +1081,9 @@ static void parse_ready(json_t *d)
         const char *my_id = store_me_id();
         char myroles[64][24]; int nmy = 0;
         json_t *mm = json_object_get(d, "merged_members");
+        json_t *ml = (json_is_array(mm) && i < json_array_size(mm)) ? json_array_get(mm, i) : NULL;
         int gate = json_is_array(mm);
         if (gate) {
-            json_t *ml = (i < json_array_size(mm)) ? json_array_get(mm, i) : NULL;
             json_t *meMem = NULL;
             if (json_is_array(ml)) {
                 size_t mln = json_array_size(ml);
@@ -988,11 +1105,11 @@ static void parse_ready(json_t *d)
                     }
             } else gate = 0;
         }
-        populate_guild(g, gj, guild_id, myroles, nmy, gate);
+        json_t *gmembers = json_is_array(ml) ? ml : json_object_get(gj, "members");
+        populate_guild(g, gj, guild_id, myroles, nmy, gate, users, gmembers);
     }
     // Direct messages / group DMs. User-account READY lists `recipient_ids`
     // resolved against the top-level `users` array (older shapes inline `recipients`).
-    json_t *users = json_object_get(d, "users");
     store_clear_dms();
 
     // Personal notes on users: READY `notes` is an object { user_id: "text" }.
@@ -1173,6 +1290,80 @@ static void parse_thread(json_t *d, int add)
             json_string_value(json_object_get(d, "last_message_id")));
     }
     store_unlock();
+    store_touch();
+}
+
+static void parse_channel_event(json_t *d, int add)
+{
+    const char *id = json_string_value(json_object_get(d, "id"));
+    if (!id || !id[0]) return;
+    store_lock();
+    if (!add) {
+        store_remove_channel(id);
+        store_unlock();
+        store_touch();
+        return;
+    }
+    int type = (int)json_integer_value(json_object_get(d, "type"));
+    const char *gid = json_string_value(json_object_get(d, "guild_id"));
+    const char *last_mid = json_string_value(json_object_get(d, "last_message_id"));
+    if (!gid && (type == CH_DM || type == CH_GROUP_DM)) {
+        const char *name = json_string_value(json_object_get(d, "name"));
+        const char *av = NULL, *rid = NULL;
+        char gname[96] = "";
+        json_t *rec = json_object_get(d, "recipients");
+        if (json_is_array(rec) && json_array_size(rec) > 0) {
+            json_t *r0 = json_array_get(rec, 0);
+            rid = json_string_value(json_object_get(r0, "id"));
+            av  = json_string_value(json_object_get(r0, "avatar"));
+            if (!name || !name[0]) {
+                if (type == CH_DM) {
+                    name = json_string_value(json_object_get(r0, "global_name"));
+                    if (!name || !name[0]) name = json_string_value(json_object_get(r0, "username"));
+                } else {
+                    size_t nr = json_array_size(rec), off = 0;
+                    for (size_t j = 0; j < nr && j < 4; j++) {
+                        json_t *u = json_array_get(rec, j);
+                        const char *un = json_string_value(json_object_get(u, "global_name"));
+                        if (!un || !un[0]) un = json_string_value(json_object_get(u, "username"));
+                        if (un && un[0]) {
+                            off += (size_t)snprintf(gname + off, sizeof(gname) - off,
+                                                    "%s%s", off ? ", " : "", un);
+                            if (off >= sizeof(gname) - 1) break;
+                        }
+                    }
+                    name = gname;
+                }
+            }
+        }
+        channel *existing = store_find_channel(id);
+        if (existing) {
+            if (name && name[0]) snprintf(existing->name, sizeof(existing->name), "%s", name);
+            if (av) snprintf(existing->avatar, sizeof(existing->avatar), "%s", av);
+            if (last_mid && last_mid[0])
+                snprintf(existing->last_message_id, sizeof(existing->last_message_id), "%s", last_mid);
+        } else {
+            store_add_dm(id, name, type, av, rid, last_mid);
+        }
+    } else if (gid) {
+        const char *name = json_string_value(json_object_get(d, "name"));
+        int pos = (int)json_integer_value(json_object_get(d, "position"));
+        const char *pid = json_string_value(json_object_get(d, "parent_id"));
+        channel *existing = store_find_channel(id);
+        if (existing) {
+            if (name && name[0]) snprintf(existing->name, sizeof(existing->name), "%s", name);
+            existing->type = type;
+            existing->position = pos;
+            snprintf(existing->parent_id, sizeof(existing->parent_id), "%s", pid ? pid : "");
+            if (last_mid && last_mid[0])
+                snprintf(existing->last_message_id, sizeof(existing->last_message_id), "%s", last_mid);
+        } else {
+            guild *g = store_find_guild(gid);
+            if (g) store_add_channel(g, id, name, type, pos, pid, last_mid);
+        }
+    }
+    store_unlock();
+    store_touch();
 }
 
 static void parse_message_create(json_t *d)
@@ -1341,18 +1532,62 @@ static int seed_presences(json_t *arr)
 static void parse_ready_supplemental(json_t *d)
 {
     json_t *mp = json_object_get(d, "merged_presences");
-    if (!json_is_object(mp)) { console_dbgf("[gw] READY_SUPPLEMENTAL: no merged_presences"); return; }
+    json_t *sg = json_object_get(d, "guilds");
     int nf = 0, ng = 0;
     store_lock();
-    nf = seed_presences(json_object_get(mp, "friends"));
-    json_t *gp = json_object_get(mp, "guilds");
-    if (json_is_array(gp)) {
-        size_t gn = json_array_size(gp);
-        for (size_t i = 0; i < gn; i++) ng += seed_presences(json_array_get(gp, i));
+    if (json_is_object(mp)) {
+        nf = seed_presences(json_object_get(mp, "friends"));
+        json_t *gp = json_object_get(mp, "guilds");
+        if (json_is_array(gp)) {
+            size_t gn = json_array_size(gp);
+            for (size_t i = 0; i < gn; i++) ng += seed_presences(json_array_get(gp, i));
+        }
+    } else {
+        console_dbgf("[gw] READY_SUPPLEMENTAL: no merged_presences");
+    }
+    if (json_is_array(sg)) {
+        size_t sgn = json_array_size(sg);
+        for (size_t i = 0; i < sgn; i++) {
+            json_t *g = json_array_get(sg, i);
+            const char *gid = json_string_value(json_object_get(g, "id"));
+            json_t *vs = json_object_get(g, "voice_states");
+            if (gid && gid[0] && json_is_array(vs) && json_array_size(vs) > 0) {
+                store_voice_clear_guild(gid);
+                seed_voice_states(gid, vs, NULL, NULL);
+            }
+        }
     }
     store_unlock();
     store_touch();
     console_dbgf("[gw] READY_SUPPLEMENTAL: seeded %d friend + %d member presences", nf, ng);
+}
+
+static void parse_voice_state_update(json_t *d)
+{
+    if (!json_is_object(d)) return;
+    const char *gid = json_string_value(json_object_get(d, "guild_id"));
+    const char *cid = json_string_value(json_object_get(d, "channel_id"));
+    const char *uid = json_string_value(json_object_get(d, "user_id"));
+    const char *sid = json_string_value(json_object_get(d, "session_id"));
+    if (!uid || !uid[0]) return;
+
+    bool mute = json_is_true(json_object_get(d, "mute")) ||
+                json_is_true(json_object_get(d, "self_mute")) ||
+                json_is_true(json_object_get(d, "suppress"));
+    bool deaf = json_is_true(json_object_get(d, "deaf")) ||
+                json_is_true(json_object_get(d, "self_deaf"));
+
+    char name[80], av[40];
+    extract_voice_member_info(d, NULL, NULL, uid, name, sizeof(name), av, sizeof(av));
+
+    store_lock();
+    store_voice_set(gid ? gid : "", cid, uid, name, av, mute, deaf);
+    bool is_me = (store_me_id()[0] && strcmp(uid, store_me_id()) == 0);
+    store_unlock();
+    store_touch();
+
+    if (is_me)
+        voice_on_state_update(gid, cid, sid);
 }
 
 // Member-list group counts live in the top-level `groups` array, keyed by id.
@@ -1462,9 +1697,7 @@ static int run_connection(bool resuming)
     s_status = "Connecting";
     console_dbgf("[gw] connecting (%s)", resuming ? "resume" : "identify");
     int result = 2;
-    net_lock();
     ws_client *ws = ws_open(url, s_cacert, "https://discord.com", discord_user_agent());
-    net_unlock();
     if (!ws) {
         console_logf("[gw] connect failed");
         return resuming ? 1 : 2;
@@ -1566,6 +1799,25 @@ static int run_connection(bool resuming)
                         const char *gid = json_string_value(json_object_get(d, "id"));
                         if (gid) { store_lock(); store_remove_guild(gid); store_unlock();
                                    store_touch(); }
+                    } else if (t && strcmp(t, "GUILD_UPDATE") == 0) {
+                        const char *gid = json_string_value(json_object_get(d, "id"));
+                        const char *gname = json_string_value(json_object_get(d, "name"));
+                        const char *gicon = json_string_value(json_object_get(d, "icon"));
+                        if (gid) {
+                            store_lock();
+                            guild *g = store_find_guild(gid);
+                            if (g) {
+                                if (gname && gname[0]) snprintf(g->name, sizeof(g->name), "%s", gname);
+                                snprintf(g->icon, sizeof(g->icon), "%s", gicon ? gicon : "");
+                            }
+                            store_unlock();
+                            store_touch();
+                        }
+                    } else if (t && (strcmp(t, "CHANNEL_CREATE") == 0 ||
+                                     strcmp(t, "CHANNEL_UPDATE") == 0)) {
+                        parse_channel_event(d, 1);
+                    } else if (t && strcmp(t, "CHANNEL_DELETE") == 0) {
+                        parse_channel_event(d, 0);
                     } else if (t && strcmp(t, "RELATIONSHIP_UPDATE") == 0) {
                         // Type can change (e.g. to/from blocked); sync the set.
                         int rtype = (int)json_integer_value(json_object_get(d, "type"));
@@ -1582,14 +1834,17 @@ static int run_connection(bool resuming)
                     } else if (t && strcmp(t, "RESUMED") == 0) {
                         console_dbgf("[gw] RESUMED"); s_status = "Connected";
                         s_made_progress = true;
+                    } else if (t && strcmp(t, "VOICE_STATE_UPDATE") == 0) {
+                        parse_voice_state_update(d);
                     } else if (t && strcmp(t, "VOICE_SERVER_UPDATE") == 0) {
                         // Voice gateway token + endpoint; the voice session_id is this gateway's.
                         const char *vtok = json_string_value(json_object_get(d, "token"));
                         const char *vep  = json_string_value(json_object_get(d, "endpoint"));
                         const char *vgid = json_string_value(json_object_get(d, "guild_id"));
+                        const char *vcid = json_string_value(json_object_get(d, "channel_id"));
                         console_dbgf("[gw] VOICE_SERVER_UPDATE endpoint=%s", vep ? vep : "(null)");
                         if (vep)  // null endpoint means "no server yet"; wait for the next
-                            voice_on_server(vtok, vep, s_session_id, vgid, store_me_id());
+                            voice_on_server(vtok, vep, s_session_id, vgid, vcid, store_me_id());
                     }
                 }
                 json_decref(root);
@@ -1639,23 +1894,27 @@ static int run_connection(bool resuming)
         if (s_want_voice) {
             s_want_voice = 0;
             // op4 Voice State Update: move into s_voice_chan, or out (null) if empty.
-            json_t *dd = json_pack("{s:s, s:b, s:b}",
-                                   "guild_id", s_voice_guild, "self_mute", 0, "self_deaf", 0);
-            if (s_voice_chan[0]) json_object_set_new(dd, "channel_id", json_string(s_voice_chan));
-            else                 json_object_set_new(dd, "channel_id", json_null());
+            // guild_id is null for DM / Group DM calls.
+            json_t *dd = json_pack("{s:b, s:b}",
+                                   "self_mute", s_voice_mute ? 1 : 0,
+                                   "self_deaf", s_voice_deaf ? 1 : 0);
+            if (s_voice_guild[0]) json_object_set_new(dd, "guild_id", json_string(s_voice_guild));
+            else                  json_object_set_new(dd, "guild_id", json_null());
+            if (s_voice_chan[0])  json_object_set_new(dd, "channel_id", json_string(s_voice_chan));
+            else                  json_object_set_new(dd, "channel_id", json_null());
             json_t *p = json_pack("{s:i, s:o}", "op", 4, "d", dd);
             char *txt = json_dumps(p, JSON_COMPACT);
             json_decref(p);
             if (txt) { ws_send(ws, txt); free(txt); }
-            console_dbgf("[gw] op4 voice guild=%s chan=%s", s_voice_guild,
-                         s_voice_chan[0] ? s_voice_chan : "(leave)");
+            console_dbgf("[gw] op4 voice guild=%s chan=%s mute=%d",
+                         s_voice_guild[0] ? s_voice_guild : "(dm)",
+                         s_voice_chan[0] ? s_voice_chan : "(leave)",
+                         s_voice_mute);
         }
     }
 
     free(buf);
-    net_lock();
     ws_close(ws);
-    net_unlock();
     if (!s_run) return 0;
     return result;
 }
@@ -1730,9 +1989,17 @@ void gateway_set_custom_status(const char *text)
     s_want_status = 1;
 }
 
-void gateway_voice_update(const char *guild_id, const char *channel_id)
+void gateway_voice_update_ex(const char *guild_id, const char *channel_id,
+                             int self_mute, int self_deaf)
 {
     snprintf(s_voice_guild, sizeof(s_voice_guild), "%s", guild_id ? guild_id : "");
     snprintf(s_voice_chan, sizeof(s_voice_chan), "%s", channel_id ? channel_id : "");
+    s_voice_mute = self_mute ? 1 : 0;
+    s_voice_deaf = self_deaf ? 1 : 0;
     s_want_voice = 1;
+}
+
+void gateway_voice_update(const char *guild_id, const char *channel_id)
+{
+    gateway_voice_update_ex(guild_id, channel_id, 0, 0);
 }

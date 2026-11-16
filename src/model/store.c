@@ -60,6 +60,9 @@ typedef struct {
     // Empty until fetched; the rail then uses load order.
     char       guild_order[MAX_GUILDS][24];
     int        guild_order_n;
+
+    voice_member voice[MAX_VOICE_STATES];
+    int          voice_count;
 } store_t;
 
 static store_t *S;
@@ -83,6 +86,7 @@ guild *store_guilds(int *count_out)
 void store_clear_guilds(void)
 {
     S->guild_count = 0;
+    S->voice_count = 0;
     S->ready = false;
 }
 
@@ -290,6 +294,18 @@ long long   store_typing_at(void)      { return S->typing_at; }
 
 void store_push_message(const message *src)
 {
+    if (!src->pending) {
+        for (int i = S->message_count - 1; i >= 0; i--) {
+            message *pm = &S->messages[i];
+            if (pm->pending &&
+                strcmp(pm->author_id, src->author_id) == 0 &&
+                strcmp(pm->content, src->content) == 0) {
+                *pm = *src;
+                S->msg_rev++;
+                return;
+            }
+        }
+    }
     message *m;
     if (S->message_count < MAX_MESSAGES) {
         m = &S->messages[S->message_count++];
@@ -392,6 +408,25 @@ void store_add_member_group(const char *label, int count)
     r->count = count;
 }
 
+// Backfill display name and avatar onto any active voice entry for this user.
+static void voice_backfill_user(const char *id, const char *name, const char *avatar)
+{
+    if (!id || !id[0]) return;
+    bool dirty = false;
+    for (int i = 0; i < S->voice_count; i++) {
+        if (strcmp(S->voice[i].user_id, id) != 0) continue;
+        if (name && name[0] && strcmp(S->voice[i].name, name) != 0) {
+            snprintf(S->voice[i].name, sizeof(S->voice[i].name), "%s", name);
+            dirty = true;
+        }
+        if (avatar && avatar[0] && !S->voice[i].avatar[0]) {
+            snprintf(S->voice[i].avatar, sizeof(S->voice[i].avatar), "%s", avatar);
+            dirty = true;
+        }
+    }
+    if (dirty) S->msg_rev++;
+}
+
 void store_add_member(const char *name, const char *id, const char *avatar, int status)
 {
     if (S->member_count >= MAX_MEMBERS) return;
@@ -401,6 +436,7 @@ void store_add_member(const char *name, const char *id, const char *avatar, int 
     snprintf(r->id, sizeof(r->id), "%s", id ? id : "");
     snprintf(r->avatar, sizeof(r->avatar), "%s", avatar ? avatar : "");
     r->status = status;
+    voice_backfill_user(id, (name && strcmp(name, "?") != 0) ? name : NULL, avatar);
 }
 
 member_row *store_members(int *count_out)
@@ -420,6 +456,7 @@ void store_add_friend(const char *name, const char *id, const char *avatar)
     snprintf(r->text,   sizeof(r->text),   "%s", name   ? name   : "?");
     snprintf(r->id,     sizeof(r->id),     "%s", id     ? id     : "");
     snprintf(r->avatar, sizeof(r->avatar), "%s", avatar ? avatar : "");
+    voice_backfill_user(id, (name && strcmp(name, "?") != 0) ? name : NULL, avatar);
 }
 
 member_row *store_friends(int *count_out)
@@ -576,7 +613,7 @@ void store_set_channel_hidden(const char *id, bool hidden)
     if (c) c->hidden = hidden;
 }
 
-// Remove a channel/thread by id from whichever guild holds it.
+// Remove a channel/thread by id from whichever guild (or DM list) holds it.
 void store_remove_channel(const char *id)
 {
     if (!id || !id[0]) return;
@@ -590,11 +627,20 @@ void store_remove_channel(const char *id)
                 return;
             }
     }
+    for (int i = 0; i < S->dm_count; i++) {
+        if (strcmp(S->dms[i].id, id) == 0) {
+            memmove(&S->dms[i], &S->dms[i + 1],
+                    sizeof(channel) * (S->dm_count - i - 1));
+            S->dm_count--;
+            return;
+        }
+    }
 }
 
 void store_remove_guild(const char *id)
 {
     if (!id || !id[0]) return;
+    store_voice_clear_guild(id);
     for (int g = 0; g < S->guild_count; g++)
         if (strcmp(S->guilds[g].id, id) == 0) {
             memmove(&S->guilds[g], &S->guilds[g + 1],
@@ -620,4 +666,122 @@ void store_bump_unread(const char *id, const char *last_message_id, bool mention
     if (mention) c->mentions++;
     if (last_message_id)
         snprintf(c->last_message_id, sizeof(c->last_message_id), "%s", last_message_id);
+}
+
+void store_voice_clear_all(void)
+{
+    S->voice_count = 0;
+}
+
+void store_voice_clear_guild(const char *guild_id)
+{
+    if (!guild_id || !guild_id[0]) return;
+    int w = 0;
+    for (int i = 0; i < S->voice_count; i++) {
+        if (strcmp(S->voice[i].guild_id, guild_id) != 0)
+            S->voice[w++] = S->voice[i];
+    }
+    S->voice_count = w;
+}
+
+// Resolve fallback name/avatar from known local caches when voice state omits member.
+static void voice_resolve_fallback(const char *user_id, char *name_out, size_t ncap,
+                                   char *av_out, size_t acap)
+{
+    if (S->me_id[0] && strcmp(user_id, S->me_id) == 0) {
+        if (!name_out[0] && S->me_name[0])
+            snprintf(name_out, ncap, "%s", S->me_name);
+        if (!av_out[0] && S->me_avatar[0])
+            snprintf(av_out, acap, "%s", S->me_avatar);
+        return;
+    }
+    for (int i = 0; i < S->member_count; i++) {
+        if (S->members[i].is_group || strcmp(S->members[i].id, user_id) != 0) continue;
+        if (!name_out[0] && S->members[i].text[0])
+            snprintf(name_out, ncap, "%s", S->members[i].text);
+        if (!av_out[0] && S->members[i].avatar[0])
+            snprintf(av_out, acap, "%s", S->members[i].avatar);
+        if (name_out[0] && av_out[0]) return;
+    }
+    for (int i = 0; i < S->friend_count; i++) {
+        if (strcmp(S->friends[i].id, user_id) != 0) continue;
+        if (!name_out[0] && S->friends[i].text[0])
+            snprintf(name_out, ncap, "%s", S->friends[i].text);
+        if (!av_out[0] && S->friends[i].avatar[0])
+            snprintf(av_out, acap, "%s", S->friends[i].avatar);
+        if (name_out[0] && av_out[0]) return;
+    }
+    for (int i = 0; i < S->dm_count; i++) {
+        if (S->dms[i].type != CH_DM || strcmp(S->dms[i].recipient_id, user_id) != 0) continue;
+        if (!name_out[0] && S->dms[i].name[0])
+            snprintf(name_out, ncap, "%s", S->dms[i].name);
+        if (!av_out[0] && S->dms[i].avatar[0])
+            snprintf(av_out, acap, "%s", S->dms[i].avatar);
+        if (name_out[0] && av_out[0]) return;
+    }
+}
+
+void store_voice_set(const char *guild_id, const char *channel_id,
+                     const char *user_id, const char *name,
+                     const char *avatar, bool mute, bool deaf)
+{
+    if (!user_id || !user_id[0]) return;
+
+    if (!channel_id || !channel_id[0]) {
+        int w = 0;
+        for (int i = 0; i < S->voice_count; i++) {
+            bool uid_match = strcmp(S->voice[i].user_id, user_id) == 0;
+            bool gid_match = !guild_id || !guild_id[0] ||
+                             strcmp(S->voice[i].guild_id, guild_id) == 0;
+            if (uid_match && gid_match) continue;
+            S->voice[w++] = S->voice[i];
+        }
+        S->voice_count = w;
+        return;
+    }
+
+    int idx = -1;
+    for (int i = 0; i < S->voice_count; i++) {
+        if (strcmp(S->voice[i].user_id, user_id) == 0) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        if (S->voice_count >= MAX_VOICE_STATES) return;
+        idx = S->voice_count++;
+        memset(&S->voice[idx], 0, sizeof(S->voice[idx]));
+    }
+
+    voice_member *vm = &S->voice[idx];
+    char rname[80] = "", rav[40] = "";
+    if (name && name[0]) snprintf(rname, sizeof(rname), "%s", name);
+    else if (vm->name[0] && strcmp(vm->name, "User") != 0)
+        snprintf(rname, sizeof(rname), "%s", vm->name);
+
+    if (avatar && avatar[0]) snprintf(rav, sizeof(rav), "%s", avatar);
+    else if (vm->avatar[0]) snprintf(rav, sizeof(rav), "%s", vm->avatar);
+
+    if (!rname[0] || !rav[0])
+        voice_resolve_fallback(user_id, rname, sizeof(rname), rav, sizeof(rav));
+    if (!rname[0]) snprintf(rname, sizeof(rname), "User");
+
+    snprintf(vm->guild_id,   sizeof(vm->guild_id),   "%s", guild_id ? guild_id : "");
+    snprintf(vm->channel_id, sizeof(vm->channel_id), "%s", channel_id);
+    snprintf(vm->user_id,    sizeof(vm->user_id),    "%s", user_id);
+    snprintf(vm->name,       sizeof(vm->name),       "%s", rname);
+    snprintf(vm->avatar,     sizeof(vm->avatar),     "%s", rav);
+    vm->mute = mute;
+    vm->deaf = deaf;
+}
+
+int store_voice_for_channel(const char *channel_id, voice_member *out, int max)
+{
+    if (!channel_id || !channel_id[0] || !out || max <= 0) return 0;
+    int n = 0;
+    for (int i = 0; i < S->voice_count && n < max; i++) {
+        if (strcmp(S->voice[i].channel_id, channel_id) == 0)
+            out[n++] = S->voice[i];
+    }
+    return n;
 }

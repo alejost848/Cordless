@@ -18,23 +18,23 @@
 
 // A recent Discord desktop (Electron) UA.
 #define UA "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
-           "(KHTML, like Gecko) discord/1.0.9040 Chrome/128.0.6613.186 " \
-           "Electron/32.2.5 Safari/537.36"
+           "(KHTML, like Gecko) discord/1.0.9268 Chrome/134.0.6998.179 " \
+           "Electron/35.1.5 Safari/537.36"
 
 // Client super-properties (gateway + REST send the same object).
 // Override client_build_number per release with -DCLIENT_BUILD_NUMBER=<n>.
 #ifndef CLIENT_BUILD_NUMBER
-#define CLIENT_BUILD_NUMBER 396858
+#define CLIENT_BUILD_NUMBER 673869
 #endif
 #define CL_STR2(x) #x
 #define CL_STR(x)  CL_STR2(x)
 #define SUPERPROPS_JSON \
     "{\"os\":\"Windows\",\"browser\":\"Discord Client\"," \
-    "\"release_channel\":\"stable\",\"client_version\":\"1.0.9040\"," \
+    "\"release_channel\":\"stable\",\"client_version\":\"1.0.9268\"," \
     "\"os_version\":\"10.0.22631\",\"os_arch\":\"x64\"," \
     "\"app_arch\":\"x64\",\"system_locale\":\"en-US\"," \
     "\"browser_user_agent\":\"" UA "\"," \
-    "\"browser_version\":\"32.2.5\",\"client_build_number\":" CL_STR(CLIENT_BUILD_NUMBER) "," \
+    "\"browser_version\":\"35.1.5\",\"client_build_number\":" CL_STR(CLIENT_BUILD_NUMBER) "," \
     "\"native_build_number\":63451,\"client_event_source\":null}"
 
 const char *discord_user_agent(void) { return UA; }
@@ -72,11 +72,9 @@ int discord_auth_preflight(const char *cacert_path, char *fingerprint, size_t fp
     };
 
     unsigned char *out = NULL; int outlen = 0; long code = -1;
-    net_lock();
     int r = https_request_cookies("GET", DISCORD_API_BASE "/experiments", cacert_path,
                                   hdrs, NULL, 0, &out, &outlen, &code, 256 * 1024,
                                   cookies, ck_cap);
-    net_unlock();
     if (r != 0 || code != 200 || !out) {
         free(out);
         console_logf("[auth] preflight failed (rc=%d http=%ld)", r, code);
@@ -137,11 +135,9 @@ static long rest_call(const char *method, const char *url, const char *body,
 
     for (int attempt = 0; ; attempt++) {
         unsigned char *out = NULL; int outlen = 0; long code = -1;
-        net_lock();
         int r = https_request(method, url, cacert_path, hdrs,
                               (const unsigned char *)body, body ? (int)strlen(body) : 0,
                               &out, &outlen, &code, 6 * 1024 * 1024);
-        net_unlock();
         if (r != 0) { free(out); console_logf("[api] %s transport err", method); return -1; }
         if (code == 429 && attempt < 3) {
             double wait = parse_retry_after((const char *)out, outlen);
@@ -368,7 +364,8 @@ void discord_json_to_message(json_t *m, message *out)
             int rw = out->img_w, rh = out->img_h, MAXD = 400;
             if (rw > MAXD) { rh = (int)((long long)rh * MAXD / rw); rw = MAXD; }
             if (rh > MAXD) { rw = (int)((long long)rw * MAXD / rh); rh = MAXD; }
-            if (rw < 1) rw = 1; if (rh < 1) rh = 1;
+            if (rw < 1) rw = 1;
+            if (rh < 1) rh = 1;
             if (purl && purl[0])
                 snprintf(out->image_url, sizeof(out->image_url),
                          "%s%cwidth=%d&height=%d%s", purl,
@@ -394,7 +391,8 @@ void discord_json_to_message(json_t *m, message *out)
                 int rw = out->img_w, rh = out->img_h, MAXD = 400;
                 if (rw > MAXD) { rh = (int)((long long)rh * MAXD / rw); rw = MAXD; }
                 if (rh > MAXD) { rw = (int)((long long)rw * MAXD / rh); rh = MAXD; }
-                if (rw < 1) rw = 1; if (rh < 1) rh = 1;
+                if (rw < 1) rw = 1;
+            if (rh < 1) rh = 1;
                 // Poster still from the media proxy (first frame PNG).
                 if (purl && purl[0])
                     snprintf(out->image_url, sizeof(out->image_url),
@@ -482,7 +480,8 @@ void discord_json_to_message(json_t *m, message *out)
             int rw = out->img_w, rh = out->img_h, MAXD = 400;
             if (rw > MAXD) { rh = (int)((long long)rh * MAXD / rw); rw = MAXD; }
             if (rh > MAXD) { rw = (int)((long long)rw * MAXD / rh); rh = MAXD; }
-            if (rw < 1) rw = 1; if (rh < 1) rh = 1;
+            if (rw < 1) rw = 1;
+            if (rh < 1) rh = 1;
             // images-ext-* proxies reject our TLS fingerprint; for those fetch
             // the embed's original url and decode webp ourselves.
             bool ext_proxy = purl && strstr(purl, "images-ext");
@@ -630,12 +629,14 @@ int discord_get_messages(const char *channel_id, const char *around_id,
         json_t *arr = json_loads(resp, 0, &err);
         if (json_is_array(arr)) {
             store_lock();
-            store_clear_messages();
-            // Discord returns newest-first; add in reverse for oldest-first.
-            for (int i = (int)json_array_size(arr) - 1; i >= 0; i--) {
-                message msg;
-                discord_json_to_message(json_array_get(arr, i), &msg);
-                store_push_message(&msg);
+            if (strcmp(channel_id, store_open_channel()) == 0) {
+                store_clear_messages();
+                // Discord returns newest-first; add in reverse for oldest-first.
+                for (int i = (int)json_array_size(arr) - 1; i >= 0; i--) {
+                    message msg;
+                    discord_json_to_message(json_array_get(arr, i), &msg);
+                    store_push_message(&msg);
+                }
             }
             store_unlock();
         }
@@ -1294,7 +1295,7 @@ int discord_react(const char *channel_id, const char *message_id,
                   const char *cacert_path)
 {
     char enc[256]; url_encode(emoji, enc, sizeof(enc));
-    char url[256];
+    char url[512];
     snprintf(url, sizeof(url),
              DISCORD_API_BASE "/channels/%s/messages/%s/reactions/%s/@me",
              channel_id, message_id, enc);
@@ -1319,13 +1320,15 @@ int discord_get_messages_before(const char *channel_id, const char *before_id,
         json_t *arr = json_loads(resp, 0, NULL);
         if (json_is_array(arr)) {
             store_lock();
-            // Discord returns newest-first; prepend in that order for oldest-first.
-            size_t n = json_array_size(arr);
-            for (size_t i = 0; i < n; i++) {
-                message msg;
-                discord_json_to_message(json_array_get(arr, i), &msg);
-                if (!store_prepend_message(&msg)) break;
-                added++;
+            if (strcmp(channel_id, store_open_channel()) == 0) {
+                // Discord returns newest-first; prepend in that order for oldest-first.
+                size_t n = json_array_size(arr);
+                for (size_t i = 0; i < n; i++) {
+                    message msg;
+                    discord_json_to_message(json_array_get(arr, i), &msg);
+                    if (!store_prepend_message(&msg)) break;
+                    added++;
+                }
             }
             store_unlock();
         }
@@ -1404,10 +1407,8 @@ static int post_multipart(const char *channel_id, const char *content,
                            ct, NULL };
 
     long code = -1;
-    net_lock();
     int r = https_request("POST", url, cacert_path, hdrs, bodybuf, total,
                           NULL, NULL, &code, 1 << 20);
-    net_unlock();
     free(bodybuf);
     if (r != 0) console_logf("[api] upload transport err");
     return (int)code;
@@ -1448,4 +1449,13 @@ int discord_send_bytes(const char *channel_id, const char *content,
     return post_multipart(channel_id, content, data, (size_t)len,
                           filename && filename[0] ? filename : "upload.bin",
                           token, cacert_path);
+}
+
+int discord_ring_call(const char *channel_id, const char *token,
+                      const char *cacert_path)
+{
+    if (!channel_id || !channel_id[0]) return -1;
+    char url[256];
+    snprintf(url, sizeof(url), DISCORD_API_BASE "/channels/%s/call/ring", channel_id);
+    return api_perform("POST", url, "{\"recipients\":null}", token, cacert_path);
 }
