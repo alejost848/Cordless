@@ -65,21 +65,35 @@ vita_create_self(cordless_mem.skprx cordless_mem
 )
 vita_create_stubs(cordless_mem_stubs cordless_mem ${CMAKE_CURRENT_SOURCE_DIR}/kernel/exports.yml KERNEL)
 
-# Stage 1: Minimal *main loader + hot-reload (no SceNet/SceAudioIn stubs at boot)
+set(TAIHEN_STUB_DIR "${CMAKE_CURRENT_BINARY_DIR}/taihen_stubs")
+add_custom_command(
+  OUTPUT "${TAIHEN_STUB_DIR}/libtaihen_stub.a"
+  COMMAND ${VITA_LIBS_GEN} "${CMAKE_CURRENT_SOURCE_DIR}/taihen/taihen_stubs.yml" "${TAIHEN_STUB_DIR}"
+  COMMAND make -C "${TAIHEN_STUB_DIR}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/taihen/taihen_stubs.yml"
+  COMMENT "Building libtaihen_stub.a"
+)
+add_custom_target(taihen_stubs ALL DEPENDS "${TAIHEN_STUB_DIR}/libtaihen_stub.a")
+
+# Stage 1: Minimal *main loader + on-demand core wake listener (no SceNet/SceAudioIn stubs at boot)
 add_executable(cordless_voice_poc
   src/loader.c
 )
+add_dependencies(cordless_voice_poc taihen_stubs)
+target_link_directories(cordless_voice_poc PRIVATE "${TAIHEN_STUB_DIR}")
 target_link_libraries(cordless_voice_poc
   -Wl,--gc-sections
   -Wl,-u,module_start
   -Wl,-u,module_stop
   -nostdlib
   SceLibKernel_stub
+  SceSysmem_stub
   SceKernelThreadMgr_stub
   SceKernelModulemgr_stub
   SceIofilemgr_stub
   SceCtrl_stub
   SceSysmodule_stub
+  taihen_stub
   gcc
 )
 vita_create_self(cordless_voice_poc.suprx cordless_voice_poc
@@ -121,16 +135,6 @@ vita_create_self(cordless_voice_core.suprx cordless_voice_core
 )
 
 # Stage 3: Tiny *ALL user-mode HUD overlay (~8K)
-set(TAIHEN_STUB_DIR "${CMAKE_CURRENT_BINARY_DIR}/taihen_stubs")
-add_custom_command(
-  OUTPUT "${TAIHEN_STUB_DIR}/libtaihen_stub.a"
-  COMMAND ${VITA_LIBS_GEN} "${CMAKE_CURRENT_SOURCE_DIR}/taihen/taihen_stubs.yml" "${TAIHEN_STUB_DIR}"
-  COMMAND make -C "${TAIHEN_STUB_DIR}"
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/taihen/taihen_stubs.yml"
-  COMMENT "Building libtaihen_stub.a"
-)
-add_custom_target(taihen_stubs ALL DEPENDS "${TAIHEN_STUB_DIR}/libtaihen_stub.a")
-
 add_executable(cordless_hud
   src/hud.c
 )
