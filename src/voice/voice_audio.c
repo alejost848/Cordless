@@ -353,25 +353,8 @@ static int rx_worker(SceSize sz, void *p)
 // Opus-encoded -> sealed -> UDP. Five 0xF8FFFE silence frames end each utterance.
 
 #define VA_MIC_GRAIN   256  // sceAudioIn VOICE grain @ 16kHz (16ms)
-#define VA_VAD_MS2     700000  // default mean-square energy gate (Medium)
+#define VA_VAD_MS2     700000  // mean-square energy gate
 #define VA_VAD_HANG    25  // quiet frames before we stop (~500ms)
-
-static volatile int       s_ptt_enabled;
-static volatile int       s_ptt_down;
-static volatile long long s_vad_thresh = VA_VAD_MS2;
-
-void voice_audio_set_ptt(int enabled, int down)
-{
-    s_ptt_enabled = enabled ? 1 : 0;
-    s_ptt_down    = down ? 1 : 0;
-}
-
-void voice_audio_set_vad_sens(int sens_level)
-{
-    if (sens_level <= 0)      s_vad_thresh = 1600000;  // Low sensitivity (requires louder voice)
-    else if (sens_level >= 2) s_vad_thresh = 250000;   // High sensitivity (picks up softer voice)
-    else                      s_vad_thresh = VA_VAD_MS2;  // Medium (default)
-}
 
 static SceUID       s_tx_thread = -1;
 static int          s_mic = -1;
@@ -437,11 +420,7 @@ static int tx_worker(SceSize sz, void *p)
         while (accn >= VA_FRAME_SAMPLES && s_run) {
             long long e = 0;
             for (int i = 0; i < VA_FRAME_SAMPLES; i++) { int v = acc[i]; e += (long long)v * v; }
-            int active = 0;
-            if (!s_muted && !s_deafened) {
-                if (s_ptt_enabled) active = s_ptt_down ? 1 : 0;
-                else               active = ((e / VA_FRAME_SAMPLES) > s_vad_thresh);
-            }
+            int active = (s_muted || s_deafened) ? 0 : ((e / VA_FRAME_SAMPLES) > VA_VAD_MS2);
             if (active || (speaking && quiet < VA_VAD_HANG)) {
                 if (!speaking) { speaking = 1; s_tx_speaking = 1; quiet = 0; if (s_on_speaking) s_on_speaking(1); }
                 quiet = active ? 0 : quiet + 1;

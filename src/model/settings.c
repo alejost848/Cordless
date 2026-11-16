@@ -23,8 +23,6 @@ static void defaults(void)
     g_settings.clock_24h   = 0;  // 12-hour
     g_settings.open_last   = 0;  // Home
     g_settings.low_battery = 1;  // idle skip on
-    g_settings.voice_mode  = 0;  // Voice Activity
-    g_settings.mic_sens    = 1;  // Medium
 }
 
 void settings_load(void)

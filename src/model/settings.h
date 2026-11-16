@@ -10,8 +10,6 @@ typedef struct {
     int  clock_24h;    // 0 = 12-hour, 1 = 24-hour
     int  open_last;    // 0 open Home, 1 open last channel
     int  low_battery;  // 1 idle frame-skip, 0 always 60fps
-    int  voice_mode;   // 0 Voice Activity, 1 Push-to-Talk (hold Square)
-    int  mic_sens;     // 0 Low, 1 Medium (default), 2 High
 } app_settings;
 
 extern app_settings g_settings;

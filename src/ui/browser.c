@@ -14,7 +14,6 @@
 #include "api/discord.h"
 #include "gateway/gateway.h"
 #include "voice/voice.h"
-#include "voice/voice_audio.h"
 #include "console.h"
 
 #include <stdio.h>
@@ -293,8 +292,8 @@ static int      s_set_av_r[4], s_set_name_r[4];
 static int      s_set_sw_r[4];  // Switch Account button
 #define SET_BTN_H 34
 #define SET_ROW_H  30           // appearance setting row height
-#define SET_NAPP    9           // appearance + voice setting rows
-static int      s_set_app_r[SET_NAPP][4];  // setting row hit rects
+#define SET_NAPP    7           // appearance setting rows
+static int      s_set_app_r[SET_NAPP][4];  // appearance row hit rects
 static char     s_msg_sel_id[24];
 static bool     s_msg_sel_follow;
 static int      s_set_scroll;              // settings modal scroll (tall content)
@@ -816,8 +815,6 @@ void browser_init(const char *token, const char *cacert_path)
     snprintf(s_token, sizeof(s_token), "%s", token);
     snprintf(s_cacert, sizeof(s_cacert), "%s", cacert_path);
     s_restored = false;  // re-run the last-view restore for this login
-    voice_audio_set_vad_sens(g_settings.mic_sens);
-    voice_audio_set_ptt(g_settings.voice_mode == 1, 0);
 }
 
 static void compose_with(const char *initial)
@@ -2056,10 +2053,7 @@ static void menu_react(int idx)
 
 void browser_input(unsigned pressed, unsigned held, int ly, int ry)
 {
-    // Push-to-Talk: update held state even if composing, gated by voice_mode == 1.
-    voice_audio_set_ptt(g_settings.voice_mode == 1,
-                        (g_settings.voice_mode == 1 && (held & SCE_CTRL_SQUARE)) ? 1 : 0);
-
+    (void)held;
     // compose is modal: ignore app buttons while the inline keyboard is up
     if (s_compose_active) return;
 
@@ -2221,8 +2215,7 @@ void browser_input(unsigned pressed, unsigned held, int ly, int ry)
         }
     }
     if (pressed & SCE_CTRL_TRIANGLE) compose_message();
-    if ((pressed & SCE_CTRL_SQUARE) && voice_active() && g_settings.voice_mode == 0)
-        voice_toggle_mute();
+    if ((pressed & SCE_CTRL_SQUARE) && voice_active()) voice_toggle_mute();
     if ((pressed & SCE_CTRL_SELECT) && voice_active()) voice_toggle_deaf();
 
     // left stick scrolls messages
@@ -2578,10 +2571,6 @@ void browser_touch(int x, int y, int dy, bool tap)
                 case 4: g_settings.clock_24h ^= 1; break;
                 case 5: g_settings.open_last ^= 1; break;
                 case 6: g_settings.low_battery ^= 1; break;
-                case 7: g_settings.voice_mode ^= 1;
-                        voice_audio_set_ptt(g_settings.voice_mode == 1, 0); break;
-                case 8: g_settings.mic_sens = (g_settings.mic_sens + 1) % 3;
-                        voice_audio_set_vad_sens(g_settings.mic_sens); break;
                 }
                 settings_save();
             } else if (inbtn && y >= s_set_eb_y && y < s_set_eb_y + SET_BTN_H) {
@@ -4845,7 +4834,6 @@ static void draw_settings(void)
     ui_text(cx + 20, y, FS_TINY, COL_TEXT_MUTED, "APPEARANCE");
     y += 18;
     static const char *fs_lab[3] = { "Small", "Medium", "Large" };
-    static const char *sens_lab[3] = { "Low", "Medium", "High" };
     char av[SET_NAPP][20];
     snprintf(av[0], 20, "%s", g_settings.theme ? "Light" : "Dark");
     av[1][0] = '\0';  // accent draws a swatch, not text
@@ -4854,11 +4842,8 @@ static void draw_settings(void)
     snprintf(av[4], 20, "%s", g_settings.clock_24h ? "24-hour" : "12-hour");
     snprintf(av[5], 20, "%s", g_settings.open_last ? "Last channel" : "Home");
     snprintf(av[6], 20, "%s", g_settings.low_battery ? "On" : "Off");
-    snprintf(av[7], 20, "%s", g_settings.voice_mode ? "Push-to-Talk (Sq)" : "Voice Activity");
-    snprintf(av[8], 20, "%s", sens_lab[g_settings.mic_sens % 3]);
     static const char *app_lab[SET_NAPP] = {
-        "Theme", "Accent", "Font Size", "Density", "Clock", "Open To", "Low Battery",
-        "Voice Input", "Mic Sensitivity" };
+        "Theme", "Accent", "Font Size", "Density", "Clock", "Open To", "Low Battery" };
     for (int i = 0; i < SET_NAPP; i++) {
         ui_rounded_rect(cx + 20, y, cw - 40, SET_ROW_H, 6, COL_ELEVATED);
         ui_text(cx + 30, y + 8, FS_SMALL, COL_TEXT, app_lab[i]);
