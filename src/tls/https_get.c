@@ -9,7 +9,10 @@
 #include <unistd.h>  // close
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <netinet/in.h>
 #include <netdb.h>
+
+#include <psp2/kernel/processmgr.h>
 
 #include <mbedtls/ssl.h>
 #include <mbedtls/entropy.h>
@@ -110,6 +113,114 @@ static void collect_cookies(const char *hdr, int hdr_len, char *jar, size_t cap)
     }
 }
 
+// In-memory DNS cache (5-minute TTL) + TLS session resumption cache.
+#define DNS_CACHE_N   16
+#define DNS_TTL_US    (300ULL * 1000000ULL)
+#define TLS_SESS_N    8
+
+static struct {
+    char host[128], port[8];
+    struct sockaddr_in addr;
+    uint64_t expires_us;
+    uint64_t used;
+} s_dns[DNS_CACHE_N];
+static uint64_t s_dns_clk;
+
+static struct {
+    char host[128];
+    mbedtls_ssl_session sess;
+    int valid;
+    uint64_t used;
+} s_tls_sess[TLS_SESS_N];
+static uint64_t s_tls_clk;
+
+static int dns_resolve_cached(const char *host, const char *port, struct sockaddr_in *out)
+{
+    uint64_t now = sceKernelGetProcessTimeWide();
+    net_lock();
+    psa_crypto_init();
+    int empty = -1, lru = 0;
+    uint64_t best = ~0ULL;
+    for (int i = 0; i < DNS_CACHE_N; i++) {
+        if (s_dns[i].expires_us > now &&
+            strcmp(s_dns[i].host, host) == 0 && strcmp(s_dns[i].port, port) == 0) {
+            s_dns[i].used = ++s_dns_clk;
+            *out = s_dns[i].addr;
+            net_unlock();
+            return 0;
+        }
+        if (s_dns[i].expires_us <= now && empty < 0) empty = i;
+        if (s_dns[i].used < best) { best = s_dns[i].used; lru = i; }
+    }
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    int gai_rc = getaddrinfo(host, port, &hints, &res);
+    if (gai_rc != 0 || !res || res->ai_addrlen < (socklen_t)sizeof(struct sockaddr_in)) {
+        if (res) freeaddrinfo(res);
+        net_unlock();
+        return -1;
+    }
+    *out = *(const struct sockaddr_in *)res->ai_addr;
+    freeaddrinfo(res);
+
+    int slot = (empty >= 0) ? empty : lru;
+    snprintf(s_dns[slot].host, sizeof(s_dns[slot].host), "%s", host);
+    snprintf(s_dns[slot].port, sizeof(s_dns[slot].port), "%s", port);
+    s_dns[slot].addr = *out;
+    s_dns[slot].expires_us = now + DNS_TTL_US;
+    s_dns[slot].used = ++s_dns_clk;
+    net_unlock();
+    return 0;
+}
+
+static void dns_invalidate(const char *host, const char *port)
+{
+    net_lock();
+    for (int i = 0; i < DNS_CACHE_N; i++)
+        if (strcmp(s_dns[i].host, host) == 0 && strcmp(s_dns[i].port, port) == 0)
+            s_dns[i].expires_us = 0;
+    net_unlock();
+}
+
+static void tls_sess_load(const char *host, mbedtls_ssl_context *ssl)
+{
+    net_lock();
+    for (int i = 0; i < TLS_SESS_N; i++) {
+        if (s_tls_sess[i].valid && strcmp(s_tls_sess[i].host, host) == 0) {
+            s_tls_sess[i].used = ++s_tls_clk;
+            mbedtls_ssl_set_session(ssl, &s_tls_sess[i].sess);
+            break;
+        }
+    }
+    net_unlock();
+}
+
+static void tls_sess_save(const char *host, mbedtls_ssl_context *ssl)
+{
+    net_lock();
+    int slot = -1, empty = -1, lru = 0;
+    uint64_t best = ~0ULL;
+    for (int i = 0; i < TLS_SESS_N; i++) {
+        if (s_tls_sess[i].valid && strcmp(s_tls_sess[i].host, host) == 0) { slot = i; break; }
+        if (!s_tls_sess[i].valid && empty < 0) empty = i;
+        if (s_tls_sess[i].used < best) { best = s_tls_sess[i].used; lru = i; }
+    }
+    if (slot < 0) slot = (empty >= 0) ? empty : lru;
+    if (s_tls_sess[slot].valid) mbedtls_ssl_session_free(&s_tls_sess[slot].sess);
+    mbedtls_ssl_session_init(&s_tls_sess[slot].sess);
+    if (mbedtls_ssl_get_session(ssl, &s_tls_sess[slot].sess) == 0) {
+        snprintf(s_tls_sess[slot].host, sizeof(s_tls_sess[slot].host), "%s", host);
+        s_tls_sess[slot].valid = 1;
+        s_tls_sess[slot].used = ++s_tls_clk;
+    } else {
+        mbedtls_ssl_session_free(&s_tls_sess[slot].sess);
+        s_tls_sess[slot].valid = 0;
+    }
+    net_unlock();
+}
+
 // Core HTTPS request. `follow` chases 3xx as GET; `only_200` returns a body only on
 // 200 (else any status with a body); `cookie_jar`, if set, collects Set-Cookie pairs.
 static int do_request(const char *method, const char *url, const char *cacert_path,
@@ -131,21 +242,18 @@ static int do_request(const char *method, const char *url, const char *cacert_pa
     if (parse_url(url, host, sizeof(host), port, sizeof(port), path, sizeof(path)) != 0)
         return -1;
 
-    net_lock();
-    psa_crypto_init();
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
-    int gai_rc = getaddrinfo(host, port, &hints, &res);
-    net_unlock();
-    if (gai_rc != 0 || !res) return -1;
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) { freeaddrinfo(res); return -1; }
+    struct sockaddr_in sa;
+    if (dns_resolve_cached(host, port, &sa) != 0) return -1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
     struct timeval tv = { .tv_sec = 15, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) { close(fd); freeaddrinfo(res); return -1; }
-    freeaddrinfo(res);
+    if (connect(fd, (const struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        close(fd);
+        dns_invalidate(host, port);
+        return -1;
+    }
 
     mbedtls_ssl_context ssl;   mbedtls_ssl_config conf;
     mbedtls_entropy_context ent; mbedtls_ctr_drbg_context drbg;
@@ -171,9 +279,11 @@ static int do_request(const char *method, const char *url, const char *cacert_pa
     if (mbedtls_ssl_setup(&ssl, &conf) != 0) goto done;
     mbedtls_ssl_set_hostname(&ssl, host);
     mbedtls_ssl_set_bio(&ssl, &fd, bio_send, bio_recv, NULL);
+    tls_sess_load(host, &ssl);
     do { rc = mbedtls_ssl_handshake(&ssl); }
     while (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE);
     if (rc != 0) { console_logf("[https] handshake %s rc=-0x%04x", host, -rc); goto done; }
+    tls_sess_save(host, &ssl);
 
     // Request line + headers.
     char req[2048];

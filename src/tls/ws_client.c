@@ -35,7 +35,7 @@ struct ws_client {
     SceUID lock;
     mbedtls_ssl_context ssl;   mbedtls_ssl_config conf;
     mbedtls_entropy_context ent; mbedtls_ctr_drbg_context drbg;
-    unsigned char *rx; size_t rx_len, rx_cap;  // raw bytes pulled from TLS
+    unsigned char *rx; size_t rx_off, rx_len, rx_cap;  // raw bytes pulled from TLS
     unsigned char *msg; size_t msg_len, msg_cap;  // app message being assembled
     int msg_started;  // mid text/binary reassembly
     int msg_opcode;  // opcode being assembled (0x1 text / 0x2 binary)
@@ -299,21 +299,22 @@ static int msg_append(ws_client *w, const unsigned char *p, size_t n)
     return 0;
 }
 
-// Consume one frame from the head of rx. Returns 1 if parsed (rx compacted), 0 if
+// Consume one frame from rx + rx_off. Returns 1 if parsed, 0 if
 // more bytes needed, -1 on close/error; sets *done=1 on a completed app message.
 static int consume_frame(ws_client *w, int *done)
 {
-    if (w->rx_len < 2) return 0;
-    unsigned char *b = w->rx;
+    size_t avail = w->rx_len - w->rx_off;
+    if (avail < 2) return 0;
+    unsigned char *b = w->rx + w->rx_off;
     int fin = b[0] & 0x80, opcode = b[0] & 0x0F;
     int masked = b[1] & 0x80;  // server frames are not masked
     unsigned long long paylen = b[1] & 0x7F;
     size_t off = 2;
     if (paylen == 126) {
-        if (w->rx_len < 4) return 0;
+        if (avail < 4) return 0;
         paylen = ((unsigned)b[2] << 8) | b[3]; off = 4;
     } else if (paylen == 127) {
-        if (w->rx_len < 10) return 0;
+        if (avail < 10) return 0;
         paylen = 0; for (int i = 0; i < 8; i++) paylen = (paylen << 8) | b[2 + i];
         off = 10;
     }
@@ -326,7 +327,7 @@ static int consume_frame(ws_client *w, int *done)
     if ((opcode == 0x8 || opcode == 0x9 || opcode == 0xA) && paylen > 125) return -1;
     size_t mask_off = off;
     if (masked) off += 4;
-    if (w->rx_len < off + paylen) return 0;  // frame incomplete
+    if (avail < off + paylen) return 0;  // frame incomplete
 
     unsigned char *pl = b + off;
     if (masked) for (unsigned long long i = 0; i < paylen; i++) pl[i] ^= b[mask_off + (i & 3)];
@@ -350,10 +351,9 @@ static int consume_frame(ws_client *w, int *done)
         if (fin) { *done = 1; w->msg_started = 0; }
     }
 
-    // drop the consumed frame
-    size_t consumed = off + paylen;
-    memmove(w->rx, w->rx + consumed, w->rx_len - consumed);
-    w->rx_len -= consumed;
+    // advance read cursor; reset when drained so normal frames avoid memmove
+    w->rx_off += off + (size_t)paylen;
+    if (w->rx_off >= w->rx_len) { w->rx_off = 0; w->rx_len = 0; }
     return ret;
 }
 
@@ -445,7 +445,13 @@ int ws_recv_ex(ws_client *w, char **buf, size_t *cap, int *is_binary)
         }
         if (cr < 0) { out_ret = -1; goto out; }  // close/error
 
-        // 2. Pull more TLS bytes (non-blocking).
+        // 2. Pull more TLS bytes (non-blocking). Compact unread tail only when needed.
+        if (w->rx_off > 0 && (w->rx_off >= 32768 || w->rx_len + 16384 > w->rx_cap)) {
+            size_t rem = w->rx_len - w->rx_off;
+            if (rem > 0) memmove(w->rx, w->rx + w->rx_off, rem);
+            w->rx_len = rem;
+            w->rx_off = 0;
+        }
         if (rx_reserve(w, 16384) != 0) { out_ret = -1; goto out; }
         int r = mbedtls_ssl_read(&w->ssl, w->rx + w->rx_len, 16384);
         if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) { out_ret = 0; goto out; }

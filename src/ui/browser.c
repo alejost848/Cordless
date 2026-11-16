@@ -5514,9 +5514,16 @@ void browser_draw(void)
     build_rows(g, home);
     const char *vcid = voice_channel_id();
     if (vcid[0]) {
-        channel *vc = store_find_channel(vcid);
-        if (vc && vc->name[0])
-            snprintf(s_voice_ch_name, sizeof(s_voice_ch_name), "%s", vc->name);
+        static char s_vcn_cid[24];
+        static unsigned s_vcn_rev = 0xFFFFFFFFu;
+        unsigned rev = store_msg_rev();
+        if (strcmp(s_vcn_cid, vcid) != 0 || s_vcn_rev != rev) {
+            snprintf(s_vcn_cid, sizeof(s_vcn_cid), "%s", vcid);
+            s_vcn_rev = rev;
+            channel *vc = store_find_channel(vcid);
+            if (vc && vc->name[0])
+                snprintf(s_voice_ch_name, sizeof(s_voice_ch_name), "%s", vc->name);
+        }
     }
     store_unlock();
 

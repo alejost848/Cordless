@@ -48,7 +48,8 @@ typedef struct {
 
 static entry     s_cache[CACHE_N];
 static SceUID    s_mutex;
-static SceUID    s_thread = -1;
+#define IMG_WORKERS 2
+static SceUID    s_threads[IMG_WORKERS] = { -1, -1 };
 static volatile int s_run;
 static char      s_cacert[256];
 static unsigned  s_tick;
@@ -170,11 +171,11 @@ static int decode_to_rgba(entry *e, const unsigned char *bytes, int nb);  // fwd
 
 static int worker(SceSize a, void *ap)
 {
-    (void)a; (void)ap;
-    disk_cache_prune();  // prune the on-disk cache once
+    int wid = (a >= sizeof(int) && ap) ? *(int *)ap : 0;
+    if (wid == 0) disk_cache_prune();  // prune the on-disk cache once
     while (s_run) {
         int idx = -1;
-        char url[256];
+        char url[600];
         sceKernelLockMutex(s_mutex, 1, NULL);
         // Fetch the most-recently-requested queued image first.
         unsigned best = 0;
@@ -381,19 +382,24 @@ void imagecache_init(const char *cacert_path)
     sceIoMkdir(IMGCACHE_DIR, 0777);
     s_mutex = sceKernelCreateMutex("img_cache", 0, 0, NULL);
     s_run = 1;
-    // Pin the decode worker to CPU core 1 (render=0, images=1, gateway=2).
-    s_thread = sceKernelCreateThread("img_worker", worker, 0x40, 0x100000, 0,
-                                     SCE_KERNEL_CPU_MASK_USER_1, NULL);
-    if (s_thread >= 0) sceKernelStartThread(s_thread, 0, NULL);
+    // Pin the decode workers to CPU core 1 (render=0, images=1, gateway=2).
+    for (int i = 0; i < IMG_WORKERS; i++) {
+        int wid = i;
+        s_threads[i] = sceKernelCreateThread("img_worker", worker, 0x40, 0x100000, 0,
+                                             SCE_KERNEL_CPU_MASK_USER_1, NULL);
+        if (s_threads[i] >= 0) sceKernelStartThread(s_threads[i], sizeof(wid), &wid);
+    }
 }
 
 void imagecache_fini(void)
 {
     s_run = 0;
-    if (s_thread >= 0) {
-        sceKernelWaitThreadEnd(s_thread, NULL, NULL);
-        sceKernelDeleteThread(s_thread);
-        s_thread = -1;
+    for (int i = 0; i < IMG_WORKERS; i++) {
+        if (s_threads[i] >= 0) {
+            sceKernelWaitThreadEnd(s_threads[i], NULL, NULL);
+            sceKernelDeleteThread(s_threads[i]);
+            s_threads[i] = -1;
+        }
     }
 }
 

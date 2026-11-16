@@ -373,24 +373,38 @@ static void clip_to_width(vita2d_font *f, int size, const char *s, int max_w,
                           char *out, size_t out_cap)
 {
     if (!f) { out[0] = '\0'; return; }
+    if (max_w <= 0) { snprintf(out, out_cap, "..."); return; }
     if (vita2d_font_text_width(f, size, s) <= max_w) {
         snprintf(out, out_cap, "%s", s);
         return;
     }
-    size_t n = strlen(s);
-    while (n > 0) {
-        char tmp[256];
-        if (n + 2 >= sizeof(tmp)) { n--; continue; }
-        memcpy(tmp, s, n);
-        tmp[n] = '\0';
-        strcat(tmp, "...");
-        if (vita2d_font_text_width(f, size, tmp) <= max_w) {
-            snprintf(out, out_cap, "%s", tmp);
-            return;
+    size_t len = strlen(s);
+    if (len > 250) len = 250;
+    size_t lo = 0, hi = len;
+    while (lo < hi) {
+        size_t mid = (lo + hi + 1) / 2;
+        while (mid > lo && (s[mid] & 0xC0) == 0x80) mid--;
+        if (mid == lo) {
+            mid++;
+            while (mid < hi && (s[mid] & 0xC0) == 0x80) mid++;
         }
-        n--;
+        char tmp[256];
+        memcpy(tmp, s, mid);
+        tmp[mid] = '\0';
+        strcat(tmp, "...");
+        if (vita2d_font_text_width(f, size, tmp) <= max_w) lo = mid;
+        else                                                hi = mid - 1;
     }
-    snprintf(out, out_cap, "...");
+    if (lo == 0) {
+        snprintf(out, out_cap, "...");
+    } else {
+        while (lo > 0 && (s[lo] & 0xC0) == 0x80) lo--;
+        char tmp[256];
+        memcpy(tmp, s, lo);
+        tmp[lo] = '\0';
+        strcat(tmp, "...");
+        snprintf(out, out_cap, "%s", tmp);
+    }
 }
 
 static unsigned ui_strhash(const char *s)
@@ -399,10 +413,11 @@ static unsigned ui_strhash(const char *s)
     for (; *s; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
     return h;
 }
-#define CLIP_CACHE_N 192
+#define CLIP_SETS 64
+#define CLIP_WAYS 4
 static struct {
     const void *font; int size, max_w; unsigned hash, age; char out[96];
-} s_clipc[CLIP_CACHE_N];
+} s_clipc[CLIP_SETS * CLIP_WAYS];
 static unsigned s_clip_clock;
 static void clip_cached(vita2d_font *f, int size, const char *s, int max_w,
                         char *out, size_t out_cap)
@@ -410,7 +425,8 @@ static void clip_cached(vita2d_font *f, int size, const char *s, int max_w,
     if (!f || !s) { out[0] = '\0'; return; }
     unsigned h = ui_strhash(s);
     if (++s_clip_clock == 0) s_clip_clock = 1;
-    for (int i = 0; i < CLIP_CACHE_N; i++)
+    int base = (int)(h & (CLIP_SETS - 1)) * CLIP_WAYS;
+    for (int i = base; i < base + CLIP_WAYS; i++)
         if (s_clipc[i].hash == h && s_clipc[i].font == f &&
             s_clipc[i].size == size && s_clipc[i].max_w == max_w) {
             s_clipc[i].age = s_clip_clock;
@@ -421,8 +437,9 @@ static void clip_cached(vita2d_font *f, int size, const char *s, int max_w,
     clip_to_width(f, size, s, max_w, tmp, sizeof(tmp));
     snprintf(out, out_cap, "%s", tmp);
     if (strlen(tmp) >= sizeof(s_clipc[0].out)) return;
-    int lru = 0; unsigned best = 0xFFFFFFFFu;
-    for (int i = 0; i < CLIP_CACHE_N; i++) if (s_clipc[i].age < best) { best = s_clipc[i].age; lru = i; }
+    int lru = base; unsigned best = 0xFFFFFFFFu;
+    for (int i = base; i < base + CLIP_WAYS; i++)
+        if (s_clipc[i].age < best) { best = s_clipc[i].age; lru = i; }
     s_clipc[lru].font = f; s_clipc[lru].size = size; s_clipc[lru].max_w = max_w;
     s_clipc[lru].hash = h; s_clipc[lru].age = s_clip_clock;
     snprintf(s_clipc[lru].out, sizeof(s_clipc[lru].out), "%s", tmp);
