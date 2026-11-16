@@ -160,9 +160,7 @@ static int fetch(const char *url, unsigned char **out, int *outn)
     if (cached) { *out = cached; return 0; }
 
     long code = 0;
-    net_lock();
     int rc = https_get_mbedtls(url, s_cacert, out, outn, &code, IMG_MAX_BYTES);
-    net_unlock();
     if (rc == 0 && *out && *outn > 0) disk_write(path, *out, *outn);
     else console_logf("[img] http=%ld %.70s", code, url);
     return rc;
@@ -248,7 +246,8 @@ static int static_to_rgba(entry *e, const unsigned char *bytes, int nb)
         int sx = (w + MAXD - 1) / MAXD, sy = (h + MAXD - 1) / MAXD;
         int s = sx > sy ? sx : sy;
         int nw = w / s, nh = h / s;
-        if (nw < 1) nw = 1; if (nh < 1) nh = 1;
+        if (nw < 1) nw = 1;
+        if (nh < 1) nh = 1;
         unsigned char *dn = malloc((size_t)nw * nh * 4);
         if (dn) {
             for (int y = 0; y < nh; y++)

@@ -3,8 +3,8 @@
 
 #include <stddef.h>
 
-// Minimal RFC 6455 WebSocket client over mbedTLS. Non-blocking: the caller polls
-// under net_lock. Control frames handled internally; ws_recv returns app messages.
+// Minimal RFC 6455 WebSocket client over mbedTLS. Non-blocking after handshake,
+// internally synchronized per-client. Control frames handled internally; ws_recv returns app messages.
 
 typedef struct ws_client ws_client;
 

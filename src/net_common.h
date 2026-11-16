@@ -15,7 +15,8 @@ void net_finish(void);
 // Writes the absolute path (ux0:app/<TITLEID>/rel) of a vpk-shipped file into `out`.
 void net_app_path(char *out, unsigned out_len, const char *rel);
 
-// Hold net_lock() around every blocking network op (TLS request / ws_recv / ws_send).
+// Serializes non-reentrant DNS/crypto init calls (getaddrinfo / psa_crypto_init).
+// Per-socket TLS/UDP I/O runs concurrently across distinct sockets.
 void net_lock(void);
 void net_unlock(void);
 

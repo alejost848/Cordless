@@ -185,9 +185,7 @@ void video_play(const char *url, const char *cacert_path)
 
     // 1. Fetch the whole file (attachments <= 25 MB).
     unsigned char *data = NULL; int n = 0; long http = 0;
-    net_lock();
     int rc = https_get_mbedtls(url, cacert_path, &data, &n, &http, VID_MAX_BYTES);
-    net_unlock();
     if (rc != 0 || !data) { console_logf("[vid] fetch fail rc=%d http=%ld", rc, http); return; }
 
     // 2. Demux.

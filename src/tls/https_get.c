@@ -1,5 +1,6 @@
 #include "tls/https_get.h"
 #include "console.h"
+#include "net_common.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +8,7 @@
 #include <strings.h>  // strncasecmp
 #include <unistd.h>  // close
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netdb.h>
 
 #include <mbedtls/ssl.h>
@@ -33,8 +35,12 @@ static int parse_url(const char *url, char *host, size_t hcap, char *port,
     size_t hlen = colon ? (size_t)(colon - h) : (slash ? (size_t)(slash - h) : strlen(h));
     if (hlen == 0 || hlen >= hcap) return -1;
     memcpy(host, h, hlen); host[hlen] = '\0';
-    if (colon) { size_t pl = (slash ? (size_t)(slash - (colon + 1)) : strlen(colon + 1));
-                 if (pl >= pcap) return -1; memcpy(port, colon + 1, pl); port[pl] = '\0'; }
+    if (colon) {
+        size_t pl = (slash ? (size_t)(slash - (colon + 1)) : strlen(colon + 1));
+        if (pl >= pcap) return -1;
+        memcpy(port, colon + 1, pl);
+        port[pl] = '\0';
+    }
     else       snprintf(port, pcap, "443");
     snprintf(path, pathcap, "%s", slash ? slash : "/");
     return 0;
@@ -125,13 +131,19 @@ static int do_request(const char *method, const char *url, const char *cacert_pa
     if (parse_url(url, host, sizeof(host), port, sizeof(port), path, sizeof(path)) != 0)
         return -1;
 
+    net_lock();
     psa_crypto_init();
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, port, &hints, &res) != 0 || !res) return -1;
+    int gai_rc = getaddrinfo(host, port, &hints, &res);
+    net_unlock();
+    if (gai_rc != 0 || !res) return -1;
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) { freeaddrinfo(res); return -1; }
+    struct timeval tv = { .tv_sec = 15, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) { close(fd); freeaddrinfo(res); return -1; }
     freeaddrinfo(res);
 

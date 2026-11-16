@@ -1,6 +1,7 @@
 #include "tls/ws_client.h"
 #include "util/b64.h"
 #include "console.h"
+#include "net_common.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,9 +11,11 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netdb.h>
 
 #include <psp2/kernel/rng.h>
+#include <psp2/kernel/threadmgr.h>
 #include <zlib.h>
 
 #include <mbedtls/ssl.h>
@@ -29,6 +32,7 @@
 
 struct ws_client {
     int fd;
+    SceUID lock;
     mbedtls_ssl_context ssl;   mbedtls_ssl_config conf;
     mbedtls_entropy_context ent; mbedtls_ctr_drbg_context drbg;
     unsigned char *rx; size_t rx_len, rx_cap;  // raw bytes pulled from TLS
@@ -107,16 +111,35 @@ ws_client *ws_open(const char *url, const char *cacert_path,
     ws_client *w = calloc(1, sizeof(*w));
     if (!w) return NULL;
     w->fd = -1;
+    w->lock = sceKernelCreateMutex("ws_client", SCE_KERNEL_MUTEX_ATTR_RECURSIVE, 0, NULL);
 
+    net_lock();
     psa_crypto_init();
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, port, &hints, &res) != 0 || !res) { free(w); return NULL; }
+    int gai_rc = getaddrinfo(host, port, &hints, &res);
+    net_unlock();
+    if (gai_rc != 0 || !res) {
+        if (w->lock >= 0) sceKernelDeleteMutex(w->lock);
+        free(w);
+        return NULL;
+    }
     w->fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (w->fd < 0) { freeaddrinfo(res); free(w); return NULL; }
+    if (w->fd < 0) {
+        freeaddrinfo(res);
+        if (w->lock >= 0) sceKernelDeleteMutex(w->lock);
+        free(w);
+        return NULL;
+    }
+    struct timeval tv = { .tv_sec = 15, .tv_usec = 0 };
+    setsockopt(w->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(w->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (connect(w->fd, res->ai_addr, res->ai_addrlen) < 0) {
-        freeaddrinfo(res); close(w->fd); free(w); return NULL;
+        freeaddrinfo(res); close(w->fd);
+        if (w->lock >= 0) sceKernelDeleteMutex(w->lock);
+        free(w);
+        return NULL;
     }
     freeaddrinfo(res);
 
@@ -229,17 +252,26 @@ static int send_frame(ws_client *w, int opcode, const unsigned char *payload, in
     return 0;
 }
 
+static inline void ws_lock(ws_client *w)   { if (w && w->lock >= 0) sceKernelLockMutex(w->lock, 1, NULL); }
+static inline void ws_unlock(ws_client *w) { if (w && w->lock >= 0) sceKernelUnlockMutex(w->lock, 1); }
+
 int ws_send_text(ws_client *w, const char *txt, int len)
 {
     if (!w) return -1;
     if (len < 0) len = (int)strlen(txt);
-    return send_frame(w, 0x1, (const unsigned char *)txt, len);
+    ws_lock(w);
+    int rc = send_frame(w, 0x1, (const unsigned char *)txt, len);
+    ws_unlock(w);
+    return rc;
 }
 
 int ws_send_binary(ws_client *w, const unsigned char *data, int len)
 {
     if (!w || len < 0) return -1;
-    return send_frame(w, 0x2, data, len);
+    ws_lock(w);
+    int rc = send_frame(w, 0x2, data, len);
+    ws_unlock(w);
+    return rc;
 }
 
 static int rx_reserve(ws_client *w, size_t extra)
@@ -374,6 +406,8 @@ int ws_recv_ex(ws_client *w, char **buf, size_t *cap, int *is_binary)
 {
     if (!w) return -1;
     if (is_binary) *is_binary = 0;
+    ws_lock(w);
+    int out_ret = -1;
     for (;;) {
         // 1. Assemble from whatever is already buffered.
         int done = 0, cr;
@@ -384,38 +418,43 @@ int ws_recv_ex(ws_client *w, char **buf, size_t *cap, int *is_binary)
             if (w->compressed) {
                 // Feed this message's compressed bytes into the stream; inflate only
                 // once the 00 00 FF FF flush terminates a gateway event.
-                if (zbuf_append(w, w->msg, w->msg_len) != 0) return -1;
+                if (zbuf_append(w, w->msg, w->msg_len) != 0) { out_ret = -1; goto out; }
                 w->msg_len = 0;
                 if (w->zbuf_len < 4 ||
                     memcmp(w->zbuf + w->zbuf_len - 4, "\x00\x00\xff\xff", 4) != 0)
                     continue;  // event incomplete; read more
                 int jl = ws_inflate(w);
                 w->zbuf_len = 0;
-                if (jl < 0) return -1;
-                if ((size_t)jl + 1 > *cap) { char *g = realloc(*buf, jl + 1); if (!g) return -1; *buf = g; *cap = jl + 1; }
+                if (jl < 0) { out_ret = -1; goto out; }
+                if ((size_t)jl + 1 > *cap) { char *g = realloc(*buf, jl + 1); if (!g) { out_ret = -1; goto out; } *buf = g; *cap = jl + 1; }
                 memcpy(*buf, w->infl, jl);
                 (*buf)[jl] = '\0';
-                return jl;
+                out_ret = jl;
+                goto out;
             }
 
             if (is_binary) *is_binary = (w->msg_opcode == 0x2);
             size_t need = w->msg_len + 1;
-            if (need > *cap) { char *g = realloc(*buf, need); if (!g) return -1; *buf = g; *cap = need; }
+            if (need > *cap) { char *g = realloc(*buf, need); if (!g) { out_ret = -1; goto out; } *buf = g; *cap = need; }
             memcpy(*buf, w->msg, w->msg_len);
             (*buf)[w->msg_len] = '\0';
             int out = (int)w->msg_len;
             w->msg_len = 0;
-            return out;
+            out_ret = out;
+            goto out;
         }
-        if (cr < 0) return -1;  // close/error
+        if (cr < 0) { out_ret = -1; goto out; }  // close/error
 
         // 2. Pull more TLS bytes (non-blocking).
-        if (rx_reserve(w, 16384) != 0) return -1;
+        if (rx_reserve(w, 16384) != 0) { out_ret = -1; goto out; }
         int r = mbedtls_ssl_read(&w->ssl, w->rx + w->rx_len, 16384);
-        if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) return 0;
-        if (r <= 0) return -1;  // close_notify / error
+        if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) { out_ret = 0; goto out; }
+        if (r <= 0) { out_ret = -1; goto out; }  // close_notify / error
         w->rx_len += r;
     }
+out:
+    ws_unlock(w);
+    return out_ret;
 }
 
 int ws_recv(ws_client *w, char **buf, size_t *cap)
@@ -436,6 +475,7 @@ void ws_close(ws_client *w)
     mbedtls_ctr_drbg_free(&w->drbg); mbedtls_entropy_free(&w->ent);
     if (w->fd >= 0) close(w->fd);
     if (w->compressed) inflateEnd(&w->zs);
+    if (w->lock >= 0) sceKernelDeleteMutex(w->lock);
     free(w->rx); free(w->msg); free(w->zbuf); free(w->infl);
     free(w);
 }

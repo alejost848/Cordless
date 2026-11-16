@@ -177,11 +177,9 @@ static void exchange_token(ra_ctx *c, const char *ticket)
     hdrs[hi] = NULL;
 
     unsigned char *out = NULL; int outlen = 0; long code = 0;
-    net_lock();
     int rc = https_request("POST", RA_LOGIN_URL, c->cacert, hdrs,
                            (const unsigned char *)body, (int)strlen(body),
                            &out, &outlen, &code, 1 << 20);
-    net_unlock();
     char *resp_p = (char *)out;
     console_dbgf("[ra] login POST rc=%d http=%ld", rc, code);
     if (code != 200 && resp_p) {
