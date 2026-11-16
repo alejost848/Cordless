@@ -4475,11 +4475,11 @@ static void draw_messages(void)
     if (s_uploading)
         ui_text(msg_right - 150, cb_y + 10, FS_SMALL, COL_TEXT_LINK, "Uploading image...");
     else if (s_msg_sel_id[0]) {
-        int hy = cb_y + 10, hx = msg_right - 162;
-        hx += ui_pad_glyph(hx, hy, FS_SMALL, COL_TEXT_BRIGHT, UI_PAD_CROSS, "[X]");
+        int hy = cb_y + 10, hx = msg_right - 166;
+        hx += ui_pad_glyph(hx, hy, FS_SMALL, COL_TEXT_MUTED, UI_PAD_CROSS, "[X]");
         hx += ui_text(hx, hy, FS_SMALL, COL_TEXT_MUTED, " Actions  ");
-        hx += ui_pad_glyph(hx, hy, FS_SMALL, COL_TEXT_BRIGHT, UI_PAD_CIRCLE, "[O]");
-        ui_text(hx, hy, FS_SMALL, COL_TEXT_MUTED, " Clear");
+        hx += ui_pad_glyph(hx, hy, FS_SMALL, COL_TEXT_MUTED, UI_PAD_CIRCLE, "[O]");
+        ui_text(hx, hy, FS_SMALL, COL_TEXT_MUTED, " Cancel");
     } else {
         // "tap or [triangle] to type" -- real PS button glyph from psexchar.pvf,
         // drawn inline (falls back to [/\] text if the system font is missing).
