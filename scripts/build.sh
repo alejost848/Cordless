@@ -3,8 +3,15 @@
 # Mirror sources to a space-free workspace, build there, copy the vpk back.
 set -euo pipefail
 
-export VITASDK="${VITASDK:-/usr/local/vitasdk}"
-export PATH="$VITASDK/bin:$PATH"
+if [[ -z "${VITASDK:-}" ]]; then
+  if [[ -d /usr/local/vitasdk ]]; then
+    VITASDK=/usr/local/vitasdk
+  else
+    VITASDK="$HOME/vitasdk"
+  fi
+fi
+export VITASDK
+export PATH="$VITASDK/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 if [[ ! -f "$VITASDK/share/vita.toolchain.cmake" ]]; then
   echo "error: VitaSDK not found at $VITASDK. Install it (https://vitasdk.org) or set VITASDK to your install path." >&2

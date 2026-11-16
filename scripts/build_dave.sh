@@ -4,8 +4,15 @@
 # Output: third_party/mlspp/lib/libmlspp_core.a
 set -euo pipefail
 
-export VITASDK="${VITASDK:-/usr/local/vitasdk}"
-export PATH="$VITASDK/bin:$PATH"
+if [[ -z "${VITASDK:-}" ]]; then
+  if [[ -d /usr/local/vitasdk ]]; then
+    VITASDK=/usr/local/vitasdk
+  else
+    VITASDK="$HOME/vitasdk"
+  fi
+fi
+export VITASDK
+export PATH="$VITASDK/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VENDOR="$ROOT/third_party/mlspp"

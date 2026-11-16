@@ -31,6 +31,10 @@ option(CORDLESS_AUTOEXIT "Exit after auto-running spikes (for Vita3K capture)" O
 ## Keep chain-trust verification on but skip TLS hostname matching.
 option(CORDLESS_INSECURE_TLS "Disable TLS hostname matching (Vita3K only)" OFF)
 
+## Voice channel and DM call support (with Discord DAVE E2EE).
+option(VOICE_JOIN_ENABLE "Enable joining Discord voice channels and calls" ON)
+option(VOICE_DAVE_ENABLE "Enable Discord DAVE voice E2EE" ON)
+
 ## Sources --------------------------------------------------------------------
 add_executable(${PROJECT_NAME}
   src/main.c
@@ -88,6 +92,16 @@ if(CORDLESS_AUTOEXIT)
 endif()
 if(CORDLESS_INSECURE_TLS)
   target_compile_definitions(${PROJECT_NAME} PRIVATE CORDLESS_INSECURE_TLS=1)
+endif()
+if(VOICE_JOIN_ENABLE)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE VOICE_JOIN_ENABLE=1)
+else()
+  target_compile_definitions(${PROJECT_NAME} PRIVATE VOICE_JOIN_ENABLE=0)
+endif()
+if(VOICE_DAVE_ENABLE)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE VOICE_DAVE_ENABLE=1)
+else()
+  target_compile_definitions(${PROJECT_NAME} PRIVATE VOICE_DAVE_ENABLE=0)
 endif()
 # Optional override for the Discord client_build_number.
 # Refresh with scripts/refresh_build_number.sh, then pass -DCLIENT_BUILD_NUMBER=NNN.

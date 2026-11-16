@@ -3,8 +3,15 @@
 # Run from WSL: bash scripts/build_tls.sh
 set -euo pipefail
 
-export VITASDK="${VITASDK:-/usr/local/vitasdk}"
-export PATH="$VITASDK/bin:$PATH"
+if [[ -z "${VITASDK:-}" ]]; then
+  if [[ -d /usr/local/vitasdk ]]; then
+    VITASDK=/usr/local/vitasdk
+  else
+    VITASDK="$HOME/vitasdk"
+  fi
+fi
+export VITASDK
+export PATH="$VITASDK/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 MBEDTLS_TAG="v3.6.2"
 BD="${TLS_BUILD_DIR:-$HOME/.cache/cordless_tls}"

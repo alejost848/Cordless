@@ -18,9 +18,9 @@ presence, typing indicators, friends, profile popouts, mentions, invite joins,
 blocking, multiple accounts, and permission-gated channel visibility and
 moderation.
 
-Voice (sound) channels are still in progress and untested. The code is there but
-stays off behind `VOICE_JOIN_ENABLE`, since non-stage voice now needs Discord's
-DAVE end-to-end encryption, and none of it has been exercised on hardware yet.
+Voice channels and DM/Group DM calls use Discord's DAVE (MLS) end-to-end
+encryption and are enabled by default (`VOICE_JOIN_ENABLE=ON`,
+`VOICE_DAVE_ENABLE=ON`). Still needs testing on real Vita hardware.
 
 ## Build
 
@@ -33,10 +33,10 @@ That drops a `cordless.vpk` in the repo root. You'll need
 come pre-vendored under `third_party/`, so you only rebuild them with
 `scripts/build_tls.sh` or `scripts/build_dave.sh` if you actually change them.
 
-The build flags are all off by default. `-DCORDLESS_INSECURE_TLS=ON` skips TLS
-hostname matching for the emulator, `-DCLIENT_BUILD_NUMBER=<n>` sets the build
-number Cordless advertises, and `-DVOICE_JOIN_ENABLE=1` together with
-`-DVOICE_DAVE_ENABLE=1` turn voice back on (throwaway account only).
+Optional CMake flags: `-DCORDLESS_INSECURE_TLS=ON` skips TLS hostname matching
+for the emulator, `-DCLIENT_BUILD_NUMBER=<n>` sets the build number Cordless
+advertises, and `-DVOICE_JOIN_ENABLE=OFF` / `-DVOICE_DAVE_ENABLE=OFF` disable
+voice or DAVE E2EE.
 
 ## Install and run
 
