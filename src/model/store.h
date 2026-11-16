@@ -17,6 +17,7 @@
 #define CH_TEXT            0
 #define CH_DM              1
 #define CH_VOICE           2
+#define CH_STAGE           13
 #define CH_GROUP_DM        3
 #define CH_CATEGORY        4
 #define CH_ANNOUNCE        5

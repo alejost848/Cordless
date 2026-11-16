@@ -921,7 +921,7 @@ static void parse_ready_js(int d)
     JT_FOREACH(rs, e) {
         char cid[24]; jt_gets(e, "id", cid, sizeof cid);
         channel *c = store_find_channel(cid);
-        if (!c) continue;
+        if (!c || c->type == CH_VOICE || c->type == CH_STAGE) continue;
         char lr[24]; jt_gets(e, "last_message_id", lr, sizeof lr);
         if (lr[0]) snprintf(c->last_read_id, sizeof c->last_read_id, "%s", lr);
         c->mentions = (int)jt_int(jt_get(e, "mention_count"));
@@ -1191,7 +1191,7 @@ static void parse_ready(json_t *d)
     for (size_t i = 0; i < rn; i++) {
         json_t *e = json_array_get(rs, i);
         channel *c = store_find_channel(json_string_value(json_object_get(e, "id")));
-        if (!c) continue;
+        if (!c || c->type == CH_VOICE || c->type == CH_STAGE) continue;
         const char *lr = json_string_value(json_object_get(e, "last_message_id"));
         if (lr) snprintf(c->last_read_id, sizeof(c->last_read_id), "%s", lr);
         c->mentions = (int)json_integer_value(json_object_get(e, "mention_count"));
