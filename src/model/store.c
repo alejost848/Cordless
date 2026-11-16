@@ -26,6 +26,7 @@ typedef struct {
     char    me_avatar[40];
 
     unsigned  msg_rev;
+    unsigned  sidebar_rev;
     char      typing_name[80];
     char      typing_channel[24];
     long long typing_at;
@@ -279,8 +280,9 @@ void store_reaction_clear(const char *msg_id)
     }
 }
 
-unsigned store_msg_rev(void) { return S->msg_rev; }
-void     store_touch(void)   { S->msg_rev++; }
+unsigned store_msg_rev(void)     { return S->msg_rev; }
+unsigned store_sidebar_rev(void) { return S->sidebar_rev; }
+void     store_touch(void)       { S->msg_rev++; S->sidebar_rev++; }
 
 void store_set_typing(const char *channel_id, const char *name, long long at_ms)
 {
@@ -424,7 +426,7 @@ static void voice_backfill_user(const char *id, const char *name, const char *av
             dirty = true;
         }
     }
-    if (dirty) S->msg_rev++;
+    if (dirty) { S->msg_rev++; S->sidebar_rev++; }
 }
 
 void store_add_member(const char *name, const char *id, const char *avatar, int status)
@@ -655,7 +657,8 @@ void store_mark_read(const char *id)
     channel *c = store_find_channel(id);
     if (c) { c->unread = false; c->mentions = 0;
              // mark read up to the newest message
-             snprintf(c->last_read_id, sizeof(c->last_read_id), "%s", c->last_message_id); }
+             snprintf(c->last_read_id, sizeof(c->last_read_id), "%s", c->last_message_id);
+             S->sidebar_rev++; }
 }
 
 void store_bump_unread(const char *id, const char *last_message_id, bool mention)
@@ -666,6 +669,7 @@ void store_bump_unread(const char *id, const char *last_message_id, bool mention
     if (mention) c->mentions++;
     if (last_message_id)
         snprintf(c->last_message_id, sizeof(c->last_message_id), "%s", last_message_id);
+    S->sidebar_rev++;
 }
 
 void store_voice_clear_all(void)

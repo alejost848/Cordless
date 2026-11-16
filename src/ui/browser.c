@@ -513,7 +513,7 @@ static void build_rows(const guild *g, bool home)
     static int      c_guild = -0x7fff;
     static bool     c_home;
     static unsigned c_rev = 0xFFFFFFFFu, c_fold = 0xFFFFFFFFu;
-    unsigned rev = store_msg_rev();
+    unsigned rev = store_sidebar_rev();
     if (s_guild == c_guild && home == c_home && rev == c_rev && s_cat_foldgen == c_fold)
         return;
     c_guild = s_guild; c_home = home; c_rev = rev; c_fold = s_cat_foldgen;
@@ -5602,7 +5602,7 @@ void browser_draw(void)
     if (vcid[0]) {
         static char s_vcn_cid[24];
         static unsigned s_vcn_rev = 0xFFFFFFFFu;
-        unsigned rev = store_msg_rev();
+        unsigned rev = store_sidebar_rev();
         if (strcmp(s_vcn_cid, vcid) != 0 || s_vcn_rev != rev) {
             snprintf(s_vcn_cid, sizeof(s_vcn_cid), "%s", vcid);
             s_vcn_rev = rev;

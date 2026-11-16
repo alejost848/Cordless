@@ -173,7 +173,8 @@ void store_reaction_clear(const char *msg_id);
 
 // Bumped on any message list change (add/edit/delete/clear).
 unsigned store_msg_rev(void);
-void     store_touch(void);  // bump the message revision
+unsigned store_sidebar_rev(void);
+void     store_touch(void);  // bump revisions
 
 // Typing indicator: the most recent typer in a channel and when (ms).
 void store_set_typing(const char *channel_id, const char *name, long long at_ms);

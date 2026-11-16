@@ -636,7 +636,22 @@ static int md_run(int x, int y, int size, unsigned base, const char *text,
                      : (W[i].style & MD_CODE)    ? 0xFFD0D0D0 : base;
         int len = W[i].len < 511 ? W[i].len : 511;
         memcpy(buf, W[i].s, len); buf[len] = '\0';
-        int wwd = draw_mixed(f, 0, 0, size, 0, buf, 0);
+        int wwd = -1;
+        static struct { const void *f; int size; unsigned h; int w; char s[32]; } s_wwc[256];
+        if (len < 32) {
+            unsigned wh = ui_strhash(buf);
+            unsigned idx = (wh ^ (unsigned)size ^ (unsigned)(uintptr_t)f) & 255u;
+            if (s_wwc[idx].f == f && s_wwc[idx].size == size &&
+                s_wwc[idx].h == wh && strcmp(s_wwc[idx].s, buf) == 0) {
+                wwd = s_wwc[idx].w;
+            } else {
+                wwd = draw_mixed(f, 0, 0, size, 0, buf, 0);
+                s_wwc[idx].f = f; s_wwc[idx].size = size; s_wwc[idx].h = wh;
+                s_wwc[idx].w = wwd; memcpy(s_wwc[idx].s, buf, len + 1);
+            }
+        } else {
+            wwd = draw_mixed(f, 0, 0, size, 0, buf, 0);
+        }
         int lx = W[i].block ? x + 20 : x;
         int spw = W[i].sp ? space_w : 0;
         if (cx + spw + wwd > x + max_w && cx > lx) { cx = lx; cy += lh; spw = 0; line_start = true; }
@@ -682,7 +697,18 @@ void ui_richtext_draw(int x, int y, int size, unsigned color, const char *text,
 
 int ui_richtext_height(int size, const char *text, int max_w, int line_h)
 {
-    return md_run(0, 0, size, 0, text, max_w, line_h, 0);
+    if (!text) return line_h;
+    static struct { unsigned h; int len, size, max_w, line_h, out; } s_rhc[64];
+    unsigned h = ui_strhash(text);
+    int len = (int)strlen(text);
+    unsigned idx = (h ^ (unsigned)max_w ^ (unsigned)size) & 63u;
+    if (s_rhc[idx].out > 0 && s_rhc[idx].h == h && s_rhc[idx].len == len &&
+        s_rhc[idx].size == size && s_rhc[idx].max_w == max_w && s_rhc[idx].line_h == line_h)
+        return s_rhc[idx].out;
+    int out = md_run(0, 0, size, 0, text, max_w, line_h, 0);
+    s_rhc[idx].h = h; s_rhc[idx].len = len; s_rhc[idx].size = size;
+    s_rhc[idx].max_w = max_w; s_rhc[idx].line_h = line_h; s_rhc[idx].out = out;
+    return out;
 }
 
 int ui_wrap_height(int size, const char *text, int max_w, int line_h)

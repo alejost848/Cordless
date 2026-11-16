@@ -44,6 +44,7 @@ typedef struct {
     int             total_ms;  // animation loop length
     unsigned        used;  // LRU tick
     unsigned        seen_frame;  // render frame this was last requested
+    unsigned        url_hash;
 } entry;
 
 static entry     s_cache[CACHE_N];
@@ -403,18 +404,27 @@ void imagecache_fini(void)
     }
 }
 
+static unsigned url_hash32(const char *s)
+{
+    unsigned h = 2166136261u;
+    for (; *s; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
+    return h;
+}
+
 // Find the entry for `url`. Returns it if READY; otherwise claims a slot and
 // queues a background fetch.
 static entry *touch(const char *url)
 {
     if (!url || !url[0]) return NULL;
+    unsigned h = url_hash32(url);
     entry *ready = NULL;
     sceKernelLockMutex(s_mutex, 1, NULL);
 
     int found = -1, empty = -1, lru = -1, pending = 0;
     unsigned lru_used = 0xFFFFFFFF;
     for (int i = 0; i < CACHE_N; i++) {
-        if (s_cache[i].state != E_EMPTY && strcmp(s_cache[i].url, url) == 0) {
+        if (s_cache[i].state != E_EMPTY && s_cache[i].url_hash == h &&
+            strcmp(s_cache[i].url, url) == 0) {
             found = i; break;
         }
         if (s_cache[i].state == E_QUEUED || s_cache[i].state == E_FETCHING ||
@@ -441,6 +451,7 @@ static entry *touch(const char *url)
             free(e->rgba); e->rgba = NULL; e->rgba_n = 0;
             e->total_ms = 0;
             snprintf(e->url, sizeof(e->url), "%s", url);
+            e->url_hash = h;
             e->state = E_QUEUED; e->used = ++s_tick;
             e->seen_frame = s_frame;
         }

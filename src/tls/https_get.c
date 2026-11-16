@@ -7,7 +7,10 @@
 #include <string.h>
 #include <strings.h>  // strncasecmp
 #include <unistd.h>  // close
+#include <fcntl.h>
+#include <errno.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -246,14 +249,24 @@ static int do_request(const char *method, const char *url, const char *cacert_pa
     if (dns_resolve_cached(host, port, &sa) != 0) return -1;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+    // Non-blocking connect with a 5s timeout so unreachable hosts fail fast.
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    int cr = connect(fd, (const struct sockaddr *)&sa, sizeof(sa));
+    if (cr < 0) {
+        if (errno != EINPROGRESS) { close(fd); dns_invalidate(host, port); return -1; }
+        fd_set wfds; FD_ZERO(&wfds); FD_SET(fd, &wfds);
+        struct timeval ctv = { .tv_sec = 5, .tv_usec = 0 };
+        int sr = select(fd + 1, NULL, &wfds, NULL, &ctv);
+        int soerr = 0; socklen_t slen = sizeof(soerr);
+        if (sr <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) < 0 || soerr != 0) {
+            close(fd); dns_invalidate(host, port); return -1;
+        }
+    }
+    if (fl >= 0) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
     struct timeval tv = { .tv_sec = 15, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    if (connect(fd, (const struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        close(fd);
-        dns_invalidate(host, port);
-        return -1;
-    }
 
     mbedtls_ssl_context ssl;   mbedtls_ssl_config conf;
     mbedtls_entropy_context ent; mbedtls_ctr_drbg_context drbg;
