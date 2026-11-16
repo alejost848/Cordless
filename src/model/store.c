@@ -615,7 +615,7 @@ void store_mark_read(const char *id)
 void store_bump_unread(const char *id, const char *last_message_id, bool mention)
 {
     channel *c = store_find_channel(id);
-    if (!c) return;
+    if (!c || c->type == CH_VOICE || c->type == CH_STAGE) return;
     c->unread = true;
     if (mention) c->mentions++;
     if (last_message_id)
