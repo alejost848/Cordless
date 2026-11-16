@@ -3,6 +3,8 @@
 *.velf
 *.self
 *.vpk
+*.suprx
+*.skprx
 *.elf
 param.sfo
 

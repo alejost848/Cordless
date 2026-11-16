@@ -55,6 +55,7 @@ add_executable(${PROJECT_NAME}
   src/api/discord.c
   src/gateway/gateway.c
   src/voice/voice.c
+  src/voice/voice_ipc.c
   src/voice/voice_crypto.c
   src/voice/voice_audio.c
   src/voice/dave_frame.c

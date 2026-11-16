@@ -6,6 +6,7 @@
 #include "console.h"
 #include "net_common.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
@@ -60,7 +61,7 @@ typedef struct {
     uint8_t      plc_streak;
     int16_t      pcm[VA_JITTER_FRAMES][VA_FRAME_SAMPLES * 2];
 } spk_slot;
-static spk_slot s_spk[VA_MAX_SPEAKERS];
+static spk_slot *s_spk = NULL;
 
 void voice_audio_set_muted(int muted)       { s_muted = muted ? 1 : 0; }
 int  voice_audio_is_muted(void)             { return s_muted; }
@@ -70,7 +71,7 @@ int  voice_audio_is_tx_speaking(void)       { return (!s_muted && !s_deafened &&
 
 int voice_audio_ssrc_speaking(unsigned ssrc)
 {
-    if (!ssrc || s_deafened) return 0;
+    if (!ssrc || s_deafened || !s_spk) return 0;
     unsigned tick = s_rx_tick;
     for (int i = 0; i < VA_MAX_SPEAKERS; i++) {
         if (s_spk[i].dec && s_spk[i].ssrc == ssrc &&
@@ -84,7 +85,7 @@ unsigned voice_audio_speaking_mask(void)
 {
     unsigned mask = 0;
     unsigned tick = s_rx_tick;
-    if (!s_deafened) {
+    if (!s_deafened && s_spk) {
         for (int i = 0; i < VA_MAX_SPEAKERS; i++) {
             if (s_spk[i].dec && s_spk[i].speaking_until != 0 &&
                 (int)(s_spk[i].speaking_until - tick) >= 0)
@@ -628,7 +629,9 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
     s_on_speaking = on_speaking;
     s_tx_speaking = 0;
     s_rx_tick = 0;
-    memset(s_spk, 0, sizeof s_spk);
+    if (!s_spk) s_spk = (spk_slot *)calloc(VA_MAX_SPEAKERS, sizeof(spk_slot));
+    if (!s_spk) return -1;
+    memset(s_spk, 0, VA_MAX_SPEAKERS * sizeof(spk_slot));
 #if VOICE_DAVE_ENABLE
     memset(s_rxkey, 0, sizeof s_rxkey);
     s_rx_epoch_seen = s_rx_epoch_gen;
@@ -645,9 +648,16 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
     if (s_aport < 0) console_logf("[voice] audio out open failed 0x%08x", (unsigned)s_aport);
 
     s_run = 1;
+#ifdef CORDLESS_PLUGIN
+    const SceSize rx_stack = 0x4000;
+    const int rx_aff = 0;
+#else
+    const SceSize rx_stack = 0x10000;
+    const int rx_aff = SCE_KERNEL_CPU_MASK_USER_1;
+#endif
     // Vita user thread priorities must be >= 0x40 (0x40 is highest user priority).
-    s_rx_thread = sceKernelCreateThread("cl_voice_rx", rx_worker, 0x40, 0x10000, 0,
-                                        SCE_KERNEL_CPU_MASK_USER_1, NULL);
+    s_rx_thread = sceKernelCreateThread("cl_voice_rx", rx_worker, 0x40, rx_stack, 0,
+                                        rx_aff, NULL);
     if (s_rx_thread < 0) {
         console_logf("[voice] rx thread create failed 0x%08x", (unsigned)s_rx_thread);
         voice_audio_stop();
@@ -677,8 +687,15 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
     s_mic = sceAudioInOpenPort(SCE_AUDIO_IN_PORT_TYPE_VOICE, VA_MIC_GRAIN, 16000,
                                SCE_AUDIO_IN_PARAM_FORMAT_S16_MONO);
     if (s_mic < 0) console_logf("[voice] mic open failed 0x%08x", (unsigned)s_mic);
-    s_tx_thread = sceKernelCreateThread("cl_voice_tx", tx_worker, 0x42, 0x10000, 0,
-                                        SCE_KERNEL_CPU_MASK_USER_2, NULL);
+#ifdef CORDLESS_PLUGIN
+    const SceSize tx_stack = 0x4000;
+    const int tx_aff = 0;
+#else
+    const SceSize tx_stack = 0x10000;
+    const int tx_aff = SCE_KERNEL_CPU_MASK_USER_2;
+#endif
+    s_tx_thread = sceKernelCreateThread("cl_voice_tx", tx_worker, 0x42, tx_stack, 0,
+                                        tx_aff, NULL);
     if (s_tx_thread >= 0) sceKernelStartThread(s_tx_thread, 0, NULL);
     else console_logf("[voice] tx thread create failed 0x%08x", (unsigned)s_tx_thread);
 
@@ -703,8 +720,12 @@ void voice_audio_stop(void)
     if (s_mic >= 0) { sceAudioInReleasePort(s_mic); s_mic = -1; }
     if (s_denoise) { speex_preprocess_state_destroy(s_denoise); s_denoise = NULL; }
     if (s_enc) { opus_encoder_destroy(s_enc); s_enc = NULL; }
-    for (int i = 0; i < VA_MAX_SPEAKERS; i++)
-        if (s_spk[i].dec) { opus_decoder_destroy(s_spk[i].dec); s_spk[i].dec = NULL; }
+    if (s_spk) {
+        for (int i = 0; i < VA_MAX_SPEAKERS; i++)
+            if (s_spk[i].dec) { opus_decoder_destroy(s_spk[i].dec); s_spk[i].dec = NULL; }
+        free(s_spk);
+        s_spk = NULL;
+    }
     if (s_aport >= 0) { sceAudioOutReleasePort(s_aport); s_aport = -1; }
     s_udp = -1;
 }

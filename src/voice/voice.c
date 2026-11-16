@@ -1,4 +1,7 @@
 #include "voice/voice.h"
+#ifndef CORDLESS_PLUGIN
+#include "voice/voice_ipc.h"
+#endif
 #include "voice/voice_audio.h"
 #include "voice/dave.h"
 #include "api/discord.h"
@@ -148,6 +151,15 @@ static int64_t now_ms(void)
     return (int64_t)(t.tick / 1000);
 }
 
+#ifndef CORDLESS_PLUGIN
+int         voice_active(void)      { return voice_ipc_available() ? voice_ipc_active()      : s_active; }
+int         voice_connected(void)   { return voice_ipc_available() ? voice_ipc_connected()   : s_connected; }
+const char *voice_guild_id(void)    { return voice_ipc_available() ? voice_ipc_guild_id()    : (s_active ? s_guild : ""); }
+const char *voice_channel_id(void)  { return voice_ipc_available() ? voice_ipc_channel_id()  : (s_active ? s_chan : ""); }
+const char *voice_status(void)      { return voice_ipc_available() ? voice_ipc_status()      : s_status; }
+int         voice_is_muted(void)    { return voice_ipc_available() ? voice_ipc_is_muted()    : s_muted; }
+int         voice_is_deafened(void) { return voice_ipc_available() ? voice_ipc_is_deafened() : s_deafened; }
+#else
 int         voice_active(void)      { return s_active; }
 int         voice_connected(void)   { return s_connected; }
 const char *voice_guild_id(void)    { return s_active ? s_guild : ""; }
@@ -155,6 +167,7 @@ const char *voice_channel_id(void)  { return s_active ? s_chan : ""; }
 const char *voice_status(void)      { return s_status; }
 int         voice_is_muted(void)    { return s_muted; }
 int         voice_is_deafened(void) { return s_deafened; }
+#endif
 
 static void voice_sync_self_store(void)
 {
@@ -174,6 +187,15 @@ static void voice_sync_self_store(void)
 
 void voice_set_muted(int muted)
 {
+#ifndef CORDLESS_PLUGIN
+    if (voice_ipc_available()) {
+        voice_ipc_set_muted(muted);
+        if (voice_ipc_active())
+            gateway_voice_update_ex(voice_ipc_guild_id(), voice_ipc_channel_id(),
+                                    voice_ipc_is_muted(), voice_ipc_is_deafened());
+        return;
+    }
+#endif
     s_muted = muted ? 1 : 0;
     if (!s_muted && s_deafened) {
         s_deafened = 0;
@@ -188,12 +210,21 @@ void voice_set_muted(int muted)
 
 void voice_toggle_mute(void)
 {
-    voice_set_muted(!s_muted);
+    voice_set_muted(!voice_is_muted());
     if (s_connected) voice_audio_play_cue(s_muted ? 1 : 2);
 }
 
 void voice_set_deafened(int deafened)
 {
+#ifndef CORDLESS_PLUGIN
+    if (voice_ipc_available()) {
+        voice_ipc_set_deafened(deafened);
+        if (voice_ipc_active())
+            gateway_voice_update_ex(voice_ipc_guild_id(), voice_ipc_channel_id(),
+                                    voice_ipc_is_muted(), voice_ipc_is_deafened());
+        return;
+    }
+#endif
     int d = deafened ? 1 : 0;
     if (d) {
         if (!s_deafened) s_pre_deaf_muted = s_muted;
@@ -213,7 +244,7 @@ void voice_set_deafened(int deafened)
 
 void voice_toggle_deaf(void)
 {
-    voice_set_deafened(!s_deafened);
+    voice_set_deafened(!voice_is_deafened());
     if (s_connected) voice_audio_play_cue(s_deafened ? 1 : 2);
 }
 
@@ -757,6 +788,12 @@ void voice_on_server(const char *token, const char *endpoint,
                      const char *session_id, const char *guild_id,
                      const char *channel_id, const char *user_id)
 {
+#ifndef CORDLESS_PLUGIN
+    if (voice_ipc_available()) {
+        voice_ipc_on_server(token, endpoint, session_id, guild_id, channel_id, user_id);
+        return;
+    }
+#endif
     if (!s_active) return;
     if (s_guild[0]) {
         if (!guild_id || strcmp(guild_id, s_guild) != 0) return;
@@ -775,6 +812,12 @@ void voice_on_server(const char *token, const char *endpoint,
 void voice_on_state_update(const char *guild_id, const char *channel_id,
                            const char *session_id)
 {
+#ifndef CORDLESS_PLUGIN
+    if (voice_ipc_available()) {
+        voice_ipc_on_state_update(guild_id, channel_id, session_id);
+        return;
+    }
+#endif
     if (!s_active) return;
     if (s_guild[0]) {
         if (!guild_id || strcmp(guild_id, s_guild) != 0) return;
@@ -816,6 +859,18 @@ int voice_join(const char *guild_id, const char *channel_id,
         console_logf("[voice] join refused: voice disabled (DAVE E2EE required)");
         return -1;
     }
+#ifndef CORDLESS_PLUGIN
+    if (voice_ipc_available()) {
+        int rc = voice_ipc_join(guild_id, channel_id, token, cacert_path);
+        if (rc == 0) {
+            gateway_voice_update_ex(guild_id, channel_id, 0, 0);
+            if (!guild_id || !guild_id[0]) {
+                discord_ring_call(channel_id, token, cacert_path);
+            }
+        }
+        return rc;
+    }
+#endif
     if (s_active || s_thread >= 0) voice_leave();
 
     // run the crypto self-tests once, on first join
@@ -844,7 +899,12 @@ int voice_join(const char *guild_id, const char *channel_id,
     // ask the main gateway to move us into the voice channel / call (op4)
     gateway_voice_update_ex(s_guild, channel_id, 0, 0);
 
-    s_thread = sceKernelCreateThread("cl_voice", worker, 0x40, 0x40000, 0, 0, NULL);
+#ifdef CORDLESS_PLUGIN
+    const SceSize worker_stack = 0x6000;
+#else
+    const SceSize worker_stack = 0x40000;
+#endif
+    s_thread = sceKernelCreateThread("cl_voice", worker, 0x40, worker_stack, 0, 0, NULL);
     if (s_thread < 0) { s_active = 0; s_run = 0; s_status = "Idle"; return -1; }
     sceKernelStartThread(s_thread, 0, NULL);
     console_dbgf("[voice] join %s#%s", s_guild[0] ? s_guild : "(dm)", channel_id);
@@ -853,6 +913,15 @@ int voice_join(const char *guild_id, const char *channel_id,
 
 void voice_leave(void)
 {
+#ifndef CORDLESS_PLUGIN
+    if (voice_ipc_available()) {
+        if (voice_ipc_active()) {
+            gateway_voice_update_ex(voice_ipc_guild_id(), "", 0, 0);
+        }
+        voice_ipc_leave();
+        return;
+    }
+#endif
     if (!s_active && s_thread < 0) return;
     if (s_active) {
         console_dbgf("[voice] leaving");
