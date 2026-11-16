@@ -29,6 +29,7 @@
 #include "auth/tokenstore.h"
 #include "api/discord.h"
 #include "gateway/gateway.h"
+#include "voice/voice.h"
 #include "model/store.h"
 #include "model/settings.h"
 #include "ui/browser.h"
@@ -102,7 +103,7 @@ static void validate_token(void)
         tokenstore_save(g_token);
         accounts_add(g_token, g_me.global_name[0] ? g_me.global_name : g_me.username,
                      g_me.id, g_me.avatar);
-        snprintf(g_msg, sizeof(g_msg), "");
+        g_msg[0] = '\0';
         if (!g_app_started) {
             store_set_me(g_me.username, g_me.global_name, g_me.id, g_me.avatar);
             gateway_start(g_token, g_cacert);
@@ -408,7 +409,7 @@ int main(void)
             }
             case ST_HOME: if (store_ready()) {
                 // Skip UI input until READY is parsed.
-                browser_input(pressed, pad.buttons, (int)pad.ly - 128);
+                browser_input(pressed, pad.buttons, (int)pad.ly - 128, (int)pad.ry - 128);
 
                 // Front touch: tap (select/open) + drag (scroll). The panel
                 // reports 1920x1088 for a 960x544 screen, so halve.
@@ -438,6 +439,7 @@ int main(void)
                 // Gateway 4004 (token invalidated): stop gateway, clear saved login, back to QR.
                 if (gateway_auth_failed()) {
                     console_logf("[app] gateway auth failed; clearing saved login");
+                    voice_leave();
                     gateway_stop();
                     g_app_started = false;
                     store_lock(); store_clear_guilds(); store_unlock();
@@ -451,6 +453,7 @@ int main(void)
                 }
                 // Logout via the Settings -> Log Out button.
                 if (browser_wants_logout()) {
+                    voice_leave();
                     gateway_stop();
                     g_app_started = false;
                     store_lock(); store_clear_guilds(); store_unlock();
@@ -464,12 +467,14 @@ int main(void)
                 {
                     char swtok[128];
                     if (browser_pending_switch(swtok, sizeof(swtok))) {
+                        voice_leave();
                         gateway_stop();
                         g_app_started = false;
                         store_lock(); store_clear_guilds(); store_unlock();
                         snprintf(g_token, sizeof(g_token), "%s", swtok);
                         g_state = ST_VALIDATING;
                     } else if (browser_wants_add_account()) {
+                        voice_leave();
                         gateway_stop();
                         g_app_started = false;
                         store_lock(); store_clear_guilds(); store_unlock();

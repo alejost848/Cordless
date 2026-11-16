@@ -10,8 +10,8 @@
 void browser_init(const char *token, const char *cacert_path);
 
 // `pressed` = rising-edge buttons, `held` = current buttons, `ly` = left-stick
-// Y (-128..127).
-void browser_input(unsigned pressed, unsigned held, int ly);
+// Y (-128..127), `ry` = right-stick Y (-128..127).
+void browser_input(unsigned pressed, unsigned held, int ly, int ry);
 
 void browser_draw(void);
 

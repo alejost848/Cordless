@@ -14,6 +14,7 @@
 #include "api/discord.h"
 #include "gateway/gateway.h"
 #include "voice/voice.h"
+#include "voice/voice_audio.h"
 #include "console.h"
 
 #include <stdio.h>
@@ -138,19 +139,14 @@ static bool snowflake_gt(const char *a, const char *b)
     return strcmp(a, b) > 0;
 }
 
-static SceUID s_fetch_thread = -1;
-static char   s_fetch_cid[24];
 // the view actually open; can differ from the sidebar selection
 static channel s_open_ch;
 static bool    s_have_open;
 static int     s_back_r[4];
-static char   s_fetch_around[24];  // load window centered here (last-read), if set
-static char   s_ack_newest[24];  // channel's true newest id, to persist read state
 static volatile int s_fetch_http;
 
 static volatile bool s_loading_older;
 static volatile bool s_history_done;  // reached the start of the channel
-static char s_older_cid[24];
 static char s_restore_anchor[24];  // keep this msg id at the top after prepend
 
 typedef struct { int y0, y1; char id[24]; bool own; bool has_spoiler;
@@ -182,7 +178,8 @@ static void make_view_url(const char *src, char *dst, size_t dstsz, int d)
     if (w > 0 && h > 0) {
         if (w >= h) { nw = d; nh = (int)((long long)h * d / w); }
         else        { nh = d; nw = (int)((long long)w * d / h); }
-        if (nw < 1) nw = 1; if (nh < 1) nh = 1;
+        if (nw < 1) nw = 1;
+        if (nh < 1) nh = 1;
     }
     size_t o = 0;
     const char *p = src;
@@ -296,8 +293,10 @@ static int      s_set_av_r[4], s_set_name_r[4];
 static int      s_set_sw_r[4];  // Switch Account button
 #define SET_BTN_H 34
 #define SET_ROW_H  30           // appearance setting row height
-#define SET_NAPP    7           // appearance setting rows
-static int      s_set_app_r[SET_NAPP][4];  // appearance row hit rects
+#define SET_NAPP    9           // appearance + voice setting rows
+static int      s_set_app_r[SET_NAPP][4];  // setting row hit rects
+static char     s_msg_sel_id[24];
+static bool     s_msg_sel_follow;
 static int      s_set_scroll;              // settings modal scroll (tall content)
 static int      s_set_scroll_max;
 
@@ -339,7 +338,9 @@ static int      s_suser_hit_y0[MAX_SUSERS], s_suser_hit_y1[MAX_SUSERS];
 static char     s_jump_to[24];  // if set, next open_channel loads around this msg
 static char     s_pin_anchor[24];  // pin this msg near the top each frame (search jump)
 
+#ifndef MAX_FRIENDS
 #define MAX_FRIENDS 128
+#endif
 static int       s_friends_btn[4];
 static bool      s_friends_open;
 static int       s_confirm_open;
@@ -369,17 +370,31 @@ static int      s_pins_count;
 static volatile bool s_pins_loading;
 static char     s_pins_cid[24];
 static int      s_pin_btn_x0, s_pin_btn_x1;
+static int      s_call_btn_x0 = -1, s_call_btn_x1 = -1;
+static int      s_dm_mute_btn_x0 = -1, s_dm_mute_btn_x1 = -1;
+static int      s_dm_deaf_btn_x0 = -1, s_dm_deaf_btn_x1 = -1;
+static int      s_vmute_btn[4], s_vdeaf_btn[4], s_vleave_btn[4];
+static char     s_voice_ch_name[80];
+#define VOICEBAR_H 68
 
-typedef struct { bool is_cat; const channel *ch; } row_t;
-static row_t s_rows[MAX_CHANNELS + 64];
+#define MAX_SIDEBAR_ROWS (MAX_CHANNELS + 128)
+typedef struct {
+    bool           is_cat;
+    bool           is_voice_user;
+    const channel *ch;
+    voice_member   vm;
+} row_t;
+static row_t s_rows[MAX_SIDEBAR_ROWS];
 static int   s_row_count;
-static int   s_selectable[MAX_CHANNELS + 64];  // row indices that are channels
+static int   s_selectable[MAX_SIDEBAR_ROWS];  // row indices that are channels
 static int   s_sel_count;
 
 // must match the row heights drawn in draw_sidebar
 static int sidebar_rowh(int r, bool home)
 {
-    return s_rows[r].is_cat ? 24 : (home ? 30 : 26);
+    if (s_rows[r].is_cat) return 24;
+    if (s_rows[r].is_voice_user) return 22;
+    return home ? 30 : 26;
 }
 static int sidebar_row_y(int upto, bool home)
 {
@@ -404,9 +419,13 @@ static bool is_text_channel(int type)
 {
     return type == CH_TEXT || type == CH_ANNOUNCE || type == CH_FORUM;
 }
+static bool is_voice_channel(int type)
+{
+    return type == CH_VOICE || type == CH_STAGE;
+}
 static bool is_listed_channel(int type)
 {
-    return is_text_channel(type) || type == CH_VOICE;
+    return is_text_channel(type) || is_voice_channel(type);
 }
 
 // fills out[] with indices into g->channels, ordered by position
@@ -436,17 +455,33 @@ static void collect_sorted(const guild *g, const char *parent, int want_cat,
 
 static void add_channel_with_threads(const guild *g, const channel *ch)
 {
-    if (s_row_count >= MAX_CHANNELS + 64) return;
+    if (s_row_count >= MAX_SIDEBAR_ROWS) return;
     s_selectable[s_sel_count++] = s_row_count;
-    s_rows[s_row_count++] = (row_t){ false, ch };
+    s_rows[s_row_count++] = (row_t){ .ch = ch };
+    if (is_voice_channel(ch->type)) {
+        voice_member vms[32];
+        int vn = store_voice_for_channel(ch->id, vms, 32);
+        for (int k = 0; k < vn && s_row_count < MAX_SIDEBAR_ROWS; k++) {
+            const char *nick = store_member_nick(vms[k].user_id);
+            if (nick && nick[0])
+                snprintf(vms[k].name, sizeof(vms[k].name), "%s", nick);
+            row_t vr;
+            memset(&vr, 0, sizeof(vr));
+            vr.is_voice_user = true;
+            vr.ch = ch;
+            vr.vm = vms[k];
+            s_rows[s_row_count++] = vr;
+        }
+        return;
+    }
     // forum posts get their own post list, never sidebar rows
     if (ch->type == CH_FORUM) return;
     for (int i = 0; i < g->channel_count; i++) {
         const channel *c = &g->channels[i];
         if (ch_is_thread(c->type) && c->parent_id[0] &&
-            strcmp(c->parent_id, ch->id) == 0 && s_row_count < MAX_CHANNELS + 64) {
+            strcmp(c->parent_id, ch->id) == 0 && s_row_count < MAX_SIDEBAR_ROWS) {
             s_selectable[s_sel_count++] = s_row_count;
-            s_rows[s_row_count++] = (row_t){ false, c };
+            s_rows[s_row_count++] = (row_t){ .ch = c };
         }
     }
 }
@@ -486,8 +521,9 @@ static void build_rows(const guild *g, bool home)
             order[j + 1] = v;
         }
         for (int i = 0; i < dn; i++) {
+            if (s_row_count >= MAX_SIDEBAR_ROWS) break;
             s_selectable[s_sel_count++] = s_row_count;
-            s_rows[s_row_count++] = (row_t){ false, &dms[order[i]] };
+            s_rows[s_row_count++] = (row_t){ .ch = &dms[order[i]] };
         }
         return;
     }
@@ -505,7 +541,8 @@ static void build_rows(const guild *g, bool home)
         int ch[MAX_CHANNELS], chn;
         collect_sorted(g, cat->id, 0, ch, &chn);
         if (chn == 0) continue;
-        s_rows[s_row_count++] = (row_t){ true, cat };
+        if (s_row_count < MAX_SIDEBAR_ROWS)
+            s_rows[s_row_count++] = (row_t){ .is_cat = true, .ch = cat };
         if (cat_collapsed(cat->id)) continue;
         for (int i = 0; i < chn; i++)
             add_channel_with_threads(g, &g->channels[ch[i]]);
@@ -513,35 +550,47 @@ static void build_rows(const guild *g, bool home)
 }
 
 
+struct fetch_req { char cid[24]; char around[24]; char ack[24]; };
+
 static int fetch_worker(SceSize args, void *argp)
 {
-    (void)args; (void)argp;
-    const char *around = s_fetch_around[0] ? s_fetch_around : NULL;
-    s_fetch_http = discord_get_messages(s_fetch_cid, around, s_token, s_cacert);
+    (void)args;
+    struct fetch_req *req = *(struct fetch_req **)argp;
+    const char *around = req->around[0] ? req->around : NULL;
+    s_fetch_http = discord_get_messages(req->cid, around, s_token, s_cacert);
     // ack the channel's newest message (captured at open); DMs fall back to
     // the newest loaded message id
     char ack[24] = "";
     store_lock();
-    store_set_msg_loading(false);
-    if (s_ack_newest[0]) snprintf(ack, sizeof(ack), "%s", s_ack_newest);
-    else { int mc = 0; message *ms = store_messages(&mc);
-           if (mc > 0) snprintf(ack, sizeof(ack), "%s", ms[mc-1].id); }
+    if (strcmp(req->cid, store_open_channel()) == 0) {
+        store_set_msg_loading(false);
+        if (req->ack[0]) snprintf(ack, sizeof(ack), "%s", req->ack);
+        else { int mc = 0; message *ms = store_messages(&mc);
+               if (mc > 0) snprintf(ack, sizeof(ack), "%s", ms[mc-1].id); }
+    } else if (req->ack[0]) {
+        snprintf(ack, sizeof(ack), "%s", req->ack);
+    }
     store_unlock();
-    if (ack[0]) discord_ack_message(s_fetch_cid, ack, s_token, s_cacert);
+    if (ack[0]) discord_ack_message(req->cid, ack, s_token, s_cacert);
+    free(req);
     return sceKernelExitDeleteThread(0);
 }
 
+struct older_req { char cid[24]; };
+
 static int older_worker(SceSize args, void *argp)
 {
-    (void)args; (void)argp;
+    (void)args;
+    struct older_req *req = *(struct older_req **)argp;
     char before[24];
     store_lock(); snprintf(before, sizeof(before), "%s", store_oldest_message_id());
     store_unlock();
     int added = before[0]
-        ? discord_get_messages_before(s_older_cid, before, s_token, s_cacert) : 0;
+        ? discord_get_messages_before(req->cid, before, s_token, s_cacert) : 0;
     if (added > 0) snprintf(s_restore_anchor, sizeof(s_restore_anchor), "%s", before);
     else           s_history_done = true;  // start of channel: stop asking
     console_dbgf("[ui] load older <%s -> +%d", before, added);
+    free(req);
     s_loading_older = false;
     return sceKernelExitDeleteThread(0);
 }
@@ -561,12 +610,14 @@ static void maybe_load_older(void)
     if (can) snprintf(cid, sizeof(cid), "%s", oc);
     store_unlock();
     if (!can) return;
+    struct older_req *req = calloc(1, sizeof(*req));
+    if (!req) return;
+    snprintf(req->cid, sizeof(req->cid), "%s", cid);
     s_loading_older = true;
-    snprintf(s_older_cid, sizeof(s_older_cid), "%s", cid);
     SceUID th = sceKernelCreateThread("cl_older", older_worker, 0x40,
                                       0x100000, 0, SCE_KERNEL_CPU_MASK_USER_1, NULL);
-    if (th >= 0) sceKernelStartThread(th, 0, NULL);
-    else s_loading_older = false;
+    if (th >= 0) sceKernelStartThread(th, sizeof(req), &req);
+    else { free(req); s_loading_older = false; }
 }
 
 static void open_forum(const channel *c);
@@ -642,10 +693,14 @@ static void set_toast(const char *msg);
 static void open_channel(const channel *c)
 {
     if (!c) return;
-    if (c->type == CH_VOICE) {
+    if (is_voice_channel(c->type)) {
 #if VOICE_JOIN_ENABLE
-        if (voice_active() && strcmp(voice_channel_id(), c->id) == 0) voice_leave();
-        else voice_join(s_cur_guild_id, c->id, s_token, s_cacert);
+        if (voice_active() && strcmp(voice_channel_id(), c->id) == 0) {
+            voice_leave();
+        } else {
+            snprintf(s_voice_ch_name, sizeof(s_voice_ch_name), "%s", c->name);
+            voice_join(s_cur_guild_id, c->id, s_token, s_cacert);
+        }
 #else
         set_toast("Voice needs Discord's E2EE (DAVE) and is disabled in this build.");
 #endif
@@ -654,6 +709,7 @@ static void open_channel(const channel *c)
     s_open_ch = *c; s_have_open = true;
     if (c->type == CH_FORUM) { open_forum(c); return; }
     s_forum_view = false;
+    struct fetch_req *req = calloc(1, sizeof(*req));
     store_lock();
     store_set_open_channel(c->id);
     store_clear_messages();
@@ -661,27 +717,35 @@ static void open_channel(const channel *c)
     // capture the last-read id before marking read
     snprintf(s_unread_boundary, sizeof(s_unread_boundary), "%s", c->last_read_id);
     bool unread = c->last_read_id[0] && snowflake_gt(c->last_message_id, c->last_read_id);
-    snprintf(s_fetch_around, sizeof(s_fetch_around), "%s", unread ? c->last_read_id : "");
-    snprintf(s_ack_newest, sizeof(s_ack_newest), "%s", c->last_message_id);
+    if (req) {
+        snprintf(req->cid, sizeof(req->cid), "%s", c->id);
+        snprintf(req->around, sizeof(req->around), "%s", unread ? c->last_read_id : "");
+        snprintf(req->ack, sizeof(req->ack), "%s", c->last_message_id);
+    }
     store_mark_read(c->id);
     store_unlock();
     save_last_view(s_cur_guild_id, c->id);
     s_msg_scroll = 0;
+    s_msg_sel_id[0] = '\0';
     s_want_unread = (s_unread_boundary[0] != '\0');
     s_want_bottom = !s_want_unread;
     s_history_done = false; s_restore_anchor[0] = '\0'; s_pin_anchor[0] = '\0';
 
     if (s_jump_to[0]) {
-        snprintf(s_fetch_around, sizeof(s_fetch_around), "%s", s_jump_to);
+        if (req) snprintf(req->around, sizeof(req->around), "%s", s_jump_to);
         snprintf(s_pin_anchor, sizeof(s_pin_anchor), "%s", s_jump_to);
         s_want_unread = false; s_want_bottom = false;
         s_jump_to[0] = '\0';
     }
 
-    snprintf(s_fetch_cid, sizeof(s_fetch_cid), "%s", c->id);
-    SceUID th = sceKernelCreateThread("gw_fetch", fetch_worker, 0x40,
-                                      0x100000, 0, SCE_KERNEL_CPU_MASK_USER_1, NULL);
-    if (th >= 0) sceKernelStartThread(th, 0, NULL);
+    if (req) {
+        SceUID th = sceKernelCreateThread("gw_fetch", fetch_worker, 0x40,
+                                          0x100000, 0, SCE_KERNEL_CPU_MASK_USER_1, NULL);
+        if (th >= 0) sceKernelStartThread(th, sizeof(req), &req);
+        else { free(req); store_lock(); store_set_msg_loading(false); store_unlock(); }
+    } else {
+        store_lock(); store_set_msg_loading(false); store_unlock();
+    }
 
     if (s_cur_guild_id[0])
         gateway_request_members(s_cur_guild_id, c->id);
@@ -752,6 +816,8 @@ void browser_init(const char *token, const char *cacert_path)
     snprintf(s_token, sizeof(s_token), "%s", token);
     snprintf(s_cacert, sizeof(s_cacert), "%s", cacert_path);
     s_restored = false;  // re-run the last-view restore for this login
+    voice_audio_set_vad_sens(g_settings.mic_sens);
+    voice_audio_set_ptt(g_settings.voice_mode == 1, 0);
 }
 
 static void compose_with(const char *initial)
@@ -767,8 +833,51 @@ static void compose_with(const char *initial)
 }
 static void compose_message(void) { compose_with(""); }
 
+struct act { int kind; char cid[24], mid[24], text[1200], emoji[64]; int arg; };
+static int act_thread(SceSize sz, void *p)
+{
+    (void)sz;
+    struct act *a = *(struct act **)p;
+    switch (a->kind) {
+    case 0: discord_react(a->cid, a->mid, a->emoji, a->arg != 0, s_token, s_cacert); break;
+    case 1: {
+        int code = discord_send_reply(a->cid, a->text, a->mid, s_token, s_cacert);
+        if (code < 200 || code >= 300) {
+            if (a->emoji[0]) { store_lock(); store_delete_message(a->emoji); store_unlock(); }
+            set_toast("Failed to send reply.");
+        }
+        break;
+    }
+    case 9: {
+        int code = discord_send_message(a->cid, a->text, s_token, s_cacert);
+        if (code < 200 || code >= 300) {
+            if (a->emoji[0]) { store_lock(); store_delete_message(a->emoji); store_unlock(); }
+            set_toast("Failed to send message.");
+        }
+        break;
+    }
+    case 2: discord_edit_message(a->cid, a->mid, a->text, s_token, s_cacert); break;
+    case 3: if (discord_delete_message_api(a->cid, a->mid, s_token, s_cacert) < 300) {
+                store_lock(); store_delete_message(a->mid); store_unlock(); }
+            break;
+    case 4: discord_poll_vote(a->cid, a->mid, a->arg, s_token, s_cacert); break;
+    case 5: discord_create_thread(a->cid, a->mid, a->text, s_token, s_cacert); break;
+    // forward: cid = destination channel, emoji = source channel, mid = message
+    case 6: discord_forward_message(a->cid, a->emoji, a->mid, s_token, s_cacert); break;
+    case 7: discord_crosspost(a->cid, a->mid, s_token, s_cacert); break;
+    case 8: discord_pin_message(a->cid, a->mid, a->arg, s_token, s_cacert); break;
+    }
+    free(a);
+    return sceKernelExitDeleteThread(0);
+}
+static void spawn_act(struct act *a)
+{
+    SceUID th = sceKernelCreateThread("cl_act", act_thread, 0x40, 0x40000, 0, SCE_KERNEL_CPU_MASK_USER_1, NULL);
+    if (th >= 0) sceKernelStartThread(th, sizeof(a), &a); else free(a);
+}
+
 // pump the inline composer once per frame after swap, outside the GXM scene;
-// called from main.c; sending is a blocking REST call
+// called from main.c; sends asynchronously via spawn_act with optimistic local echo
 void browser_ime_pump(void)
 {
     if (!s_compose_active) return;
@@ -777,13 +886,33 @@ void browser_ime_pump(void)
     if (r == 1) {  // Enter/Send
         const char *text = inlinekbd_text();
         if (text && text[0]) {
-            int code;
-            if (s_compose_reply[0])
-                code = discord_send_reply(s_compose_cid, text, s_compose_reply,
-                                          s_token, s_cacert);
-            else
-                code = discord_send_message(s_compose_cid, text, s_token, s_cacert);
-            console_dbgf("[ui] send -> %d", code);
+            static unsigned s_pending_seq = 0;
+            char pid[24];
+            snprintf(pid, sizeof(pid), "pending-%u", ++s_pending_seq);
+
+            store_lock();
+            if (strcmp(s_compose_cid, store_open_channel()) == 0) {
+                message pm;
+                memset(&pm, 0, sizeof(pm));
+                snprintf(pm.id, sizeof(pm.id), "%s", pid);
+                snprintf(pm.author_id, sizeof(pm.author_id), "%s", store_me_id());
+                snprintf(pm.author, sizeof(pm.author), "%s", store_me_name()[0] ? store_me_name() : "Me");
+                snprintf(pm.avatar, sizeof(pm.avatar), "%s", store_me_avatar());
+                snprintf(pm.content, sizeof(pm.content), "%s", text);
+                pm.pending = true;
+                store_push_message(&pm);
+            }
+            store_unlock();
+
+            struct act *a = calloc(1, sizeof(*a));
+            if (a) {
+                a->kind = s_compose_reply[0] ? 1 : 9;
+                snprintf(a->cid, sizeof(a->cid), "%s", s_compose_cid);
+                snprintf(a->mid, sizeof(a->mid), "%s", s_compose_reply);
+                snprintf(a->text, sizeof(a->text), "%s", text);
+                snprintf(a->emoji, sizeof(a->emoji), "%s", pid);
+                spawn_act(a);
+            }
         }
         s_reply_to[0] = '\0';  // consumed the reply target
     }
@@ -847,34 +976,6 @@ static void attach_camera(void)
     snprintf(u->cid, sizeof(u->cid), "%s", cid);
     u->bytes = buf; u->len = len;
     start_upload(u);
-}
-
-struct act { int kind; char cid[24], mid[24], text[1200], emoji[64]; int arg; };
-static int act_thread(SceSize sz, void *p)
-{
-    (void)sz;
-    struct act *a = *(struct act **)p;
-    switch (a->kind) {
-    case 0: discord_react(a->cid, a->mid, a->emoji, a->arg != 0, s_token, s_cacert); break;
-    case 1: discord_send_reply(a->cid, a->text, a->mid, s_token, s_cacert); break;
-    case 2: discord_edit_message(a->cid, a->mid, a->text, s_token, s_cacert); break;
-    case 3: if (discord_delete_message_api(a->cid, a->mid, s_token, s_cacert) < 300) {
-                store_lock(); store_delete_message(a->mid); store_unlock(); }
-            break;
-    case 4: discord_poll_vote(a->cid, a->mid, a->arg, s_token, s_cacert); break;
-    case 5: discord_create_thread(a->cid, a->mid, a->text, s_token, s_cacert); break;
-    // forward: cid = destination channel, emoji = source channel, mid = message
-    case 6: discord_forward_message(a->cid, a->emoji, a->mid, s_token, s_cacert); break;
-    case 7: discord_crosspost(a->cid, a->mid, s_token, s_cacert); break;
-    case 8: discord_pin_message(a->cid, a->mid, a->arg, s_token, s_cacert); break;
-    }
-    free(a);
-    return sceKernelExitDeleteThread(0);
-}
-static void spawn_act(struct act *a)
-{
-    SceUID th = sceKernelCreateThread("cl_act", act_thread, 0x40, 0x40000, 0, SCE_KERNEL_CPU_MASK_USER_1, NULL);
-    if (th >= 0) sceKernelStartThread(th, sizeof(a), &a); else free(a);
 }
 
 // tap-to-vote on a poll: optimistically update the local counts, then PUT the
@@ -1062,6 +1163,18 @@ static void set_toast(const char *msg)
 // dots); GIFs and new images are reported separately via imagecache_*
 bool browser_wants_redraw(void)
 {
+    static int s_last_va = -1, s_last_vc = -1, s_last_vm = -1, s_last_vd = -1;
+    static unsigned s_last_vspk = 0;
+    static const char *s_last_vs = NULL;
+    int va = voice_active(), vc = voice_connected(), vm = voice_is_muted(), vd = voice_is_deafened();
+    unsigned vspk = voice_speaking_mask();
+    const char *vs = voice_status();
+    bool vchanged = (va != s_last_va || vc != s_last_vc || vm != s_last_vm ||
+                     vd != s_last_vd || vspk != s_last_vspk || vs != s_last_vs);
+    s_last_va = va; s_last_vc = vc; s_last_vm = vm;
+    s_last_vd = vd; s_last_vspk = vspk; s_last_vs = vs;
+    if (vchanged) return true;
+    if (va && !vc) return true;
     if (s_compose_active) return true;
     if (s_menu)           return true;
     if (s_toast[0] && now_ms() < s_toast_until) return true;
@@ -1261,7 +1374,7 @@ static void open_forward(const char *src_cid, const char *src_mid)
     guild *g = store_find_guild(s_cur_guild_id);
     if (g) for (int i = 0; i < g->channel_count && s_fwd_n < MAX_FWD; i++) {
         channel *c = &g->channels[i];
-        if (c->hidden || c->type == CH_CATEGORY || c->type == CH_VOICE) continue;
+        if (c->hidden || c->type == CH_CATEGORY || is_voice_channel(c->type)) continue;
         if (!is_listed_channel(c->type)) continue;
         snprintf(s_fwd_id[s_fwd_n], 24, "%s", c->id);
         snprintf(s_fwd_name[s_fwd_n], 80, "%s", c->name);
@@ -1504,25 +1617,48 @@ static void new_forum_post(void)
     s_np_open = true;
 }
 
-// submit the New Post form: validate, POST, refresh on success
-static void np_submit(void)
+struct np_req { char fid[24]; char title[128]; char content[1024]; char tag[24]; };
+static volatile int s_np_submitting;
+static int np_submit_worker(SceSize sz, void *p)
 {
-    if (!s_np_title[0]) { snprintf(s_forum_status, sizeof(s_forum_status), "Enter a title"); return; }
-    if (s_np_tag_required && s_np_tagsel < 0) {
-        snprintf(s_forum_status, sizeof(s_forum_status), "Pick a tag"); return; }
-    const char *tag = (s_np_tagsel >= 0) ? s_np_tag_ids[s_np_tagsel] : NULL;
-    int code = discord_create_forum_post(s_forum_id, s_np_title, s_np_content, tag,
+    (void)sz;
+    struct np_req *r = *(struct np_req **)p;
+    int code = discord_create_forum_post(r->fid, r->title, r->content,
+                                         r->tag[0] ? r->tag : NULL,
                                          s_token, s_cacert);
     console_dbgf("[ui] new forum post -> %d", code);
     if (code >= 200 && code < 300) {
         s_np_open = false;
         snprintf(s_forum_status, sizeof(s_forum_status), "Post created");
-        s_forum_n = 0; s_forum_loading = true;  // refresh the post list
+        s_forum_n = 0; s_forum_loading = true;
         SceUID th = sceKernelCreateThread("cl_forum", forum_worker, 0x40, 0x100000, 0, SCE_KERNEL_CPU_MASK_USER_1, NULL);
         if (th >= 0) sceKernelStartThread(th, 0, NULL); else s_forum_loading = false;
     } else {
         snprintf(s_forum_status, sizeof(s_forum_status), "Failed (%d)", code);
     }
+    free(r);
+    s_np_submitting = 0;
+    return sceKernelExitDeleteThread(0);
+}
+
+// submit the New Post form: validate, POST off-thread, refresh on success
+static void np_submit(void)
+{
+    if (s_np_submitting) return;
+    if (!s_np_title[0]) { snprintf(s_forum_status, sizeof(s_forum_status), "Enter a title"); return; }
+    if (s_np_tag_required && s_np_tagsel < 0) {
+        snprintf(s_forum_status, sizeof(s_forum_status), "Pick a tag"); return; }
+    struct np_req *r = calloc(1, sizeof(*r));
+    if (!r) return;
+    snprintf(r->fid, sizeof(r->fid), "%s", s_forum_id);
+    snprintf(r->title, sizeof(r->title), "%s", s_np_title);
+    snprintf(r->content, sizeof(r->content), "%s", s_np_content);
+    if (s_np_tagsel >= 0) snprintf(r->tag, sizeof(r->tag), "%s", s_np_tag_ids[s_np_tagsel]);
+    s_np_submitting = 1;
+    snprintf(s_forum_status, sizeof(s_forum_status), "Posting...");
+    SceUID th = sceKernelCreateThread("cl_npsub", np_submit_worker, 0x40, 0x40000, 0, SCE_KERNEL_CPU_MASK_USER_1, NULL);
+    if (th >= 0) sceKernelStartThread(th, sizeof(r), &r);
+    else { free(r); s_np_submitting = 0; }
 }
 
 // presence rank for online-first ordering (1 online, 2 idle, 3 dnd, else offline)
@@ -1763,7 +1899,7 @@ static int pins_worker(SceSize sz, void *p)
 }
 static void open_pins(void)
 {
-    const channel *c = selected_channel();
+    const channel *c = s_have_open ? &s_open_ch : selected_channel();
     if (!c) return;
     if (s_pins_loading) { s_pins_open = true; return; }  // fetch already running
     snprintf(s_pins_cid, sizeof(s_pins_cid), "%s", c->id);
@@ -1905,7 +2041,7 @@ static void menu_do(int sel)
 
 static void menu_react(int idx)
 {
-    const channel *c = selected_channel();
+    const channel *c = s_have_open ? &s_open_ch : selected_channel();
     const char *e = NULL;
     if (s_menu == 2 && idx >= 0 && idx < 6)               e = k_react[idx];
     else if (s_menu == 3 && idx >= 0 && idx < K_EMOJI_N)  e = k_emoji[idx];
@@ -1918,8 +2054,12 @@ static void menu_react(int idx)
     s_menu = 0;
 }
 
-void browser_input(unsigned pressed, unsigned held, int ly)
+void browser_input(unsigned pressed, unsigned held, int ly, int ry)
 {
+    // Push-to-Talk: update held state even if composing, gated by voice_mode == 1.
+    voice_audio_set_ptt(g_settings.voice_mode == 1,
+                        (g_settings.voice_mode == 1 && (held & SCE_CTRL_SQUARE)) ? 1 : 0);
+
     // compose is modal: ignore app buttons while the inline keyboard is up
     if (s_compose_active) return;
 
@@ -1949,15 +2089,23 @@ void browser_input(unsigned pressed, unsigned held, int ly)
     }
 
     // on view entry, open the default item: a guild's #general (or its first
-    // channel), or the first DM
+    // non-voice channel), or the first DM
     if (s_pending_open && ready && s_sel_count > 0) {
-        int def = 0;
+        int def = -1;
         if (!home) {
             for (int i = 0; i < s_sel_count; i++)
-                if (strcmp(s_rows[s_selectable[i]].ch->name, "general") == 0) { def = i; break; }
+                if (strcmp(s_rows[s_selectable[i]].ch->name, "general") == 0 &&
+                    !is_voice_channel(s_rows[s_selectable[i]].ch->type)) { def = i; break; }
+            if (def < 0)
+                for (int i = 0; i < s_sel_count; i++)
+                    if (!is_voice_channel(s_rows[s_selectable[i]].ch->type)) { def = i; break; }
+        } else {
+            def = 0;
         }
-        s_chan_sel = def;
-        open_channel(selected_channel());
+        if (def >= 0) {
+            s_chan_sel = def;
+            open_channel(selected_channel());
+        }
         s_pending_open = false;
     }
 
@@ -1992,11 +2140,90 @@ void browser_input(unsigned pressed, unsigned held, int ly)
     if (pressed & SCE_CTRL_LTRIGGER) s_channels_collapsed = !s_channels_collapsed;
     if (pressed & SCE_CTRL_RTRIGGER) s_members_collapsed  = !s_members_collapsed;
 
-    if (pressed & SCE_CTRL_UP)   { if (s_chan_sel > 0) s_chan_sel--; }
-    if (pressed & SCE_CTRL_DOWN) { if (s_chan_sel < s_sel_count - 1) s_chan_sel++; }
+    // Message selection via Right Stick Y (or D-pad Up/Down when sidebar is collapsed).
+    static int s_msg_nav_cd = 0;
+    if (s_msg_nav_cd > 0) s_msg_nav_cd--;
+    int mdir = 0;
+    if (ry < -55 && s_msg_nav_cd == 0) { mdir = -1; s_msg_nav_cd = 10; }
+    else if (ry > 55 && s_msg_nav_cd == 0) { mdir = 1; s_msg_nav_cd = 10; }
+    else if (ry >= -55 && ry <= 55) s_msg_nav_cd = 0;
+    if (s_channels_collapsed && !s_forum_view) {
+        if (pressed & SCE_CTRL_UP)   mdir = -1;
+        if (pressed & SCE_CTRL_DOWN) mdir = 1;
+    }
+    if (mdir != 0 && s_have_open && !s_forum_view) {
+        store_lock();
+        int mc = 0;
+        message *msgs = store_messages(&mc);
+        if (mc > 0) {
+            int cur = -1;
+            if (s_msg_sel_id[0]) {
+                for (int i = 0; i < mc; i++)
+                    if (strcmp(msgs[i].id, s_msg_sel_id) == 0) { cur = i; break; }
+            }
+            if (cur < 0) {
+                cur = mc - 1;
+                if (s_nmhit > 0) {
+                    for (int i = 0; i < mc; i++)
+                        if (strcmp(msgs[i].id, s_mhit[s_nmhit - 1].id) == 0) { cur = i; break; }
+                }
+            } else {
+                cur += mdir;
+                if (cur < 0) cur = 0;
+                if (cur >= mc) cur = mc - 1;
+            }
+            snprintf(s_msg_sel_id, sizeof(s_msg_sel_id), "%s", msgs[cur].id);
+            s_msg_sel_follow = true;
+            s_want_unread = false; s_pin_anchor[0] = '\0';
+        }
+        store_unlock();
+    }
 
-    if (pressed & SCE_CTRL_CROSS) open_channel(selected_channel());
+    if (!s_channels_collapsed) {
+        if (pressed & SCE_CTRL_UP)   { if (s_chan_sel > 0) s_chan_sel--; }
+        if (pressed & SCE_CTRL_DOWN) { if (s_chan_sel < s_sel_count - 1) s_chan_sel++; }
+    }
+    if (pressed & SCE_CTRL_LEFT) {
+        if (s_guild > -1) {
+            s_guild--; s_chan_sel = 0; s_side_scroll = 0;
+            s_channels_collapsed = false; s_pending_open = true;
+        }
+    }
+    if (pressed & SCE_CTRL_RIGHT) {
+        if (s_guild < gcount - 1) {
+            s_guild++; s_chan_sel = 0; s_side_scroll = 0;
+            s_channels_collapsed = false; s_pending_open = true;
+        }
+    }
+
+    if (s_msg_sel_id[0] && (pressed & SCE_CTRL_CIRCLE)) {
+        s_msg_sel_id[0] = '\0';
+    }
+    if (pressed & SCE_CTRL_CROSS) {
+        if (s_msg_sel_id[0] && !s_forum_view) {
+            bool own = false;
+            store_lock();
+            int mc = 0; message *msgs = store_messages(&mc);
+            const char *me = store_me_id();
+            for (int i = 0; i < mc; i++) {
+                if (strcmp(msgs[i].id, s_msg_sel_id) == 0) {
+                    own = (me && msgs[i].author_id[0] && strcmp(msgs[i].author_id, me) == 0);
+                    break;
+                }
+            }
+            store_unlock();
+            snprintf(s_act_msg, sizeof(s_act_msg), "%s", s_msg_sel_id);
+            s_act_own = own;
+            s_menu = 1; s_menu_sel = 0;
+            s_menu_x = g_msg_x + 120; s_menu_y = SCREEN_H / 2 - 60;
+        } else {
+            open_channel(selected_channel());
+        }
+    }
     if (pressed & SCE_CTRL_TRIANGLE) compose_message();
+    if ((pressed & SCE_CTRL_SQUARE) && voice_active() && g_settings.voice_mode == 0)
+        voice_toggle_mute();
+    if ((pressed & SCE_CTRL_SELECT) && voice_active()) voice_toggle_deaf();
 
     // left stick scrolls messages
     if (ly > 40 || ly < -40) { s_msg_scroll += ly / 12; s_want_unread = false; s_pin_anchor[0] = '\0'; }
@@ -2009,7 +2236,8 @@ void browser_input(unsigned pressed, unsigned held, int ly)
     if (s_chan_sel != s_follow_sel) {
         s_follow_sel = s_chan_sel;
         bool home = (s_guild < 0);
-        int top = TOPBAR_H + 8, view_h = (SCREEN_H - 4) - top;
+        int top = TOPBAR_H + 8;
+        int view_h = (SCREEN_H - (voice_active() ? VOICEBAR_H : 4)) - top;
         int sel_row = (s_chan_sel < s_sel_count) ? s_selectable[s_chan_sel] : 0;
         int sy = sidebar_row_y(sel_row, home);
         int rowh = (sel_row < s_row_count) ? sidebar_rowh(sel_row, home) : 26;
@@ -2350,6 +2578,10 @@ void browser_touch(int x, int y, int dy, bool tap)
                 case 4: g_settings.clock_24h ^= 1; break;
                 case 5: g_settings.open_last ^= 1; break;
                 case 6: g_settings.low_battery ^= 1; break;
+                case 7: g_settings.voice_mode ^= 1;
+                        voice_audio_set_ptt(g_settings.voice_mode == 1, 0); break;
+                case 8: g_settings.mic_sens = (g_settings.mic_sens + 1) % 3;
+                        voice_audio_set_vad_sens(g_settings.mic_sens); break;
                 }
                 settings_save();
             } else if (inbtn && y >= s_set_eb_y && y < s_set_eb_y + SET_BTN_H) {
@@ -2411,6 +2643,30 @@ void browser_touch(int x, int y, int dy, bool tap)
             x >= s_back_r[0] && x < s_back_r[0] + s_back_r[2]) { thread_go_back(); return; }
         if (y < TOPBAR_H && s_pin_btn_x0 >= 0 &&
             x >= s_pin_btn_x0 && x < s_pin_btn_x1) { open_pins(); return; }
+        if (y < TOPBAR_H && s_call_btn_x0 >= 0 &&
+            x >= s_call_btn_x0 && x < s_call_btn_x1) {
+            if (s_have_open) {
+#if VOICE_JOIN_ENABLE
+                if (voice_active() && strcmp(voice_channel_id(), s_open_ch.id) == 0) {
+                    voice_leave();
+                } else {
+                    snprintf(s_voice_ch_name, sizeof(s_voice_ch_name), "%s", s_open_ch.name);
+                    voice_join("", s_open_ch.id, s_token, s_cacert);
+                }
+#else
+                set_toast("Voice needs Discord's E2EE (DAVE) and is disabled in this build.");
+#endif
+            }
+            return;
+        }
+        if (y < TOPBAR_H && s_dm_mute_btn_x0 >= 0 &&
+            x >= s_dm_mute_btn_x0 && x < s_dm_mute_btn_x1) {
+            voice_toggle_mute(); return;
+        }
+        if (y < TOPBAR_H && s_dm_deaf_btn_x0 >= 0 &&
+            x >= s_dm_deaf_btn_x0 && x < s_dm_deaf_btn_x1) {
+            voice_toggle_deaf(); return;
+        }
         if (y < TOPBAR_H && s_thr_btn_x0 >= 0 &&
             x >= s_thr_btn_x0 && x < s_thr_btn_x1) { open_threads(); return; }
         if (y < TOPBAR_H && s_search_btn_x0 >= 0 &&
@@ -2428,13 +2684,13 @@ void browser_touch(int x, int y, int dy, bool tap)
         }
         // Attach "+" at the left of the compose bar -> attachment sheet.
         if (y >= SCREEN_H - 46 && x >= g_msg_x + 14 && x < g_msg_x + 46 &&
-            selected_channel() && !s_uploading) { s_attach_open = 1; return; }
+            s_have_open && !s_uploading) { s_attach_open = 1; return; }
         // Mention "@" button -> member picker.
         if (y >= SCREEN_H - 46 && x >= g_msg_x + 46 && x < g_msg_x + 74 &&
-            selected_channel()) { open_mention_picker(); return; }
+            s_have_open) { open_mention_picker(); return; }
         // Compose bar at the bottom -> open the system keyboard to type/send.
         if (y >= SCREEN_H - 46 && x >= g_msg_x + 12 && x < msg_right0 - 12 &&
-            selected_channel()) { compose_message(); return; }
+            s_have_open) { compose_message(); return; }
         if (x >= g_msg_x && x < msg_right0 && y > TOPBAR_H && y < SCREEN_H - 52) {
             // Tapping a video card plays it fullscreen (hardware decode).
             for (int i = 0; i < s_nvidhit; i++)
@@ -2526,6 +2782,25 @@ void browser_touch(int x, int y, int dy, bool tap)
                 }
             }
         } else if (x < g_msg_x) {  // channel / DM list
+            // Docked bottom voice status bar controls (Mute / Deaf / End).
+            if (voice_active() && y >= SCREEN_H - VOICEBAR_H) {
+                if (s_vmute_btn[2] &&
+                    x >= s_vmute_btn[0] && x < s_vmute_btn[0] + s_vmute_btn[2] &&
+                    y >= s_vmute_btn[1] && y < s_vmute_btn[1] + s_vmute_btn[3]) {
+                    voice_toggle_mute(); return;
+                }
+                if (s_vdeaf_btn[2] &&
+                    x >= s_vdeaf_btn[0] && x < s_vdeaf_btn[0] + s_vdeaf_btn[2] &&
+                    y >= s_vdeaf_btn[1] && y < s_vdeaf_btn[1] + s_vdeaf_btn[3]) {
+                    voice_toggle_deaf(); return;
+                }
+                if (s_vleave_btn[2] &&
+                    x >= s_vleave_btn[0] && x < s_vleave_btn[0] + s_vleave_btn[2] &&
+                    y >= s_vleave_btn[1] && y < s_vleave_btn[1] + s_vleave_btn[3]) {
+                    voice_leave(); return;
+                }
+                return;
+            }
             // Home header "Friends" button.
             if (home && s_friends_btn[2] &&
                 x >= s_friends_btn[0] && x < s_friends_btn[0] + s_friends_btn[2] &&
@@ -2547,7 +2822,9 @@ void browser_touch(int x, int y, int dy, bool tap)
                 int rowh = sidebar_rowh(r, home);
                 if (y >= TOPBAR_H && y >= ry && y < ry + rowh) {
                     if (s_rows[r].is_cat) toggle_cat(s_rows[r].ch->id);
-                    else for (int j = 0; j < s_sel_count; j++)
+                    else if (s_rows[r].is_voice_user) {
+                        open_profile(s_rows[r].vm.user_id, s_rows[r].vm.name, s_rows[r].vm.avatar);
+                    } else for (int j = 0; j < s_sel_count; j++)
                         if (s_selectable[j] == r) {
                             s_chan_sel = j; open_channel(selected_channel()); break;
                         }
@@ -2681,8 +2958,9 @@ static void draw_sidebar(guild *g, bool home)
     if (s_channels_collapsed) return;  // channel drawer hidden; message pane fills it
     ui_rect(SIDE_X, 0, SIDE_W, SCREEN_H, COL_SIDEBAR);
 
+    int vactive = voice_active();
     int top = TOPBAR_H + 8;
-    int bot = SCREEN_H - 4;
+    int bot = SCREEN_H - (vactive ? VOICEBAR_H : 4);
     int total = sidebar_total_h(home);
     s_side_max = total > (bot - top) ? total - (bot - top) : 0;
     if (s_side_scroll > s_side_max) s_side_scroll = s_side_max;
@@ -2692,7 +2970,7 @@ static void draw_sidebar(guild *g, bool home)
     for (int r = 0; r < s_row_count; r++) {
         row_t *row = &s_rows[r];
         int rowh = sidebar_rowh(r, home);
-        if (y + rowh <= TOPBAR_H || y >= SCREEN_H) { y += rowh; continue; }  // offscreen
+        if (y + rowh <= TOPBAR_H || y >= bot) { y += rowh; continue; }  // offscreen
         if (row->is_cat) {
             char up[80]; int k = 0;
             for (const char *p = row->ch->name; *p && k < 79; p++, k++)
@@ -2703,6 +2981,29 @@ static void draw_sidebar(guild *g, bool home)
             ui_text(SIDE_X + 6, y + 3, FS_TINY, COL_TEXT_MUTED,
                     fold ? "\xE2\x80\xBA" : "\xCB\x85");
             ui_text_bold(SIDE_X + 16, y + 4, FS_TINY, COL_TEXT_MUTED, up);
+        } else if (row->is_voice_user) {
+            bool spk = vactive && !row->vm.mute && !row->vm.deaf &&
+                       voice_is_speaking(row->vm.user_id);
+            char vurl[256] = "";
+            if (row->vm.avatar[0] && row->vm.user_id[0])
+                snprintf(vurl, sizeof(vurl),
+                         "https://cdn.discordapp.com/avatars/%s/%s.png?size=64",
+                         row->vm.user_id, row->vm.avatar);
+            if (spk)
+                vita2d_draw_fill_circle(SIDE_X + 34, y + 10, 10, COL_GREEN);
+            draw_avatar(SIDE_X + 34, y + 10, 8, vurl, row->vm.name, COL_BLURPLE);
+            int avail = SIDE_W - 56;
+            if (row->vm.deaf || row->vm.mute) {
+                const char *tag = row->vm.deaf ? "DEAF" : "MUTE";
+                int bw = ui_text_bold_w(FS_TINY, tag) + 8;
+                int bx = SIDE_X + SIDE_W - bw - 8;
+                ui_rounded_rect(bx, y + 3, bw, 14, 4, COL_RED);
+                ui_text_bold(bx + 4, y + 3, FS_TINY, COL_WHITE, tag);
+                avail = bx - (SIDE_X + 48) - 4;
+            }
+            if (avail > 0)
+                ui_text_clip(SIDE_X + 48, y + 2, FS_SMALL,
+                             spk ? COL_TEXT_BRIGHT : COL_TEXT, row->vm.name, avail);
         } else {
             bool sel = (s_chan_sel < s_sel_count && s_selectable[s_chan_sel] == r);
             bool unread = row->ch->unread;
@@ -2724,8 +3025,10 @@ static void draw_sidebar(guild *g, bool home)
                              "https://cdn.discordapp.com/avatars/%s/%s.png?size=64",
                              row->ch->recipient_id, row->ch->avatar);
                 draw_avatar(SIDE_X + 22, y + 11, 12, durl, row->ch->name, COL_BLURPLE);
-                if (unread) ui_text_bold_clip(SIDE_X + 42, y, FS_CHANNEL, col, row->ch->name, SIDE_W - 78);
-                else        ui_text_clip(SIDE_X + 42, y, FS_CHANNEL, col, row->ch->name, SIDE_W - 78);
+                bool in_dm_call = vactive && strcmp(voice_channel_id(), row->ch->id) == 0;
+                unsigned dmcol = in_dm_call ? (voice_connected() ? COL_GREEN : COL_TEXT_BRIGHT) : col;
+                if (unread || in_dm_call) ui_text_bold_clip(SIDE_X + 42, y, FS_CHANNEL, dmcol, row->ch->name, SIDE_W - 78);
+                else                      ui_text_clip(SIDE_X + 42, y, FS_CHANNEL, dmcol, row->ch->name, SIDE_W - 78);
             } else if (ch_is_thread(row->ch->type)) {
                 // Thread: indented under its parent with a branch connector.
                 int tx = SIDE_X + 34;
@@ -2735,13 +3038,14 @@ static void draw_sidebar(guild *g, bool home)
                 else        ui_text_clip(tx, y, FS_CHANNEL, col, row->ch->name, SIDE_W - 52);
             } else {
                 int ty = row->ch->type;
+                bool is_v = is_voice_channel(ty);
                 const char *pfx = (ty == CH_FORUM)    ? "\xF0\x9F\x93\x8B"  // forum
-                                : (ty == CH_VOICE)    ? "\xF0\x9F\x94\x8A"  // speaker
+                                : is_v                ? "\xF0\x9F\x94\x8A"  // speaker
                                 : (ty == CH_ANNOUNCE) ? "\xF0\x9F\x93\xA2"  // megaphone
                                 : "#";
-                // Voice channels render muted (joining is gated off; see voice.h).
-                unsigned ccol = (ty == CH_VOICE) ? COL_TEXT_MUTED : col;
-                if (unread && ty != CH_VOICE) {
+                bool in_call = is_v && vactive && strcmp(voice_channel_id(), row->ch->id) == 0;
+                unsigned ccol = in_call ? (voice_connected() ? COL_GREEN : COL_TEXT_BRIGHT) : col;
+                if ((unread && !is_v) || in_call) {
                     ui_text_bold(SIDE_X + 16, y, FS_CHANNEL, ccol, pfx);
                     ui_text_bold_clip(SIDE_X + 30, y, FS_CHANNEL, ccol, row->ch->name, SIDE_W - 66);
                 } else {
@@ -2772,7 +3076,8 @@ static void draw_sidebar(guild *g, bool home)
         vita2d_texture *t = imagecache_get_anim(burl, now_ms());
         if (t) {
             float tw = vita2d_texture_get_width(t), th = vita2d_texture_get_height(t);
-            if (tw < 1) tw = 1; if (th < 1) th = 1;
+            if (tw < 1) tw = 1;
+    if (th < 1) th = 1;
             float s = (float)SIDE_W / tw;
             float srch = TOPBAR_H / s; if (srch > th) srch = th;  // crop to header
             vita2d_draw_texture_part_scale(t, SIDE_X, 0, 0, 0, tw, srch, s, s);
@@ -2816,6 +3121,53 @@ static void draw_sidebar(guild *g, bool home)
     if (home && s_sel_count == 0)
         ui_text(SIDE_X + 14, TOPBAR_H + 14, FS_SMALL, COL_TEXT_MUTED,
                 "No conversations yet.");
+
+    // Docked bottom voice status bar (masks rows scrolled underneath).
+    if (vactive) {
+        int vy = SCREEN_H - VOICEBAR_H;
+        ui_rect(SIDE_X, vy, SIDE_W, VOICEBAR_H, COL_GUILDBAR);
+        ui_rect(SIDE_X, vy, SIDE_W, 1, COL_DIVIDER);
+        int vconn = voice_connected();
+        unsigned vdot = vconn ? COL_GREEN : RGBA8(0xf0, 0xb2, 0x32, 0xFF);
+        vita2d_draw_fill_circle(SIDE_X + 14, vy + 13, 4, vdot);
+
+        const char *vname = s_voice_ch_name[0] ? s_voice_ch_name : voice_channel_id();
+        char vhdr[128];
+        snprintf(vhdr, sizeof(vhdr), "%s \xE2\x80\xA2 %s", voice_status(), vname);
+        ui_text_bold_clip(SIDE_X + 24, vy + 5, FS_TINY,
+                          vconn ? COL_GREEN : COL_TEXT_BRIGHT, vhdr, SIDE_W - 32);
+
+        int bw = (SIDE_W - 32) / 3, gap = 6, bx0 = SIDE_X + 10, by = vy + 26, bh = 36;
+
+        int muted = voice_is_muted();
+        const char *mlbl = muted ? "Muted" : "Mute";
+        int mx = bx0;
+        ui_rounded_rect(mx, by, bw, bh, 7, muted ? COL_RED : COL_ELEVATED);
+        ui_text_bold(mx + (bw - ui_text_bold_w(FS_SMALL, mlbl)) / 2, by + 10, FS_SMALL,
+                     muted ? COL_WHITE : COL_TEXT_BRIGHT, mlbl);
+        s_vmute_btn[0] = mx; s_vmute_btn[1] = by;
+        s_vmute_btn[2] = bw; s_vmute_btn[3] = bh;
+
+        int deaf = voice_is_deafened();
+        const char *dlbl = deaf ? "Deafened" : "Deaf";
+        int dx = mx + bw + gap;
+        ui_rounded_rect(dx, by, bw, bh, 7, deaf ? COL_RED : COL_ELEVATED);
+        ui_text_bold(dx + (bw - ui_text_bold_w(FS_SMALL, dlbl)) / 2, by + 10, FS_SMALL,
+                     deaf ? COL_WHITE : COL_TEXT_BRIGHT, dlbl);
+        s_vdeaf_btn[0] = dx; s_vdeaf_btn[1] = by;
+        s_vdeaf_btn[2] = bw; s_vdeaf_btn[3] = bh;
+
+        int lx = dx + bw + gap;
+        ui_rounded_rect(lx, by, bw, bh, 7, COL_RED);
+        ui_text_bold(lx + (bw - ui_text_bold_w(FS_SMALL, "End")) / 2, by + 10, FS_SMALL,
+                     COL_WHITE, "End");
+        s_vleave_btn[0] = lx; s_vleave_btn[1] = by;
+        s_vleave_btn[2] = bw; s_vleave_btn[3] = bh;
+    } else {
+        s_vmute_btn[2] = 0;
+        s_vdeaf_btn[2] = 0;
+        s_vleave_btn[2] = 0;
+    }
 }
 
 // Cache of shaped (circle/squircle) RGBA icon textures: mask each source into an
@@ -2964,7 +3316,8 @@ static void draw_avatar(int cx, int cy, int r, const char *url,
     vita2d_texture *t = (url && url[0]) ? icon_shaped(url, 0) : NULL;
     if (!t) { ui_avatar_placeholder(cx, cy, r, fallback_name, bg); return; }
     float sw = vita2d_texture_get_width(t), sh = vita2d_texture_get_height(t);
-    if (sw < 1) sw = 1; if (sh < 1) sh = 1;
+    if (sw < 1) sw = 1;
+    if (sh < 1) sh = 1;
     vita2d_draw_texture_scale(t, cx - r, cy - r, (2.0f * r) / sw, (2.0f * r) / sh);
 }
 
@@ -2984,7 +3337,8 @@ static void draw_guild_icon(int cx, int cy, int half, const char *url,
         return;
     }
     float sw = vita2d_texture_get_width(t), sh = vita2d_texture_get_height(t);
-    if (sw < 1) sw = 1; if (sh < 1) sh = 1;
+    if (sw < 1) sw = 1;
+    if (sh < 1) sh = 1;
     vita2d_draw_texture_scale(t, cx - half, cy - half,
                               (2.0f * half) / sw, (2.0f * half) / sh);
 }
@@ -3014,7 +3368,8 @@ static void draw_message_image(int x, int y, const message *m, int tw)
                         ? imagecache_get_anim(m->image_url, now_ms()) : NULL;
     if (t) {
         float ntw = vita2d_texture_get_width(t), nth = vita2d_texture_get_height(t);
-        if (ntw < 1) ntw = 1; if (nth < 1) nth = 1;
+        if (ntw < 1) ntw = 1;
+        if (nth < 1) nth = 1;
         vita2d_draw_texture_scale(t, x, y, (float)dw / ntw, (float)dh / nth);
     } else {
         ui_rounded_rect(x, y, dw, dh, 8, COL_SIDEBAR);
@@ -3073,7 +3428,8 @@ static void draw_invite_tile(int x, int y, const message *m, int tw)
         vita2d_texture *t = imagecache_get(surl);
         if (t) {
             float ntw = vita2d_texture_get_width(t), nth = vita2d_texture_get_height(t);
-            if (ntw < 1) ntw = 1; if (nth < 1) nth = 1;
+            if (ntw < 1) ntw = 1;
+        if (nth < 1) nth = 1;
             float s = (float)w / ntw; int dhh = (int)(nth * s);
             vita2d_draw_texture_scale(t, x, y, s, s);
             if (dhh > h) ui_rect(x, y + h, w, dhh - h, COL_CHAT);  // mask spill
@@ -3281,15 +3637,24 @@ static int draw_reactions(int x, int y, const message *m, int tw, bool draw)
             }
             int ex = cx + 8, ey = cy + (RX_H - RX_EMOJI) / 2;
             if (r->emoji_id[0]) {
-                // custom emoji: Discord CDN sprite
+                // custom emoji: Discord CDN sprite (animated GIF when flagged)
                 char url[128];
-                snprintf(url, sizeof(url),
-                    "https://cdn.discordapp.com/emojis/%s.png?size=32", r->emoji_id);
-                vita2d_texture *t = imagecache_get(url);
+                vita2d_texture *t = NULL;
+                if (r->animated) {
+                    snprintf(url, sizeof(url),
+                        "https://cdn.discordapp.com/emojis/%s.gif?size=32", r->emoji_id);
+                    t = imagecache_get_anim(url, now_ms());
+                }
+                if (!t) {
+                    snprintf(url, sizeof(url),
+                        "https://cdn.discordapp.com/emojis/%s.png?size=32", r->emoji_id);
+                    t = imagecache_get(url);
+                }
                 if (t) {
                     float twd = vita2d_texture_get_width(t);
                     float thd = vita2d_texture_get_height(t);
-                    if (twd < 1) twd = 1; if (thd < 1) thd = 1;
+                    if (twd < 1) twd = 1;
+                    if (thd < 1) thd = 1;
                     vita2d_draw_texture_part_scale(t, ex, ey, 0, 0, twd, thd,
                                                    (float)RX_EMOJI / twd,
                                                    (float)RX_EMOJI / thd);
@@ -3536,6 +3901,9 @@ static void draw_topbar(const channel *cc, int msg_w)
     ui_rect(g_msg_x, TOPBAR_H, msg_w, 1, COL_GUILDBAR);
     const channel *c = s_have_open ? &s_open_ch : cc;  // the actual open view
     s_back_r[2] = 0;
+    s_call_btn_x0 = s_call_btn_x1 = -1;
+    s_dm_mute_btn_x0 = s_dm_mute_btn_x1 = -1;
+    s_dm_deaf_btn_x0 = s_dm_deaf_btn_x1 = -1;
     if (c && c->name[0]) {
         // Right-side header buttons, laid out right-to-left.
         int rx = g_msg_x + msg_w;
@@ -3557,6 +3925,41 @@ static void draw_topbar(const channel *cc, int msg_w)
         ui_text_bold(px + 10, 14, FS_SMALL, COL_TEXT_BRIGHT, "Pins");
         s_pin_btn_x0 = px; s_pin_btn_x1 = px + pw;
         rx = px;
+        // Call / End Call + Mute (DM / Group DM).
+        if (c->type == CH_DM || c->type == CH_GROUP_DM) {
+            bool in_dm_call = voice_active() && strcmp(voice_channel_id(), c->id) == 0;
+            const char *clbl = in_dm_call ? "End Call" : "Call";
+            unsigned cbg = in_dm_call ? (voice_connected() ? COL_RED : RGBA8(0xf0, 0xb2, 0x32, 0xFF))
+                                      : COL_ELEVATED;
+            int cw = ui_text_bold_w(FS_SMALL, clbl) + 20;
+            int cx = rx - cw - 8;
+            ui_rounded_rect(cx, 9, cw, 24, 8, cbg);
+            ui_text_bold(cx + 10, 14, FS_SMALL,
+                         in_dm_call ? COL_WHITE : COL_TEXT_BRIGHT, clbl);
+            s_call_btn_x0 = cx; s_call_btn_x1 = cx + cw;
+            rx = cx;
+            if (in_dm_call) {
+                int muted = voice_is_muted();
+                const char *mlbl = muted ? "Muted" : "Mute";
+                int mw = ui_text_bold_w(FS_SMALL, mlbl) + 20;
+                int mx = rx - mw - 8;
+                ui_rounded_rect(mx, 9, mw, 24, 8, muted ? COL_RED : COL_ELEVATED);
+                ui_text_bold(mx + 10, 14, FS_SMALL,
+                             muted ? COL_WHITE : COL_TEXT_BRIGHT, mlbl);
+                s_dm_mute_btn_x0 = mx; s_dm_mute_btn_x1 = mx + mw;
+                rx = mx;
+
+                int deaf = voice_is_deafened();
+                const char *dlbl = deaf ? "Deafened" : "Deaf";
+                int dw = ui_text_bold_w(FS_SMALL, dlbl) + 20;
+                int dx = rx - dw - 8;
+                ui_rounded_rect(dx, 9, dw, 24, 8, deaf ? COL_RED : COL_ELEVATED);
+                ui_text_bold(dx + 10, 14, FS_SMALL,
+                             deaf ? COL_WHITE : COL_TEXT_BRIGHT, dlbl);
+                s_dm_deaf_btn_x0 = dx; s_dm_deaf_btn_x1 = dx + dw;
+                rx = dx;
+            }
+        }
         // Search (guild view).
         s_search_btn_x0 = s_search_btn_x1 = -1;
         if (s_guild >= 0) {
@@ -3662,7 +4065,7 @@ static void draw_messages(void)
     ui_rect(g_msg_x, 0, msg_w, SCREEN_H, COL_CHAT);
     s_jump_show = false;  // off unless the normal path re-enables it
 
-    const channel *c = selected_channel();
+    const channel *c = s_have_open ? &s_open_ch : selected_channel();
 
     // Forum channels show a scrollable list of post threads, not a message stream.
     if (s_forum_view) {
@@ -3793,6 +4196,20 @@ static void draw_messages(void)
     }
     if (s_want_bottom) { s_msg_scroll = max_scroll; s_want_bottom = false; }
     else if (was_bottom && !restored) s_msg_scroll = max_scroll;  // follow live messages
+    if (s_msg_sel_follow && s_msg_sel_id[0]) {
+        int above = 0;
+        for (int i = 0; i < mc; i++) {
+            if (strcmp(msgs[i].id, s_msg_sel_id) == 0) {
+                if (above < s_msg_scroll + 8)
+                    s_msg_scroll = above - 8;
+                else if (above + s_bh[i] > s_msg_scroll + pane_h - 8)
+                    s_msg_scroll = above + s_bh[i] - pane_h + 8;
+                break;
+            }
+            above += s_bh[i];
+        }
+        s_msg_sel_follow = false;
+    }
     if (s_msg_scroll > max_scroll) s_msg_scroll = max_scroll;
     if (s_msg_scroll < 0) s_msg_scroll = 0;
     s_prev_max = max_scroll;
@@ -3836,8 +4253,11 @@ static void draw_messages(void)
                 snprintf(hb->author, sizeof(hb->author), "%s", msgs[i].author);
                 snprintf(hb->avatar, sizeof(hb->avatar), "%s", msgs[i].avatar);
             }
-            // Gold tint + left border when the message @-mentions you.
-            if (msgs[i].mentions_me) {
+            // Gold tint + left border when the message @-mentions you, or blurple highlight when selected.
+            if (s_msg_sel_id[0] && strcmp(msgs[i].id, s_msg_sel_id) == 0) {
+                ui_rect(g_msg_x, y - 2, msg_w, block_h, COL_SELECTED);
+                ui_rect(g_msg_x, y - 2, 3, block_h, COL_BLURPLE);
+            } else if (msgs[i].mentions_me) {
                 ui_rect(g_msg_x, y - 2, msg_w, block_h, RGBA8(0x42,0x3a,0x1e,0xFF));
                 ui_rect(g_msg_x, y - 2, 3, block_h, RGBA8(0xf0,0xb2,0x32,0xFF));
             }
@@ -4150,7 +4570,8 @@ static void draw_profile_banner(int cx, int cy, int cw, int bh, const char *id,
         vita2d_texture *t = imagecache_get_anim(burl, now_ms());
         if (t) {
             float tw = vita2d_texture_get_width(t), th = vita2d_texture_get_height(t);
-            if (tw < 1) tw = 1; if (th < 1) th = 1;
+            if (tw < 1) tw = 1;
+    if (th < 1) th = 1;
             float s = (float)cw / tw;  // fill width exactly
             int dh = (int)(th * s);
             vita2d_draw_texture_scale(t, cx, cy, s, s);
@@ -4424,6 +4845,7 @@ static void draw_settings(void)
     ui_text(cx + 20, y, FS_TINY, COL_TEXT_MUTED, "APPEARANCE");
     y += 18;
     static const char *fs_lab[3] = { "Small", "Medium", "Large" };
+    static const char *sens_lab[3] = { "Low", "Medium", "High" };
     char av[SET_NAPP][20];
     snprintf(av[0], 20, "%s", g_settings.theme ? "Light" : "Dark");
     av[1][0] = '\0';  // accent draws a swatch, not text
@@ -4432,8 +4854,11 @@ static void draw_settings(void)
     snprintf(av[4], 20, "%s", g_settings.clock_24h ? "24-hour" : "12-hour");
     snprintf(av[5], 20, "%s", g_settings.open_last ? "Last channel" : "Home");
     snprintf(av[6], 20, "%s", g_settings.low_battery ? "On" : "Off");
+    snprintf(av[7], 20, "%s", g_settings.voice_mode ? "Push-to-Talk (Sq)" : "Voice Activity");
+    snprintf(av[8], 20, "%s", sens_lab[g_settings.mic_sens % 3]);
     static const char *app_lab[SET_NAPP] = {
-        "Theme", "Accent", "Font Size", "Density", "Clock", "Open To", "Low Battery" };
+        "Theme", "Accent", "Font Size", "Density", "Clock", "Open To", "Low Battery",
+        "Voice Input", "Mic Sensitivity" };
     for (int i = 0; i < SET_NAPP; i++) {
         ui_rounded_rect(cx + 20, y, cw - 40, SET_ROW_H, 6, COL_ELEVATED);
         ui_text(cx + 30, y + 8, FS_SMALL, COL_TEXT, app_lab[i]);
@@ -4553,7 +4978,8 @@ static void draw_lightbox(void)
     vita2d_texture *t = s_lightbox_url[0] ? imagecache_get_anim(s_lightbox_url, now_ms()) : NULL;
     if (t) {
         float tw = vita2d_texture_get_width(t), th = vita2d_texture_get_height(t);
-        if (tw < 1) tw = 1; if (th < 1) th = 1;
+        if (tw < 1) tw = 1;
+    if (th < 1) th = 1;
         float maxw = SCREEN_W - 40, maxh = SCREEN_H - 60;
         float s = maxw / tw; if (th * s > maxh) s = maxh / th;  // fit within the screen
         if (s > 3.0f) s = 3.0f;
@@ -5084,6 +5510,12 @@ void browser_draw(void)
     bool home = (s_guild < 0);
     guild *g = (!home && s_guild < gcount) ? &gs[s_guild] : NULL;
     build_rows(g, home);
+    const char *vcid = voice_channel_id();
+    if (vcid[0]) {
+        channel *vc = store_find_channel(vcid);
+        if (vc && vc->name[0])
+            snprintf(s_voice_ch_name, sizeof(s_voice_ch_name), "%s", vc->name);
+    }
     store_unlock();
 
     // right panel: the member list in a guild, or the friends list in DM/home --
