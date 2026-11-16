@@ -127,4 +127,4 @@ license: mbedTLS (Apache-2.0), mlspp (BSD-2, (c) Cisco), jsmn (MIT), stb_image
 Twemoji artwork (CC-BY 4.0), and the Mozilla CA bundle (MPL-2.0). The photo and
 camera dialog layouts are adapted from LifeLua.
 
-Disclosure: AI was used for API research and live area assets.
+Disclosure: AI was used for API research, live area assets, and fork development (including the background voice plugin, in-game overlay, UI/voice fixes, and documentation).
