@@ -2213,6 +2213,94 @@ static void menu_react(int idx)
     s_menu = 0;
 }
 
+static void scroll_clamp(int *scroll, int max, unsigned pressed)
+{
+    if (pressed & SCE_CTRL_UP)   *scroll -= 36;
+    if (pressed & SCE_CTRL_DOWN) *scroll += 36;
+    if (*scroll < 0)   *scroll = 0;
+    if (*scroll > max) *scroll = max;
+}
+
+// Handle controller input for whichever modal/popout is topmost in visual z-order.
+// Returns true if a modal is open and consumed input.
+static bool modal_handle_pad(unsigned pressed)
+{
+    if (s_lightbox_open) { if (pressed & SCE_CTRL_CIRCLE) s_lightbox_open = false; return true; }
+    if (s_confirm_open)  { if (pressed & SCE_CTRL_CIRCLE) s_confirm_open = 0; return true; }
+    if (s_rolepick_open) {
+        if (pressed & SCE_CTRL_UP) { s_rolepick_scroll -= 36; if (s_rolepick_scroll < 0) s_rolepick_scroll = 0; }
+        if (pressed & SCE_CTRL_DOWN) s_rolepick_scroll += 36;
+        if (pressed & SCE_CTRL_CIRCLE) s_rolepick_open = 0;
+        return true;
+    }
+    if (s_srvinfo_open)  { if (pressed & SCE_CTRL_CIRCLE) { s_srvinfo_open = 0; s_srv_confirm_leave = 0; } return true; }
+    if (s_friends_open)  { scroll_clamp(&s_friends_scroll, s_friends_max, pressed); if (pressed & SCE_CTRL_CIRCLE) s_friends_open = false; return true; }
+    if (s_accounts_open) { if (pressed & SCE_CTRL_CIRCLE) s_accounts_open = 0; return true; }
+    if (s_mention_open)  { scroll_clamp(&s_mention_scroll, s_mention_max, pressed); if (pressed & SCE_CTRL_CIRCLE) s_mention_open = 0; return true; }
+    if (s_forward_open)  { scroll_clamp(&s_fwd_scroll, s_fwd_max, pressed); if (pressed & SCE_CTRL_CIRCLE) s_forward_open = 0; return true; }
+    if (s_addserver_open){ if (pressed & SCE_CTRL_CIRCLE) s_addserver_open = 0; return true; }
+    if (s_vrec_open) {
+        int rst = audio_rec_status(NULL, NULL);
+        if (rst == 0) { s_vrec_open = false; return true; }
+        if (rst == 1) {
+            if (pressed & SCE_CTRL_CIRCLE) {
+                audio_rec_stop(0, NULL, NULL, NULL);
+                s_vrec_open = false;
+            } else if ((pressed & SCE_CTRL_CROSS) && s_have_open) {
+                audio_rec_stop(1, s_open_ch.id, s_token, s_cacert[0] ? s_cacert : NULL);
+                s_vrec_open = false;
+            }
+        }
+        return true;
+    }
+    if (s_attach_open) {
+        if (pressed & SCE_CTRL_UP)   { if (s_attach_sel > 0) s_attach_sel--; }
+        if (pressed & SCE_CTRL_DOWN) { if (s_attach_sel < 2) s_attach_sel++; }
+        if (pressed & SCE_CTRL_CIRCLE) s_attach_open = 0;
+        if (pressed & SCE_CTRL_CROSS) {
+            int sel = s_attach_sel;
+            s_attach_open = 0;
+            if (sel == 0) attach_photo();
+            else if (sel == 1) attach_camera();
+            else if (sel == 2 && !voice_active() && s_have_open && audio_rec_start() == 0)
+                s_vrec_open = true;
+        }
+        return true;
+    }
+    if (s_np_open)       { if (pressed & SCE_CTRL_CIRCLE) s_np_open = false; return true; }
+    if (s_search_open)   { scroll_clamp(&s_search_scroll, s_search_max, pressed); if (pressed & SCE_CTRL_CIRCLE) s_search_open = false; return true; }
+    if (s_thr_open)      { if (pressed & SCE_CTRL_CIRCLE) s_thr_open = false; return true; }
+    if (s_pins_open)     { if (pressed & SCE_CTRL_CIRCLE) s_pins_open = false; return true; }
+    if (s_settings_open) { scroll_clamp(&s_set_scroll, s_set_scroll_max, pressed); if (pressed & SCE_CTRL_CIRCLE) s_settings_open = false; return true; }
+    if (s_prof_open)     { if (pressed & SCE_CTRL_CIRCLE) { s_prof_open = false; s_prof_mod_arm = 0; } return true; }
+    if (s_menu) {
+        if (s_menu == 3) {  // full emoji grid: 2-D nav
+            int moved = 0;
+            if (pressed & SCE_CTRL_LEFT)  { if (s_menu_sel > 0) { s_menu_sel--; moved = 1; } }
+            if (pressed & SCE_CTRL_RIGHT) { if (s_menu_sel < s_menu_rows - 1) { s_menu_sel++; moved = 1; } }
+            if (pressed & SCE_CTRL_UP)    { if (s_menu_sel >= EMOJI_COLS) { s_menu_sel -= EMOJI_COLS; moved = 1; } }
+            if (pressed & SCE_CTRL_DOWN)  { if (s_menu_sel + EMOJI_COLS < s_menu_rows) { s_menu_sel += EMOJI_COLS; moved = 1; } }
+            if (moved) {  // follow selection only on D-pad move
+                int selrow = s_menu_sel / EMOJI_COLS;
+                if (selrow * EMOJI_CELL < s_emoji_scroll) s_emoji_scroll = selrow * EMOJI_CELL;
+                if ((selrow + 1) * EMOJI_CELL > s_emoji_scroll + EMOJI_VISROWS * EMOJI_CELL)
+                    s_emoji_scroll = (selrow + 1) * EMOJI_CELL - EMOJI_VISROWS * EMOJI_CELL;
+            }
+        } else {
+            if (pressed & (SCE_CTRL_UP | SCE_CTRL_LEFT))   { if (s_menu_sel > 0) s_menu_sel--; }
+            if (pressed & (SCE_CTRL_DOWN | SCE_CTRL_RIGHT)){ if (s_menu_sel < s_menu_rows - 1) s_menu_sel++; }
+        }
+        if (pressed & SCE_CTRL_CROSS) {
+            if (s_menu == 1) menu_do(s_menu_sel);
+            else if (s_menu == 2 && s_menu_sel == 6) { s_menu = 3; s_emoji_scroll = 0; s_menu_sel = 0; }
+            else menu_react(s_menu_sel);
+        }
+        if (pressed & SCE_CTRL_CIRCLE) s_menu = 0;
+        return true;
+    }
+    return false;
+}
+
 void browser_input(unsigned pressed, unsigned held, int ly, int ry)
 {
     // compose is modal: ignore app buttons while the inline keyboard is up
@@ -2281,32 +2369,7 @@ void browser_input(unsigned pressed, unsigned held, int ly, int ry)
         s_pending_open = false;
     }
 
-    // action menu captures input while open
-    if (s_menu) {
-        if (s_menu == 3) {  // full emoji grid: 2-D nav
-            int moved = 0;
-            if (pressed & SCE_CTRL_LEFT)  { if (s_menu_sel > 0) { s_menu_sel--; moved = 1; } }
-            if (pressed & SCE_CTRL_RIGHT) { if (s_menu_sel < s_menu_rows - 1) { s_menu_sel++; moved = 1; } }
-            if (pressed & SCE_CTRL_UP)    { if (s_menu_sel >= EMOJI_COLS) { s_menu_sel -= EMOJI_COLS; moved = 1; } }
-            if (pressed & SCE_CTRL_DOWN)  { if (s_menu_sel + EMOJI_COLS < s_menu_rows) { s_menu_sel += EMOJI_COLS; moved = 1; } }
-            if (moved) {  // follow selection only on D-pad move
-                int selrow = s_menu_sel / EMOJI_COLS;
-                if (selrow * EMOJI_CELL < s_emoji_scroll) s_emoji_scroll = selrow * EMOJI_CELL;
-                if ((selrow + 1) * EMOJI_CELL > s_emoji_scroll + EMOJI_VISROWS * EMOJI_CELL)
-                    s_emoji_scroll = (selrow + 1) * EMOJI_CELL - EMOJI_VISROWS * EMOJI_CELL;
-            }
-        } else {
-            if (pressed & (SCE_CTRL_UP | SCE_CTRL_LEFT))   { if (s_menu_sel > 0) s_menu_sel--; }
-            if (pressed & (SCE_CTRL_DOWN | SCE_CTRL_RIGHT)){ if (s_menu_sel < s_menu_rows - 1) s_menu_sel++; }
-        }
-        if (pressed & SCE_CTRL_CROSS) {
-            if (s_menu == 1) menu_do(s_menu_sel);
-            else if (s_menu == 2 && s_menu_sel == 6) { s_menu = 3; s_emoji_scroll = 0; s_menu_sel = 0; }
-            else menu_react(s_menu_sel);
-        }
-        if (pressed & SCE_CTRL_CIRCLE) s_menu = 0;
-        return;
-    }
+    if (modal_handle_pad(pressed)) return;
 
     // L toggles the channel list, R toggles the member list
     if (pressed & SCE_CTRL_LTRIGGER) s_channels_collapsed = !s_channels_collapsed;
@@ -2347,35 +2410,6 @@ void browser_input(unsigned pressed, unsigned held, int ly, int ry)
             s_want_unread = false; s_pin_anchor[0] = '\0';
         }
         store_unlock();
-    }
-
-    if (s_vrec_open) {
-        int rst = audio_rec_status(NULL, NULL);
-        if (rst == 0) { s_vrec_open = false; return; }
-        if (rst == 1) {
-            if ((pressed & SCE_CTRL_CIRCLE) != 0) {
-                audio_rec_stop(0, NULL, NULL, NULL);
-                s_vrec_open = false;
-            } else if ((pressed & SCE_CTRL_CROSS) != 0 && s_have_open) {
-                audio_rec_stop(1, s_open_ch.id, s_token, s_cacert[0] ? s_cacert : NULL);
-                s_vrec_open = false;
-            }
-        }
-        return;
-    }
-    if (s_attach_open) {
-        if (pressed & SCE_CTRL_UP)   { if (s_attach_sel > 0) s_attach_sel--; }
-        if (pressed & SCE_CTRL_DOWN) { if (s_attach_sel < 2) s_attach_sel++; }
-        if (pressed & SCE_CTRL_CIRCLE) s_attach_open = 0;
-        if (pressed & SCE_CTRL_CROSS) {
-            int sel = s_attach_sel;
-            s_attach_open = 0;
-            if (sel == 0) attach_photo();
-            else if (sel == 1) attach_camera();
-            else if (sel == 2 && !voice_active() && s_have_open && audio_rec_start() == 0)
-                s_vrec_open = true;
-        }
-        return;
     }
 
     if (s_rail_focus) {

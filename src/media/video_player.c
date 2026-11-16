@@ -18,6 +18,7 @@
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/display.h>
+#include <psp2/ctrl.h>
 #include <psp2/touch.h>
 
 #define VID_MAX_BYTES (32 * 1024 * 1024)
@@ -164,10 +165,13 @@ static void upload_frame(vita2d_texture *t, const unsigned char *src, int w, int
         memcpy(dst + (size_t)y * dstride, src + (size_t)y * pitch_px * 4, (size_t)w * 4);
 }
 
-static int tapped(void)
+static int dismiss_pressed(void)
 {
     SceTouchData td;
-    return sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1) >= 0 && td.reportNum > 0;
+    if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1) >= 0 && td.reportNum > 0) return 1;
+    SceCtrlData pad;
+    if (sceCtrlPeekBufferPositive(0, &pad, 1) >= 0 && (pad.buttons & SCE_CTRL_CIRCLE)) return 1;
+    return 0;
 }
 
 void video_play(const char *url, const char *cacert_path)
@@ -312,15 +316,15 @@ void video_play(const char *url, const char *cacert_path)
         long long now = (long long)(sceKernelGetProcessTimeWide() / 1000) - start;
         long long wait = play_ms - now;
         if (wait > 0 && wait < 2000) sceKernelDelayThread((int)wait * 1000);
-        if (tapped()) closed = 1;
+        if (dismiss_pressed()) closed = 1;
     }
     // Stop audio (signal + wake any blocked Output by waiting it out).
     astop = 1;
     if (athread >= 0) { sceKernelWaitThreadEnd(athread, NULL, NULL); sceKernelDeleteThread(athread); athread = -1; }
     free(apcm); apcm = NULL;
 
-    // Drain the closing tap.
-    for (int i = 0; i < 150 && tapped(); i++) sceKernelDelayThread(8000);
+    // Drain the closing tap or Circle press.
+    for (int i = 0; i < 150 && dismiss_pressed(); i++) sceKernelDelayThread(8000);
     vita2d_free_texture(tex); free(au);
 
 cleanup:
