@@ -13,6 +13,8 @@ static volatile int s_ov_active = 0;
 static volatile int s_ov_conn   = 0;
 static volatile int s_ov_muted  = 0;
 static volatile int s_ov_deaf   = 0;
+static cordless_overlay_state s_ov_state;
+static volatile uint32_t s_pending_actions = 0;
 
 int cordless_mem_set_overlay(int active, int connected, int muted, int deaf) {
     uint32_t state;
@@ -21,6 +23,14 @@ int cordless_mem_set_overlay(int active, int connected, int muted, int deaf) {
     s_ov_conn   = connected ? 1 : 0;
     s_ov_muted  = muted ? 1 : 0;
     s_ov_deaf   = deaf ? 1 : 0;
+    s_ov_state.flags = (s_ov_active ? CORDLESS_OV_ACTIVE : 0) |
+                       (s_ov_conn   ? CORDLESS_OV_CONNECTED : 0) |
+                       (s_ov_muted  ? CORDLESS_OV_MUTED : 0) |
+                       (s_ov_deaf   ? CORDLESS_OV_DEAF : 0);
+    if (!s_ov_active) {
+        memset(&s_ov_state, 0, sizeof(s_ov_state));
+        s_pending_actions = 0;
+    }
     EXIT_SYSCALL(state);
     return 0;
 }
@@ -34,6 +44,64 @@ int cordless_mem_get_overlay(void) {
             (s_ov_deaf   ? 8 : 0);
     EXIT_SYSCALL(state);
     return r;
+}
+
+int cordless_mem_set_overlay_state(const cordless_overlay_state *in) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    if (!in) {
+        EXIT_SYSCALL(state);
+        return -1;
+    }
+    cordless_overlay_state tmp;
+    int rc = ksceKernelMemcpyUserToKernel(&tmp, in, sizeof(tmp));
+    if (rc < 0) {
+        EXIT_SYSCALL(state);
+        return rc;
+    }
+    if (tmp.peer_count > CORDLESS_HUD_MAX_PEERS)
+        tmp.peer_count = CORDLESS_HUD_MAX_PEERS;
+    tmp.channel[sizeof(tmp.channel) - 1] = '\0';
+    for (int i = 0; i < CORDLESS_HUD_MAX_PEERS; i++)
+        tmp.peers[i].name[sizeof(tmp.peers[i].name) - 1] = '\0';
+    s_ov_state  = tmp;
+    s_ov_active = (tmp.flags & CORDLESS_OV_ACTIVE) ? 1 : 0;
+    s_ov_conn   = (tmp.flags & CORDLESS_OV_CONNECTED) ? 1 : 0;
+    s_ov_muted  = (tmp.flags & CORDLESS_OV_MUTED) ? 1 : 0;
+    s_ov_deaf   = (tmp.flags & CORDLESS_OV_DEAF) ? 1 : 0;
+    if (!s_ov_active) s_pending_actions = 0;
+    EXIT_SYSCALL(state);
+    return 0;
+}
+
+int cordless_mem_get_overlay_state(cordless_overlay_state *out) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    if (!out) {
+        EXIT_SYSCALL(state);
+        return -1;
+    }
+    cordless_overlay_state tmp = s_ov_state;
+    int rc = ksceKernelMemcpyKernelToUser(out, &tmp, sizeof(tmp));
+    EXIT_SYSCALL(state);
+    return rc;
+}
+
+int cordless_mem_post_action(uint32_t mask) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    s_pending_actions |= mask;
+    EXIT_SYSCALL(state);
+    return 0;
+}
+
+uint32_t cordless_mem_take_action(void) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    uint32_t act = s_pending_actions;
+    s_pending_actions = 0;
+    EXIT_SYSCALL(state);
+    return act;
 }
 
 SceUID cordless_mem_alloc_pool(uint32_t size, uint32_t *out_addr, uint32_t *out_type) {

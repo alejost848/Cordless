@@ -1,6 +1,8 @@
 #ifndef CORDLESS_VOICE_VOICE_H
 #define CORDLESS_VOICE_VOICE_H
 
+#include <stddef.h>
+
 // Discord voice client: join handshake (main-gateway op4 -> VOICE_SERVER_UPDATE
 // -> voice-gateway v8), UDP IP discovery, and the Opus + AEAD audio path.
 
@@ -31,6 +33,16 @@ void voice_set_deafened(int deafened);
 void voice_toggle_deaf(void);
 int      voice_is_speaking(const char *user_id);
 unsigned voice_speaking_mask(void);
+
+typedef struct voice_hud_peer {
+    char name[20];
+    int  speaking;
+} voice_hud_peer;
+
+void voice_set_channel_meta(const char *channel_name);
+void voice_note_user_name(const char *user_id, const char *name);
+int  voice_get_hud_peers(char *out_chan, size_t chan_cap,
+                         voice_hud_peer *out_peers, int max_peers);
 
 // Called by the main gateway worker with the voice server assignment
 // (VOICE_SERVER_UPDATE token+endpoint, VOICE_STATE_UPDATE session_id).

@@ -1,4 +1,5 @@
 #include "voice/voice_ipc.h"
+#include "model/store.h"
 #include "console.h"
 
 #include <arpa/inet.h>
@@ -153,6 +154,22 @@ void voice_ipc_poll(void) {
 int voice_ipc_join(const char *guild_id, const char *channel_id,
                    const char *user_id, const char *token, const char *cacert_path) {
     ensure_ur0_cacert(cacert_path);
+    char chan_label[28];
+    chan_label[0] = '\0';
+    voice_member vms[12];
+    int vn = 0;
+
+    store_lock();
+    channel *ch = channel_id ? store_find_channel(channel_id) : NULL;
+    if (ch && ch->name[0]) {
+        if (guild_id && guild_id[0]) snprintf(chan_label, sizeof(chan_label), "#%.26s", ch->name);
+        else snprintf(chan_label, sizeof(chan_label), "%.27s", ch->name);
+    }
+    if (channel_id && channel_id[0]) {
+        vn = store_voice_for_channel(channel_id, vms, 12);
+    }
+    store_unlock();
+
     json_t *req = json_object();
     json_object_set_new(req, "cmd",        json_string("join"));
     json_object_set_new(req, "guild_id",   json_string(guild_id ? guild_id : ""));
@@ -160,6 +177,22 @@ int voice_ipc_join(const char *guild_id, const char *channel_id,
     json_object_set_new(req, "user_id",    json_string(user_id ? user_id : ""));
     json_object_set_new(req, "token",      json_string(token ? token : ""));
     json_object_set_new(req, "cacert",     json_string(PLUGIN_CACERT_PATH));
+    if (chan_label[0]) {
+        json_object_set_new(req, "chan_name", json_string(chan_label));
+    }
+    if (vn > 0) {
+        json_t *arr = json_array();
+        for (int i = 0; i < vn; i++) {
+            if (!vms[i].user_id[0] || !vms[i].name[0]) continue;
+            char short_name[20];
+            snprintf(short_name, sizeof(short_name), "%s", vms[i].name);
+            json_t *item = json_object();
+            json_object_set_new(item, "id", json_string(vms[i].user_id));
+            json_object_set_new(item, "name", json_string(short_name));
+            json_array_append_new(arr, item);
+        }
+        json_object_set_new(req, "peers", arr);
+    }
     int rc = ipc_rpc(req);
     json_decref(req);
     return rc;

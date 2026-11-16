@@ -47,6 +47,10 @@ target_link_libraries(cordless_mem
   -Wl,-u,cordless_mem_probe
   -Wl,-u,cordless_mem_set_overlay
   -Wl,-u,cordless_mem_get_overlay
+  -Wl,-u,cordless_mem_set_overlay_state
+  -Wl,-u,cordless_mem_get_overlay_state
+  -Wl,-u,cordless_mem_post_action
+  -Wl,-u,cordless_mem_take_action
   -nostdlib
   taihenForKernel_stub
   SceSysmemForDriver_stub

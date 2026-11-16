@@ -96,6 +96,8 @@ static void dave_unlock(void) { if (s_dave_mtx >= 0) sceKernelUnlockMutex(s_dave
 // ssrc <-> user_id map & Op 5 speaking state, learned from op5 Speaking / op12 Client Connect.
 #define VOICE_SSRC_MAP_N 32
 static struct { unsigned ssrc; char uid[24]; int speaking; int64_t speaking_at; } s_ssrc_map[VOICE_SSRC_MAP_N];
+static char s_chan_label[28];
+static struct { char uid[24]; char name[20]; } s_hud_names[VOICE_SSRC_MAP_N];
 
 static int64_t now_ms(void);
 
@@ -314,6 +316,81 @@ unsigned voice_speaking_mask(void)
         mask |= (ws << 12);
     }
     return mask;
+}
+
+void voice_set_channel_meta(const char *channel_name)
+{
+    dave_lock();
+    if (channel_name && channel_name[0])
+        snprintf(s_chan_label, sizeof(s_chan_label), "%s", channel_name);
+    else
+        s_chan_label[0] = '\0';
+    dave_unlock();
+}
+
+void voice_note_user_name(const char *user_id, const char *name)
+{
+    if (!user_id || !user_id[0] || !name || !name[0]) return;
+    dave_lock();
+    int slot = -1;
+    for (int i = 0; i < VOICE_SSRC_MAP_N; i++) {
+        if (strcmp(s_hud_names[i].uid, user_id) == 0) { slot = i; break; }
+        if (slot < 0 && !s_hud_names[i].uid[0]) slot = i;
+    }
+    if (slot >= 0) {
+        snprintf(s_hud_names[slot].uid, sizeof(s_hud_names[slot].uid), "%s", user_id);
+        snprintf(s_hud_names[slot].name, sizeof(s_hud_names[slot].name), "%s", name);
+    }
+    dave_unlock();
+}
+
+static void resolve_hud_name_locked(const char *uid, char *out, size_t cap)
+{
+    for (int i = 0; i < VOICE_SSRC_MAP_N; i++) {
+        if (s_hud_names[i].uid[0] && strcmp(s_hud_names[i].uid, uid) == 0 &&
+            s_hud_names[i].name[0]) {
+            snprintf(out, cap, "%s", s_hud_names[i].name);
+            return;
+        }
+    }
+    size_t n = strlen(uid);
+    const char *tail = (n > 4) ? (uid + n - 4) : uid;
+    snprintf(out, cap, "User ..%.12s", tail);
+}
+
+int voice_get_hud_peers(char *out_chan, size_t chan_cap,
+                        voice_hud_peer *out_peers, int max_peers)
+{
+    int count = 0;
+    int64_t now = now_ms();
+    dave_lock();
+    if (out_chan && chan_cap > 0) {
+        snprintf(out_chan, chan_cap, "%s",
+                 s_chan_label[0] ? s_chan_label : "Voice Call");
+    }
+    if (out_peers && max_peers > 0) {
+        /* Pass 1: active speakers first, Pass 2: quiet peers in channel */
+        for (int pass = 0; pass < 2 && count < max_peers; pass++) {
+            for (int i = 0; i < VOICE_SSRC_MAP_N && count < max_peers; i++) {
+                const char *uid = s_ssrc_map[i].uid;
+                if (!uid[0]) continue;
+                if (s_user[0] && strcmp(uid, s_user) == 0) continue;
+                int spk = 0;
+                if (!s_deafened) {
+                    if (s_ssrc_map[i].ssrc && voice_audio_ssrc_speaking(s_ssrc_map[i].ssrc))
+                        spk = 1;
+                    else if (s_ssrc_map[i].speaking && (now - s_ssrc_map[i].speaking_at <= 1500))
+                        spk = 1;
+                }
+                if ((pass == 0 && !spk) || (pass == 1 && spk)) continue;
+                resolve_hud_name_locked(uid, out_peers[count].name, sizeof(out_peers[count].name));
+                out_peers[count].speaking = spk;
+                count++;
+            }
+        }
+    }
+    dave_unlock();
+    return count;
 }
 
 static int vws_send(ws_client *ws, json_t *obj)
@@ -1031,6 +1108,8 @@ void voice_leave(void)
     voice_audio_set_deafened(0);
     dave_lock();
     memset(s_ssrc_map, 0, sizeof(s_ssrc_map));
+    s_chan_label[0] = '\0';
+    memset(s_hud_names, 0, sizeof(s_hud_names));
     dave_unlock();
     s_guild[0] = '\0'; s_chan[0] = '\0';
     s_status = "Idle";

@@ -1,88 +1,453 @@
 #include "../kernel/cordless_mem.h"
 #include "../taihen/taihen.h"
 
+#include <psp2/ctrl.h>
 #include <psp2/display.h>
 #include <psp2/kernel/modulemgr.h>
+#include <stddef.h>
 #include <stdint.h>
 
-static SceUID s_disp_hook = -1;
+/* Provide freestanding memset/memcpy/strlen so -nostdlib links cleanly even when GCC
+ * emits block or string builtins under -O2. */
+#pragma GCC push_options
+#pragma GCC optimize("no-tree-loop-distribute-patterns")
+void *memset(void *dst, int c, size_t n) {
+    volatile uint8_t *p = (volatile uint8_t *)dst;
+    uint8_t v = (uint8_t)c;
+    for (size_t i = 0; i < n; i++) p[i] = v;
+    return dst;
+}
+void *memcpy(void *dst, const void *src, size_t n) {
+    volatile uint8_t *d = (volatile uint8_t *)dst;
+    const volatile uint8_t *s = (const volatile uint8_t *)src;
+    for (size_t i = 0; i < n; i++) d[i] = s[i];
+    return dst;
+}
+size_t strlen(const char *s) {
+    const volatile char *p = (const volatile char *)s;
+    size_t n = 0;
+    while (p[n]) n++;
+    return n;
+}
+#pragma GCC pop_options
+
+#define NUM_CTRL_HOOKS 8
+
+static SceUID         s_disp_hook = -1;
 static tai_hook_ref_t s_disp_ref = 0;
+static SceUID         s_ctrl_hooks[NUM_CTRL_HOOKS];
+static tai_hook_ref_t s_ctrl_refs[NUM_CTRL_HOOKS];
 
-#define HUD_W 104
-#define HUD_H 22
+static volatile int      s_panel_open = 0;
+static volatile int      s_sel = 0;
+static volatile uint64_t s_last_ts = 0;
+static volatile uint32_t s_prev_btn = 0;
+static volatile int      s_combo_prev = 0;
 
-typedef struct { char ch; uint8_t rows[7]; } hud_glyph;
-static const hud_glyph s_font[] = {
-    {' ', {0x00,0x00,0x00,0x00,0x00,0x00,0x00}},
-    {'A', {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}},
-    {'C', {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}},
-    {'D', {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}},
-    {'E', {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}},
-    {'F', {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}},
-    {'I', {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}},
-    {'L', {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}},
-    {'M', {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}},
-    {'N', {0x11,0x19,0x15,0x13,0x11,0x11,0x11}},
-    {'O', {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}},
-    {'T', {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}},
-    {'U', {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}},
-    {'V', {0x11,0x11,0x11,0x11,0x11,0x0A,0x04}},
+/* 5x7 font bitmaps for printable ASCII 0x20..0x7E (5 bits wide, MSB=leftmost). */
+static const uint8_t s_font95[95][7] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* ' ' */
+    {0x04,0x04,0x04,0x04,0x04,0x00,0x04}, /* '!' */
+    {0x0A,0x0A,0x00,0x00,0x00,0x00,0x00}, /* '"' */
+    {0x0A,0x1F,0x0A,0x0A,0x1F,0x0A,0x00}, /* '#' */
+    {0x04,0x0F,0x14,0x0E,0x05,0x1E,0x04}, /* '$' */
+    {0x18,0x19,0x02,0x04,0x08,0x13,0x03}, /* '%' */
+    {0x08,0x14,0x14,0x08,0x15,0x12,0x0D}, /* '&' */
+    {0x04,0x04,0x00,0x00,0x00,0x00,0x00}, /* '\'' */
+    {0x02,0x04,0x08,0x08,0x08,0x04,0x02}, /* '(' */
+    {0x08,0x04,0x02,0x02,0x02,0x04,0x08}, /* ')' */
+    {0x00,0x0A,0x04,0x1F,0x04,0x0A,0x00}, /* '*' */
+    {0x00,0x04,0x04,0x1F,0x04,0x04,0x00}, /* '+' */
+    {0x00,0x00,0x00,0x00,0x04,0x04,0x08}, /* ',' */
+    {0x00,0x00,0x00,0x1F,0x00,0x00,0x00}, /* '-' */
+    {0x00,0x00,0x00,0x00,0x00,0x04,0x04}, /* '.' */
+    {0x01,0x01,0x02,0x04,0x08,0x10,0x10}, /* '/' */
+    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, /* '0' */
+    {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, /* '1' */
+    {0x0E,0x11,0x01,0x06,0x08,0x10,0x1F}, /* '2' */
+    {0x0E,0x11,0x01,0x06,0x01,0x11,0x0E}, /* '3' */
+    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, /* '4' */
+    {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}, /* '5' */
+    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, /* '6' */
+    {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}, /* '7' */
+    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, /* '8' */
+    {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}, /* '9' */
+    {0x00,0x04,0x04,0x00,0x04,0x04,0x00}, /* ':' */
+    {0x00,0x04,0x04,0x00,0x04,0x04,0x08}, /* ';' */
+    {0x02,0x04,0x08,0x10,0x08,0x04,0x02}, /* '<' */
+    {0x00,0x00,0x1F,0x00,0x1F,0x00,0x00}, /* '=' */
+    {0x08,0x04,0x02,0x01,0x02,0x04,0x08}, /* '>' */
+    {0x0E,0x11,0x01,0x02,0x04,0x00,0x04}, /* '?' */
+    {0x0E,0x11,0x17,0x15,0x17,0x10,0x0E}, /* '@' */
+    {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, /* 'A' */
+    {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}, /* 'B' */
+    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, /* 'C' */
+    {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}, /* 'D' */
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}, /* 'E' */
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}, /* 'F' */
+    {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}, /* 'G' */
+    {0x11,0x11,0x11,0x1F,0x11,0x11,0x11}, /* 'H' */
+    {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}, /* 'I' */
+    {0x07,0x02,0x02,0x02,0x02,0x12,0x0C}, /* 'J' */
+    {0x11,0x12,0x14,0x18,0x14,0x12,0x11}, /* 'K' */
+    {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}, /* 'L' */
+    {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}, /* 'M' */
+    {0x11,0x19,0x15,0x13,0x11,0x11,0x11}, /* 'N' */
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, /* 'O' */
+    {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}, /* 'P' */
+    {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}, /* 'Q' */
+    {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}, /* 'R' */
+    {0x0E,0x11,0x10,0x0E,0x01,0x11,0x0E}, /* 'S' */
+    {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}, /* 'T' */
+    {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}, /* 'U' */
+    {0x11,0x11,0x11,0x11,0x11,0x0A,0x04}, /* 'V' */
+    {0x11,0x11,0x11,0x15,0x15,0x1B,0x11}, /* 'W' */
+    {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}, /* 'X' */
+    {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}, /* 'Y' */
+    {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}, /* 'Z' */
+    {0x0E,0x08,0x08,0x08,0x08,0x08,0x0E}, /* '[' */
+    {0x10,0x10,0x08,0x04,0x02,0x01,0x01}, /* '\\' */
+    {0x0E,0x02,0x02,0x02,0x02,0x02,0x0E}, /* ']' */
+    {0x04,0x0A,0x11,0x00,0x00,0x00,0x00}, /* '^' */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x1F}, /* '_' */
+    {0x08,0x04,0x02,0x00,0x00,0x00,0x00}, /* '`' */
+    {0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F}, /* 'a' */
+    {0x10,0x10,0x1E,0x11,0x11,0x11,0x1E}, /* 'b' */
+    {0x00,0x00,0x0F,0x10,0x10,0x10,0x0F}, /* 'c' */
+    {0x01,0x01,0x0F,0x11,0x11,0x11,0x0F}, /* 'd' */
+    {0x00,0x00,0x0E,0x11,0x1F,0x10,0x0E}, /* 'e' */
+    {0x06,0x08,0x1E,0x08,0x08,0x08,0x08}, /* 'f' */
+    {0x00,0x00,0x0F,0x11,0x0F,0x01,0x0E}, /* 'g' */
+    {0x10,0x10,0x1E,0x11,0x11,0x11,0x11}, /* 'h' */
+    {0x04,0x00,0x0C,0x04,0x04,0x04,0x0E}, /* 'i' */
+    {0x02,0x00,0x06,0x02,0x02,0x12,0x0C}, /* 'j' */
+    {0x10,0x10,0x12,0x14,0x18,0x14,0x12}, /* 'k' */
+    {0x0C,0x04,0x04,0x04,0x04,0x04,0x0E}, /* 'l' */
+    {0x00,0x00,0x1A,0x15,0x15,0x11,0x11}, /* 'm' */
+    {0x00,0x00,0x1E,0x11,0x11,0x11,0x11}, /* 'n' */
+    {0x00,0x00,0x0E,0x11,0x11,0x11,0x0E}, /* 'o' */
+    {0x00,0x00,0x1E,0x11,0x1E,0x10,0x10}, /* 'p' */
+    {0x00,0x00,0x0F,0x11,0x0F,0x01,0x01}, /* 'q' */
+    {0x00,0x00,0x16,0x19,0x10,0x10,0x10}, /* 'r' */
+    {0x00,0x00,0x0F,0x10,0x0E,0x01,0x1E}, /* 's' */
+    {0x08,0x08,0x1E,0x08,0x08,0x09,0x06}, /* 't' */
+    {0x00,0x00,0x11,0x11,0x11,0x11,0x0F}, /* 'u' */
+    {0x00,0x00,0x11,0x11,0x11,0x0A,0x04}, /* 'v' */
+    {0x00,0x00,0x11,0x11,0x15,0x15,0x0A}, /* 'w' */
+    {0x00,0x00,0x11,0x0A,0x04,0x0A,0x11}, /* 'x' */
+    {0x00,0x00,0x11,0x11,0x0F,0x01,0x0E}, /* 'y' */
+    {0x00,0x00,0x1F,0x02,0x04,0x08,0x1F}, /* 'z' */
+    {0x02,0x04,0x04,0x08,0x04,0x04,0x02}, /* '{' */
+    {0x04,0x04,0x04,0x04,0x04,0x04,0x04}, /* '|' */
+    {0x08,0x04,0x04,0x02,0x04,0x04,0x08}, /* '}' */
+    {0x00,0x00,0x08,0x15,0x02,0x00,0x00}, /* '~' */
 };
 
-static const uint8_t *find_glyph(char c) {
-    for (unsigned i = 0; i < sizeof(s_font) / sizeof(s_font[0]); i++) {
-        if (s_font[i].ch == c) return s_font[i].rows;
-    }
-    return s_font[0].rows;
+static int hud_strlen(const char *s) {
+    return s ? (int)strlen(s) : 0;
 }
 
-static int hook_sceDisplaySetFrameBuf(const SceDisplayFrameBuf *pParam, int sync) {
-    int st = cordless_mem_get_overlay();
-    if ((st & 1) && pParam && pParam->base &&
-        pParam->pixelformat == SCE_DISPLAY_PIXELFORMAT_A8B8G8R8 &&
-        pParam->width >= HUD_W + 16 && pParam->height >= HUD_H + 16 &&
-        pParam->pitch >= pParam->width) {
-
-        uint32_t *fb = (uint32_t *)pParam->base;
-        int pitch = (int)pParam->pitch;
-        int px = (int)pParam->width - HUD_W - 10;
-        int py = 8;
-
-        int conn  = (st & 2) != 0;
-        int muted = (st & 4) != 0;
-        int deaf  = (st & 8) != 0;
-
-        for (int y = 0; y < HUD_H; y++) {
-            uint32_t *row = fb + (py + y) * pitch + px;
-            for (int x = 0; x < HUD_W; x++) {
-                row[x] = 0xEE1E1A18;
-            }
+static void draw_rect(uint32_t *fb, int pitch, int fw, int fh,
+                      int x, int y, int w, int h, uint32_t col) {
+    int x0 = x < 0 ? 0 : x;
+    int y0 = y < 0 ? 0 : y;
+    int x1 = (x + w > fw) ? fw : (x + w);
+    int y1 = (y + h > fh) ? fh : (y + h);
+    for (int py = y0; py < y1; py++) {
+        uint32_t *row = fb + py * pitch;
+        for (int px = x0; px < x1; px++) {
+            row[px] = col;
         }
+    }
+}
 
-        uint32_t dot = (deaf || muted) ? 0xFF4444EF :
-                       conn ? 0xFF55CC44 : 0xFF33BBEE;
-        for (int y = 6; y < 16; y++) {
-            uint32_t *row = fb + (py + y) * pitch + px;
-            for (int x = 8; x < 18; x++) row[x] = dot;
-        }
+static void draw_border(uint32_t *fb, int pitch, int fw, int fh,
+                        int x, int y, int w, int h, uint32_t col) {
+    draw_rect(fb, pitch, fw, fh, x, y, w, 1, col);
+    draw_rect(fb, pitch, fw, fh, x, y + h - 1, w, 1, col);
+    draw_rect(fb, pitch, fw, fh, x, y, 1, h, col);
+    draw_rect(fb, pitch, fw, fh, x + w - 1, y, 1, h, col);
+}
 
-        const char *lbl = deaf  ? "DEAF" :
-                          muted ? "MUTED" :
-                          conn  ? "LIVE" : "CONN";
-        int tx = px + 26;
-        for (; *lbl; lbl++, tx += 7) {
-            const uint8_t *g = find_glyph(*lbl);
-            for (int ry = 0; ry < 7; ry++) {
-                uint8_t bits = g[ry];
-                uint32_t *row = fb + (py + 7 + ry) * pitch + tx;
-                for (int rx = 0; rx < 5; rx++) {
-                    if (bits & (1u << (4 - rx))) row[rx] = 0xFFFFFFFF;
+static void draw_text(uint32_t *fb, int pitch, int fw, int fh,
+                      int x, int y, uint32_t col, const char *s, int max_chars) {
+    if (!s) return;
+    for (int idx = 0; *s && idx < max_chars; s++, idx++, x += 6) {
+        unsigned char uc = (unsigned char)*s;
+        if (uc < 0x20 || uc > 0x7E) uc = '?';
+        const uint8_t *g = s_font95[uc - 0x20];
+        for (int ry = 0; ry < 7; ry++) {
+            int py = y + ry;
+            if (py < 0 || py >= fh) continue;
+            uint8_t bits = g[ry];
+            uint32_t *row = fb + py * pitch;
+            for (int rx = 0; rx < 5; rx++) {
+                int px = x + rx;
+                if (px >= 0 && px < fw && (bits & (1u << (4 - rx)))) {
+                    row[px] = col;
                 }
             }
         }
     }
+}
+
+/* ABGR colors (SCE_DISPLAY_PIXELFORMAT_A8B8G8R8) */
+#define COL_BG        0xFF221F1E /* #1E1F22 */
+#define COL_HDR       0xFF312D2B /* #2B2D31 */
+#define COL_BORDER    0xFF47413F /* #3F4147 */
+#define COL_DIV       0xFF3A3634 /* #34363A */
+#define COL_BTN       0xFF34302E /* #2E3034 */
+#define COL_BLURPLE   0xFFF26558 /* #5865F2 */
+#define COL_DANGER    0xFF3C37DA /* #DA373C */
+#define COL_WHITE     0xFFFFFFFF
+#define COL_DIM       0xFFA49B94 /* #949BA4 */
+#define COL_GREEN     0xFF5AA523 /* #23A55A */
+#define COL_TALK      0xFF6CD943 /* #43D96C */
+#define COL_RED       0xFF433FF2 /* #F23F43 */
+#define COL_AMBER     0xFF32B2F0 /* #F0B232 */
+#define COL_PEER_IDLE 0xFF5E5753
+
+static void render_pill(uint32_t *fb, int pitch, int fw, int fh, int flags) {
+    const int pw = 104, ph = 22;
+    if (fw < pw + 16 || fh < ph + 16) return;
+    int px = fw - pw - 10;
+    int py = 8;
+
+    int conn  = (flags & CORDLESS_OV_CONNECTED) != 0;
+    int muted = (flags & CORDLESS_OV_MUTED) != 0;
+    int deaf  = (flags & CORDLESS_OV_DEAF) != 0;
+
+    draw_rect(fb, pitch, fw, fh, px, py, pw, ph, COL_BG);
+    draw_border(fb, pitch, fw, fh, px, py, pw, ph, COL_BORDER);
+
+    uint32_t dot = (deaf || muted) ? COL_RED : (conn ? COL_GREEN : COL_AMBER);
+    draw_rect(fb, pitch, fw, fh, px + 8, py + 6, 10, 10, dot);
+
+    const char *lbl = deaf ? "DEAF" : (muted ? "MUTED" : (conn ? "LIVE" : "CONN"));
+    draw_text(fb, pitch, fw, fh, px + 26, py + 7, COL_WHITE, lbl, 8);
+}
+
+static void render_panel(uint32_t *fb, int pitch, int fw, int fh,
+                         const cordless_overlay_state *st) {
+    const int pw = 252;
+    int peers = (int)st->peer_count;
+    if (peers > CORDLESS_HUD_MAX_PEERS) peers = CORDLESS_HUD_MAX_PEERS;
+    int peer_rows = 1 + (peers > 0 ? peers : 1);
+    int ph = 26 + 16 + peer_rows * 15 + 8 + 3 * 24 + 18;
+    if (fw < pw + 16 || fh < ph + 16) {
+        render_pill(fb, pitch, fw, fh, (int)st->flags);
+        return;
+    }
+
+    int px = fw - pw - 10;
+    int py = 8;
+    int conn  = (st->flags & CORDLESS_OV_CONNECTED) != 0;
+    int muted = (st->flags & CORDLESS_OV_MUTED) != 0;
+    int deaf  = (st->flags & CORDLESS_OV_DEAF) != 0;
+    int tx    = (st->flags & CORDLESS_OV_TX_SPEAKING) != 0;
+
+    /* Card backdrop + border */
+    draw_rect(fb, pitch, fw, fh, px, py, pw, ph, COL_BG);
+    draw_border(fb, pitch, fw, fh, px, py, pw, ph, COL_BORDER);
+
+    /* Header */
+    draw_rect(fb, pitch, fw, fh, px + 1, py + 1, pw - 2, 24, COL_HDR);
+    draw_rect(fb, pitch, fw, fh, px + 1, py + 25, pw - 2, 1, COL_DIV);
+    uint32_t hdr_dot = (deaf || muted) ? COL_RED : (conn ? COL_GREEN : COL_AMBER);
+    draw_rect(fb, pitch, fw, fh, px + 10, py + 9, 8, 8, hdr_dot);
+
+    const char *state_tag = deaf ? "DEAF" : (muted ? "MUTED" : (conn ? "LIVE" : "CONN"));
+    draw_text(fb, pitch, fw, fh, px + 24, py + 9, COL_WHITE, state_tag, 6);
+    int tag_len = hud_strlen(state_tag);
+    const char *ch = st->channel[0] ? st->channel : "Voice Call";
+    draw_text(fb, pitch, fw, fh, px + 24 + tag_len * 6 + 6, py + 9, COL_DIM, ch,
+              32 - tag_len);
+
+    /* Participants section */
+    int cy = py + 31;
+    draw_text(fb, pitch, fw, fh, px + 10, cy, COL_DIM,
+              conn ? "SPEAKERS" : "CONNECTING...", 20);
+    cy += 13;
+
+    /* Self row */
+    uint32_t self_dot = (deaf || muted) ? COL_RED : (tx ? COL_TALK : COL_PEER_IDLE);
+    draw_rect(fb, pitch, fw, fh, px + 12, cy + 2, 6, 6, self_dot);
+    draw_text(fb, pitch, fw, fh, px + 24, cy + 1, COL_WHITE, "You", 16);
+    const char *self_lbl = deaf ? "DEAF" : (muted ? "MUTED" : (tx ? "TALK" : "MIC ON"));
+    uint32_t self_col = (deaf || muted) ? COL_RED : (tx ? COL_TALK : COL_DIM);
+    int slen = hud_strlen(self_lbl);
+    draw_text(fb, pitch, fw, fh, px + pw - 10 - slen * 6, cy + 1, self_col, self_lbl, 8);
+    cy += 15;
+
+    if (peers == 0) {
+        draw_text(fb, pitch, fw, fh, px + 24, cy + 1, COL_DIM,
+                  conn ? "(No other active speakers)" : "(Joining channel...)", 34);
+        cy += 15;
+    } else {
+        for (int i = 0; i < peers; i++) {
+            int pspk = (st->peers[i].flags & CORDLESS_PEER_SPEAKING) != 0;
+            draw_rect(fb, pitch, fw, fh, px + 12, cy + 2, 6, 6, pspk ? COL_TALK : COL_PEER_IDLE);
+            draw_text(fb, pitch, fw, fh, px + 24, cy + 1,
+                      pspk ? COL_WHITE : COL_DIM, st->peers[i].name, 26);
+            if (pspk) {
+                draw_text(fb, pitch, fw, fh, px + pw - 10 - 4 * 6, cy + 1, COL_TALK, "TALK", 4);
+            }
+            cy += 15;
+        }
+    }
+
+    /* Divider + Actions */
+    cy += 3;
+    draw_rect(fb, pitch, fw, fh, px + 8, cy, pw - 16, 1, COL_DIV);
+    cy += 5;
+
+    const char *btns[3];
+    btns[0] = muted ? "Unmute Microphone" : "Mute Microphone";
+    btns[1] = deaf  ? "Undeafen Audio"    : "Deafen Audio";
+    btns[2] = "Disconnect";
+
+    int sel = s_sel;
+    for (int i = 0; i < 3; i++) {
+        uint32_t bcol = COL_BTN;
+        if (i == sel) bcol = (i == 2) ? COL_DANGER : COL_BLURPLE;
+        draw_rect(fb, pitch, fw, fh, px + 10, cy, pw - 20, 20, bcol);
+        if (i == sel) {
+            draw_text(fb, pitch, fw, fh, px + 16, cy + 6, COL_WHITE, ">", 1);
+        }
+        draw_text(fb, pitch, fw, fh, px + 26, cy + 6,
+                  (i == sel) ? COL_WHITE : 0xFFE1DEDB, btns[i], 30);
+        cy += 24;
+    }
+
+    draw_text(fb, pitch, fw, fh, px + 10, cy + 2, COL_DIM, "D-Pad:Nav  X:Select  O:Close", 36);
+}
+
+static int hook_sceDisplaySetFrameBuf(const SceDisplayFrameBuf *pParam, int sync) {
+    int quick = cordless_mem_get_overlay();
+    if (!(quick & CORDLESS_OV_ACTIVE)) {
+        if (s_panel_open) s_panel_open = 0;
+    } else if (pParam && pParam->base &&
+               pParam->pixelformat == SCE_DISPLAY_PIXELFORMAT_A8B8G8R8 &&
+               pParam->pitch >= pParam->width) {
+        uint32_t *fb = (uint32_t *)pParam->base;
+        int pitch = (int)pParam->pitch;
+        int fw = (int)pParam->width;
+        int fh = (int)pParam->height;
+
+        if (s_panel_open) {
+            cordless_overlay_state st;
+            memset(&st, 0, sizeof(st));
+            if (cordless_mem_get_overlay_state(&st) == 0 && (st.flags & CORDLESS_OV_ACTIVE)) {
+                render_panel(fb, pitch, fw, fh, &st);
+            } else {
+                s_panel_open = 0;
+            }
+        } else {
+            render_pill(fb, pitch, fw, fh, quick);
+        }
+    }
     return TAI_CONTINUE(int, s_disp_ref, pParam, sync);
 }
+
+static int ctrl_process(int port, SceCtrlData *pad_data, int count, int ret) {
+    if (ret <= 0 || !pad_data || (port != 0 && port != 1)) return ret;
+
+    int n = (ret < count) ? ret : count;
+    const SceCtrlData *cur = (n > 1 && pad_data[n - 1].timeStamp > pad_data[0].timeStamp)
+                             ? &pad_data[n - 1] : &pad_data[0];
+    uint32_t raw = cur->buttons;
+    uint64_t ts = cur->timeStamp;
+    int combo_now = ((raw & (SCE_CTRL_LTRIGGER | SCE_CTRL_L1)) != 0) &&
+                    ((raw & (SCE_CTRL_RTRIGGER | SCE_CTRL_R1)) != 0) &&
+                    ((raw & SCE_CTRL_TRIANGLE) != 0);
+
+    if (ts != s_last_ts || (ts == 0 && raw != s_prev_btn)) {
+        s_last_ts = ts;
+        uint32_t pressed = raw & ~s_prev_btn;
+        s_prev_btn = raw;
+
+        if (combo_now && !s_combo_prev) {
+            if (s_panel_open) {
+                s_panel_open = 0;
+            } else if (cordless_mem_get_overlay() & CORDLESS_OV_ACTIVE) {
+                s_panel_open = 1;
+                s_sel = 0;
+            }
+        } else if (s_panel_open && !combo_now) {
+            if (pressed & SCE_CTRL_UP) {
+                s_sel = (s_sel > 0) ? (s_sel - 1) : 2;
+            } else if (pressed & SCE_CTRL_DOWN) {
+                s_sel = (s_sel + 1) % 3;
+            } else if (pressed & SCE_CTRL_CIRCLE) {
+                s_panel_open = 0;
+            } else if (pressed & SCE_CTRL_CROSS) {
+                if (s_sel == 0) {
+                    cordless_mem_post_action(CORDLESS_ACT_MUTE);
+                } else if (s_sel == 1) {
+                    cordless_mem_post_action(CORDLESS_ACT_DEAF);
+                } else {
+                    cordless_mem_post_action(CORDLESS_ACT_LEAVE);
+                    s_panel_open = 0;
+                }
+            }
+        }
+        s_combo_prev = combo_now;
+    }
+
+    if (s_panel_open) {
+        for (int i = 0; i < n; i++) {
+            pad_data[i].buttons &= 0xFFFF0000u;
+            pad_data[i].lx = 128;
+            pad_data[i].ly = 128;
+            pad_data[i].rx = 128;
+            pad_data[i].ry = 128;
+            pad_data[i].up = 0;
+            pad_data[i].right = 0;
+            pad_data[i].down = 0;
+            pad_data[i].left = 0;
+            pad_data[i].lt = 0;
+            pad_data[i].rt = 0;
+            pad_data[i].l1 = 0;
+            pad_data[i].r1 = 0;
+            pad_data[i].triangle = 0;
+            pad_data[i].circle = 0;
+            pad_data[i].cross = 0;
+            pad_data[i].square = 0;
+        }
+    }
+    return ret;
+}
+
+#define DEFINE_CTRL_HOOK(idx) \
+static int hook_ctrl_##idx(int port, SceCtrlData *pad_data, int count) { \
+    int ret = TAI_CONTINUE(int, s_ctrl_refs[idx], port, pad_data, count); \
+    return ctrl_process(port, pad_data, count, ret); \
+}
+
+DEFINE_CTRL_HOOK(0)
+DEFINE_CTRL_HOOK(1)
+DEFINE_CTRL_HOOK(2)
+DEFINE_CTRL_HOOK(3)
+DEFINE_CTRL_HOOK(4)
+DEFINE_CTRL_HOOK(5)
+DEFINE_CTRL_HOOK(6)
+DEFINE_CTRL_HOOK(7)
+
+typedef int (*ctrl_hook_fn)(int port, SceCtrlData *pad_data, int count);
+
+static const struct {
+    uint32_t     nid;
+    ctrl_hook_fn fn;
+} s_ctrl_targets[NUM_CTRL_HOOKS] = {
+    { 0xA9C3CED6, hook_ctrl_0 }, /* sceCtrlPeekBufferPositive */
+    { 0x15F81E8C, hook_ctrl_1 }, /* sceCtrlPeekBufferPositive2 */
+    { 0xA59454D3, hook_ctrl_2 }, /* sceCtrlPeekBufferPositiveExt */
+    { 0x860BF292, hook_ctrl_3 }, /* sceCtrlPeekBufferPositiveExt2 */
+    { 0x67E7AB83, hook_ctrl_4 }, /* sceCtrlReadBufferPositive */
+    { 0xC4226A3E, hook_ctrl_5 }, /* sceCtrlReadBufferPositive2 */
+    { 0xE2D99296, hook_ctrl_6 }, /* sceCtrlReadBufferPositiveExt */
+    { 0xA7178860, hook_ctrl_7 }, /* sceCtrlReadBufferPositiveExt2 */
+};
 
 void _start() __attribute__((weak, alias("module_start")));
 
@@ -91,11 +456,23 @@ int module_start(SceSize argc, const void *args) {
     s_disp_hook = taiHookFunctionImport(&s_disp_ref, TAI_MAIN_MODULE,
                                         TAI_ANY_LIBRARY, 0x7A410B64,
                                         hook_sceDisplaySetFrameBuf);
+    for (int i = 0; i < NUM_CTRL_HOOKS; i++) {
+        s_ctrl_hooks[i] = taiHookFunctionImport(&s_ctrl_refs[i], TAI_MAIN_MODULE,
+                                                TAI_ANY_LIBRARY, s_ctrl_targets[i].nid,
+                                                s_ctrl_targets[i].fn);
+    }
     return SCE_KERNEL_START_SUCCESS;
 }
 
 int module_stop(SceSize argc, const void *args) {
     (void)argc; (void)args;
+    s_panel_open = 0;
+    for (int i = 0; i < NUM_CTRL_HOOKS; i++) {
+        if (s_ctrl_hooks[i] >= 0) {
+            taiHookRelease(s_ctrl_hooks[i], s_ctrl_refs[i]);
+            s_ctrl_hooks[i] = -1;
+        }
+    }
     if (s_disp_hook >= 0) {
         taiHookRelease(s_disp_hook, s_disp_ref);
         s_disp_hook = -1;

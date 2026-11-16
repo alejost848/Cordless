@@ -1,5 +1,6 @@
 #include "../kernel/cordless_mem.h"
 #include "voice/voice.h"
+#include "voice/voice_audio.h"
 #include "voice/voice_crypto.h"
 
 #include <psp2/audioout.h>
@@ -90,6 +91,20 @@ static void handle_ipc_line(int fd, const char *line) {
         const char *cacert   = json_string_value(json_object_get(req, "cacert"));
         main_gw_set_auth(token, cacert, user_id);
         int rc = voice_join(guild_id, chan_id, token, cacert);
+        if (rc == 0) {
+            const char *cname = json_string_value(json_object_get(req, "chan_name"));
+            voice_set_channel_meta(cname);
+            json_t *peers = json_object_get(req, "peers");
+            if (json_is_array(peers)) {
+                size_t np = json_array_size(peers);
+                for (size_t i = 0; i < np; i++) {
+                    json_t *it = json_array_get(peers, i);
+                    const char *pid = json_string_value(json_object_get(it, "id"));
+                    const char *pnm = json_string_value(json_object_get(it, "name"));
+                    if (pid && pnm) voice_note_user_name(pid, pnm);
+                }
+            }
+        }
         json_object_set_new(resp, "rc", json_integer(rc));
     } else if (strcmp(cmd, "server") == 0) {
         const char *token   = json_string_value(json_object_get(req, "token"));
@@ -165,15 +180,41 @@ static int full_thread(SceSize args, void *argp) {
     }
 
     int combo_held = 0;
-    int prev_ov = -1;
+    cordless_overlay_state prev_ov;
+    memset(&prev_ov, 0xff, sizeof(prev_ov));
     while (s_run) {
+        uint32_t act = cordless_mem_take_action();
+        if (act && voice_active()) {
+            if (act & CORDLESS_ACT_MUTE)  voice_toggle_mute();
+            if (act & CORDLESS_ACT_DEAF)  voice_toggle_deaf();
+            if (act & CORDLESS_ACT_LEAVE) voice_leave();
+        }
         main_gw_tick();
         if (!voice_active()) main_gw_stop();
-        int a = voice_active(), c = voice_connected(), m = voice_is_muted(), d = voice_is_deafened();
-        int ov = (a ? 1 : 0) | (c ? 2 : 0) | (m ? 4 : 0) | (d ? 8 : 0);
-        if (ov != prev_ov) {
-            prev_ov = ov;
-            cordless_mem_set_overlay(a, c, m, d);
+        {
+            int a = voice_active(), c = voice_connected(), m = voice_is_muted(), d = voice_is_deafened();
+            int tx = (a && c && voice_audio_is_tx_speaking()) ? 1 : 0;
+            cordless_overlay_state ov;
+            memset(&ov, 0, sizeof(ov));
+            ov.flags = (a  ? CORDLESS_OV_ACTIVE : 0) |
+                       (c  ? CORDLESS_OV_CONNECTED : 0) |
+                       (m  ? CORDLESS_OV_MUTED : 0) |
+                       (d  ? CORDLESS_OV_DEAF : 0) |
+                       (tx ? CORDLESS_OV_TX_SPEAKING : 0);
+            if (a) {
+                voice_hud_peer hp[CORDLESS_HUD_MAX_PEERS];
+                int n = voice_get_hud_peers(ov.channel, sizeof(ov.channel), hp, CORDLESS_HUD_MAX_PEERS);
+                if (n > CORDLESS_HUD_MAX_PEERS) n = CORDLESS_HUD_MAX_PEERS;
+                ov.peer_count = (uint8_t)n;
+                for (int i = 0; i < n; i++) {
+                    snprintf(ov.peers[i].name, sizeof(ov.peers[i].name), "%.19s", hp[i].name);
+                    ov.peers[i].flags = hp[i].speaking ? CORDLESS_PEER_SPEAKING : 0;
+                }
+            }
+            if (memcmp(&ov, &prev_ov, sizeof(ov)) != 0) {
+                prev_ov = ov;
+                cordless_mem_set_overlay_state(&ov);
+            }
         }
         /* In-game mute toggle on L + R + SELECT when a call is active */
         SceCtrlData pad;

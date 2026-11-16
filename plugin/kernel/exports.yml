@@ -15,3 +15,7 @@ cordless_mem:
         - cordless_mem_probe
         - cordless_mem_set_overlay
         - cordless_mem_get_overlay
+        - cordless_mem_set_overlay_state
+        - cordless_mem_get_overlay_state
+        - cordless_mem_post_action
+        - cordless_mem_take_action
