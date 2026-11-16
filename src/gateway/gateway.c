@@ -1866,7 +1866,11 @@ static int run_connection(bool resuming)
             json_array_append_new(arr, json_pack("[i,i]", 0, 99));
             json_t *channels = json_object();
             json_object_set_new(channels, s_mem_channel, arr);
-            json_t *dd = json_pack("{s:s, s:o}", "guild_id", s_mem_guild,
+            json_t *dd = json_pack("{s:s, s:b, s:b, s:b, s:o}",
+                                   "guild_id", s_mem_guild,
+                                   "typing", 1,
+                                   "activities", 1,
+                                   "threads", 1,
                                    "channels", channels);
             json_t *p = json_pack("{s:i, s:o}", "op", 14, "d", dd);
             char *txt = json_dumps(p, JSON_COMPACT);

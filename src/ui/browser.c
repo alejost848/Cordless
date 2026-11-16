@@ -761,8 +761,10 @@ static void open_channel(const channel *c)
         store_lock(); store_set_msg_loading(false); store_unlock();
     }
 
-    if (s_cur_guild_id[0])
-        gateway_request_members(s_cur_guild_id, c->id);
+    if (s_cur_guild_id[0]) {
+        const char *sub_cid = (ch_is_thread(c->type) && c->parent_id[0]) ? c->parent_id : c->id;
+        gateway_request_members(s_cur_guild_id, sub_cid);
+    }
     console_dbgf("[ui] open #%s", c->name);
 }
 
@@ -2149,13 +2151,8 @@ void browser_input(unsigned pressed, unsigned held, int ly, int ry)
     if (pressed & SCE_CTRL_LTRIGGER) s_channels_collapsed = !s_channels_collapsed;
     if (pressed & SCE_CTRL_RTRIGGER) s_members_collapsed  = !s_members_collapsed;
 
-    // Message selection via Right Stick Y (or D-pad Up/Down when sidebar is collapsed).
-    static int s_msg_nav_cd = 0;
-    if (s_msg_nav_cd > 0) s_msg_nav_cd--;
+    // Message selection via D-pad Up/Down when in Message Pane (or sidebar collapsed).
     int mdir = 0;
-    if (ry < -55 && s_msg_nav_cd == 0) { mdir = -1; s_msg_nav_cd = 10; }
-    else if (ry > 55 && s_msg_nav_cd == 0) { mdir = 1; s_msg_nav_cd = 10; }
-    else if (ry >= -55 && ry <= 55) s_msg_nav_cd = 0;
     if ((s_channels_collapsed || s_msg_sel_id[0]) && !s_rail_focus && !s_forum_view) {
         if (pressed & SCE_CTRL_UP)   mdir = -1;
         if (pressed & SCE_CTRL_DOWN) mdir = 1;
@@ -2284,9 +2281,14 @@ void browser_input(unsigned pressed, unsigned held, int ly, int ry)
     if ((pressed & SCE_CTRL_SQUARE) && voice_active()) voice_toggle_mute();
     if ((pressed & SCE_CTRL_SELECT) && voice_active()) voice_toggle_deaf();
 
-    // left stick scrolls messages
+    // left stick scrolls messages; right stick scrolls member / friends list
     if (ly > 40 || ly < -40) { s_msg_scroll += ly / 12; s_want_unread = false; s_pin_anchor[0] = '\0'; }
     if (s_msg_scroll < 0) s_msg_scroll = 0;
+    if (s_member_w && (ry > 40 || ry < -40)) {
+        s_member_scroll += ry / 12;
+        if (s_member_scroll < 0) s_member_scroll = 0;
+        if (s_member_scroll > s_member_max) s_member_scroll = s_member_max;
+    }
 
     maybe_load_older();
 
@@ -3918,12 +3920,20 @@ static void draw_members(void)
     if (stale) mc = 0;
     // Large/restricted servers never return a member list (Discord ignores op14).
     // Time the wait to show a message instead of a forever "loading".
-    static char s_ml_g[24]; static long long s_ml_since;
+    static char s_ml_g[24]; static long long s_ml_since; static bool s_ml_retried;
     if (strcmp(s_ml_g, s_cur_guild_id) != 0) {
         snprintf(s_ml_g, sizeof(s_ml_g), "%s", s_cur_guild_id);
         s_ml_since = now_ms();
+        s_ml_retried = false;
     }
-    bool ml_timeout = stale && (now_ms() - s_ml_since > 7000);
+    long long ml_wait = now_ms() - s_ml_since;
+    if (stale && !s_ml_retried && ml_wait > 3000 && s_cur_guild_id[0] && s_have_open) {
+        s_ml_retried = true;
+        const char *sub_cid = (ch_is_thread(s_open_ch.type) && s_open_ch.parent_id[0])
+                            ? s_open_ch.parent_id : s_open_ch.id;
+        if (sub_cid[0]) gateway_request_members(s_cur_guild_id, sub_cid);
+    }
+    bool ml_timeout = stale && (ml_wait > 8000);
     int members = 0;
     for (int i = 0; i < mc; i++) if (!rows[i].is_group) members++;
 
