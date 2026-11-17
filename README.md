@@ -22,7 +22,7 @@ self-hosted. Every network call runs on a vendored mbedTLS stack over raw
 - **Voice & DAVE E2EE:** Voice channels and DM/Group DM calls use Opus audio
   with Discord's DAVE (MLS) end-to-end encryption (`VOICE_JOIN_ENABLE=ON`,
   `VOICE_DAVE_ENABLE=ON`), tested on real Vita hardware.
-- **Background voice + in-game overlay (optional plugins):** Keep your voice
+- **Background voice + in-game overlay (optional, experimental):** Keep your voice
   call running in `SceShell` while launching or playing any game, and toggle an
   interactive in-game overlay with **`L + R + TRIANGLE`** to see who is speaking
   or **Mute / Deafen / Disconnect** without leaving your game.

@@ -77,7 +77,13 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
+          body: |
+            > **Experimental release:** Voice calls and the optional background voice / in-game overlay (`L + R + TRIANGLE`) plugins are experimental. Back up `ur0:tai/config.txt` if customizing plugins manually (the built-in **Settings -> Background Voice** installer automatically saves `ur0:tai/config.txt.cordless.bak`).
+
+            - `cordless.vpk` bundles the 4 optional plugin modules (`Settings -> Background Voice` to install/update/uninstall from inside the app).
+            - `cordless-plugins.zip` provides the standalone plugin binaries (`cordless_mem.skprx`, `cordless_voice_poc.suprx`, `cordless_voice_core.suprx`, `cordless_hud.suprx`).
           files: |
             cordless.vpk
             cordless-plugins.zip
