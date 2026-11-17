@@ -19,3 +19,5 @@ cordless_mem:
         - cordless_mem_get_overlay_state
         - cordless_mem_post_action
         - cordless_mem_take_action
+        - cordless_mem_set_game_vol
+        - cordless_mem_get_game_vol

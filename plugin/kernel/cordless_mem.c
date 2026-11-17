@@ -15,6 +15,7 @@ static volatile int s_ov_muted  = 0;
 static volatile int s_ov_deaf   = 0;
 static cordless_overlay_state s_ov_state;
 static volatile uint32_t s_pending_actions = 0;
+static volatile int s_game_vol = 100;
 
 int cordless_mem_set_overlay(int active, int connected, int muted, int deaf) {
     uint32_t state;
@@ -64,6 +65,7 @@ int cordless_mem_set_overlay_state(const cordless_overlay_state *in) {
     tmp.channel[sizeof(tmp.channel) - 1] = '\0';
     for (int i = 0; i < CORDLESS_HUD_MAX_PEERS; i++)
         tmp.peers[i].name[sizeof(tmp.peers[i].name) - 1] = '\0';
+    tmp.game_vol_pct = (uint8_t)s_game_vol;
     s_ov_state  = tmp;
     s_ov_active = (tmp.flags & CORDLESS_OV_ACTIVE) ? 1 : 0;
     s_ov_conn   = (tmp.flags & CORDLESS_OV_CONNECTED) ? 1 : 0;
@@ -102,6 +104,25 @@ uint32_t cordless_mem_take_action(void) {
     s_pending_actions = 0;
     EXIT_SYSCALL(state);
     return act;
+}
+
+int cordless_mem_set_game_vol(int pct) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    s_game_vol = pct;
+    s_ov_state.game_vol_pct = (uint8_t)pct;
+    EXIT_SYSCALL(state);
+    return 0;
+}
+
+int cordless_mem_get_game_vol(void) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int v = s_game_vol;
+    EXIT_SYSCALL(state);
+    return v;
 }
 
 SceUID cordless_mem_alloc_pool(uint32_t size, uint32_t *out_addr, uint32_t *out_type) {

@@ -51,6 +51,8 @@ target_link_libraries(cordless_mem
   -Wl,-u,cordless_mem_get_overlay_state
   -Wl,-u,cordless_mem_post_action
   -Wl,-u,cordless_mem_take_action
+  -Wl,-u,cordless_mem_set_game_vol
+  -Wl,-u,cordless_mem_get_game_vol
   -nostdlib
   taihenForKernel_stub
   SceSysmemForDriver_stub
@@ -150,6 +152,7 @@ target_link_libraries(cordless_hud
   -nostdlib
   cordless_mem_stub
   taihen_stub
+  SceAudio_stub_weak
   gcc
 )
 vita_create_self(cordless_hud.suprx cordless_hud

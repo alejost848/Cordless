@@ -1,6 +1,7 @@
 #include "../kernel/cordless_mem.h"
 #include "../taihen/taihen.h"
 
+#include <psp2/audioout.h>
 #include <psp2/ctrl.h>
 #include <psp2/display.h>
 #include <psp2/kernel/modulemgr.h>
@@ -43,6 +44,159 @@ static volatile int      s_sel = 0;
 static volatile uint64_t s_last_ts = 0;
 static volatile uint32_t s_prev_btn = 0;
 static volatile int      s_combo_prev = 0;
+
+#define AUDIO_MAX_PORTS 8
+#define NUM_AUDIO_HOOKS 4
+
+static int            s_in_shell = 0;
+static SceUID         s_audio_hooks[NUM_AUDIO_HOOKS] = {-1, -1, -1, -1};
+static tai_hook_ref_t s_audio_refs[NUM_AUDIO_HOOKS];
+
+/* Track per-port unscaled base volume (L/R); slot state: 0=closed, 1=hooked, 2=probed. */
+static uint8_t s_port_active[AUDIO_MAX_PORTS];
+static int     s_port_base_l[AUDIO_MAX_PORTS];
+static int     s_port_base_r[AUDIO_MAX_PORTS];
+
+static volatile int s_eff_vol_pct = 100;
+static int          s_probe_tick  = 0;
+
+static int scale_vol(int base, int pct) {
+    if (base < 0) base = 0;
+    if (base > SCE_AUDIO_OUT_MAX_VOL) base = SCE_AUDIO_OUT_MAX_VOL;
+    if (pct <= 0) return 0;
+    if (pct >= 100) return base;
+    /* Quadratic taper gives smooth perceived volume steps across 0..100%. */
+    return (int)(((uint32_t)base * (uint32_t)pct * (uint32_t)pct) / 10000u);
+}
+
+static void apply_port_vol(int port, int pct) {
+    int sv[2];
+    sv[0] = scale_vol(s_port_base_l[port], pct);
+    sv[1] = scale_vol(s_port_base_r[port], pct);
+    /* Direct weak-stub call in cordless_hud bypasses TAI_MAIN_MODULE import hooks. */
+    sceAudioOutSetVolume(port,
+                         (SceAudioOutChannelFlag)(SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH),
+                         sv);
+}
+
+static void probe_audio_ports(int eff_pct) {
+    for (int p = 0; p < AUDIO_MAX_PORTS; p++) {
+        if (s_port_active[p] == 0) {
+            if (sceAudioOutGetConfig(p, SCE_AUDIO_OUT_CONFIG_TYPE_LEN) >= 0) {
+                s_port_base_l[p] = SCE_AUDIO_OUT_MAX_VOL;
+                s_port_base_r[p] = SCE_AUDIO_OUT_MAX_VOL;
+                s_port_active[p] = 2;
+                apply_port_vol(p, eff_pct);
+            }
+        } else if (s_port_active[p] == 2) {
+            if (sceAudioOutGetConfig(p, SCE_AUDIO_OUT_CONFIG_TYPE_LEN) < 0) {
+                s_port_active[p] = 0;
+            }
+        }
+    }
+}
+
+static void sync_audio_volumes(int eff_pct, int allow_probe) {
+    if (s_in_shell) return;
+    if (eff_pct < 0) eff_pct = 0;
+    if (eff_pct > 100) eff_pct = 100;
+
+    if (eff_pct != s_eff_vol_pct) {
+        s_eff_vol_pct = eff_pct;
+        s_probe_tick = 0;
+        for (int p = 0; p < AUDIO_MAX_PORTS; p++) {
+            if (s_port_active[p]) {
+                apply_port_vol(p, eff_pct);
+            }
+        }
+        if (eff_pct < 100 || s_audio_hooks[2] < 0) {
+            probe_audio_ports(eff_pct);
+        }
+        return;
+    }
+
+    if (allow_probe && eff_pct < 100) {
+        if (++s_probe_tick >= 60) {
+            s_probe_tick = 0;
+            probe_audio_ports(eff_pct);
+        }
+    }
+}
+
+static int hook_sceAudioOutOpenPort(SceAudioOutPortType type, int len,
+                                    int freq, SceAudioOutMode mode) {
+    int port = TAI_CONTINUE(int, s_audio_refs[0], type, len, freq, mode);
+    if (port >= 0 && port < AUDIO_MAX_PORTS) {
+        s_port_base_l[port] = SCE_AUDIO_OUT_MAX_VOL;
+        s_port_base_r[port] = SCE_AUDIO_OUT_MAX_VOL;
+        s_port_active[port] = 1;
+        if (s_eff_vol_pct < 100) {
+            apply_port_vol(port, s_eff_vol_pct);
+        }
+    }
+    return port;
+}
+
+static int hook_sceAudioOutSetVolume(int port, SceAudioOutChannelFlag ch, int *vol) {
+    if (!vol || port < 0 || port >= AUDIO_MAX_PORTS) {
+        return TAI_CONTINUE(int, s_audio_refs[1], port, ch, vol);
+    }
+    if (!s_port_active[port]) {
+        s_port_base_l[port] = SCE_AUDIO_OUT_MAX_VOL;
+        s_port_base_r[port] = SCE_AUDIO_OUT_MAX_VOL;
+        s_port_active[port] = 1;
+    }
+    int sv[2];
+    int idx = 0;
+    if (ch & SCE_AUDIO_VOLUME_FLAG_L_CH) {
+        int v = vol[idx];
+        if (v < 0) v = 0;
+        if (v > SCE_AUDIO_OUT_MAX_VOL) v = SCE_AUDIO_OUT_MAX_VOL;
+        s_port_base_l[port] = v;
+        sv[idx] = scale_vol(v, s_eff_vol_pct);
+        idx++;
+    }
+    if (ch & SCE_AUDIO_VOLUME_FLAG_R_CH) {
+        int v = vol[idx];
+        if (v < 0) v = 0;
+        if (v > SCE_AUDIO_OUT_MAX_VOL) v = SCE_AUDIO_OUT_MAX_VOL;
+        s_port_base_r[port] = v;
+        sv[idx] = scale_vol(v, s_eff_vol_pct);
+        idx++;
+    }
+    return TAI_CONTINUE(int, s_audio_refs[1], port, ch, idx ? sv : vol);
+}
+
+static int hook_sceAudioOutOutput(int port, const void *buf) {
+    if (port >= 0 && port < AUDIO_MAX_PORTS && !s_port_active[port]) {
+        s_port_base_l[port] = SCE_AUDIO_OUT_MAX_VOL;
+        s_port_base_r[port] = SCE_AUDIO_OUT_MAX_VOL;
+        s_port_active[port] = 1;
+        if (s_eff_vol_pct < 100) {
+            apply_port_vol(port, s_eff_vol_pct);
+        }
+    }
+    return TAI_CONTINUE(int, s_audio_refs[2], port, buf);
+}
+
+static int hook_sceAudioOutReleasePort(int port) {
+    if (port >= 0 && port < AUDIO_MAX_PORTS) {
+        s_port_active[port] = 0;
+    }
+    return TAI_CONTINUE(int, s_audio_refs[3], port);
+}
+
+static void fmt_pct_tag(char out[7], int pct) {
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    out[0] = '<';
+    out[1] = (pct >= 100) ? ('0' + (pct / 100)) : ' ';
+    out[2] = (pct >= 10)  ? ('0' + ((pct / 10) % 10)) : ' ';
+    out[3] = (char)('0' + (pct % 10));
+    out[4] = '%';
+    out[5] = '>';
+    out[6] = '\0';
+}
 
 /* 5x7 font bitmaps for printable ASCII 0x20..0x7E (5 bits wide, MSB=leftmost). */
 static const uint8_t s_font95[95][7] = {
@@ -233,7 +387,7 @@ static void render_panel(uint32_t *fb, int pitch, int fw, int fh,
     int peers = (int)st->peer_count;
     if (peers > CORDLESS_HUD_MAX_PEERS) peers = CORDLESS_HUD_MAX_PEERS;
     int peer_rows = 1 + (peers > 0 ? peers : 1);
-    int ph = 26 + 16 + peer_rows * 15 + 8 + 3 * 24 + 18;
+    int ph = 26 + 16 + peer_rows * 15 + 8 + 4 * 24 + 18;
     if (fw < pw + 16 || fh < ph + 16) {
         render_pill(fb, pitch, fw, fh, (int)st->flags);
         return;
@@ -301,29 +455,54 @@ static void render_panel(uint32_t *fb, int pitch, int fw, int fh,
     draw_rect(fb, pitch, fw, fh, px + 8, cy, pw - 16, 1, COL_DIV);
     cy += 5;
 
-    const char *btns[3];
+    const char *btns[4];
     btns[0] = muted ? "Unmute Microphone" : "Mute Microphone";
     btns[1] = deaf  ? "Undeafen Audio"    : "Deafen Audio";
-    btns[2] = "Disconnect";
+    btns[2] = "Game Vol";
+    btns[3] = "Disconnect";
+
+    int gvol = (int)st->game_vol_pct;
+    if (gvol < 0) gvol = 0;
+    if (gvol > 100) gvol = 100;
 
     int sel = s_sel;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         uint32_t bcol = COL_BTN;
-        if (i == sel) bcol = (i == 2) ? COL_DANGER : COL_BLURPLE;
+        if (i == sel) bcol = (i == 3) ? COL_DANGER : COL_BLURPLE;
         draw_rect(fb, pitch, fw, fh, px + 10, cy, pw - 20, 20, bcol);
         if (i == sel) {
             draw_text(fb, pitch, fw, fh, px + 16, cy + 6, COL_WHITE, ">", 1);
         }
         draw_text(fb, pitch, fw, fh, px + 26, cy + 6,
                   (i == sel) ? COL_WHITE : 0xFFE1DEDB, btns[i], 30);
+        if (i == 2) {
+            const int bx = px + 82;
+            const int bw = 104;
+            int fill = (gvol * bw) / 100;
+            draw_rect(fb, pitch, fw, fh, bx, cy + 6, bw, 8, 0xFF1A1716);
+            if (fill > 0) {
+                draw_rect(fb, pitch, fw, fh, bx, cy + 6, fill, 8,
+                          (i == sel) ? COL_WHITE : COL_BLURPLE);
+            }
+            char ptag[7];
+            fmt_pct_tag(ptag, gvol);
+            draw_text(fb, pitch, fw, fh, px + 194, cy + 6,
+                      (i == sel) ? COL_WHITE : 0xFFE1DEDB, ptag, 6);
+        }
         cy += 24;
     }
 
-    draw_text(fb, pitch, fw, fh, px + 10, cy + 2, COL_DIM, "D-Pad:Nav  X:Select  O:Close", 36);
+    draw_text(fb, pitch, fw, fh, px + 10, cy + 2, COL_DIM,
+              (sel == 2) ? "L/R:Vol  X:40/100%  O:Close" : "D-Pad:Nav  X:Select  O:Close",
+              36);
 }
 
 static int hook_sceDisplaySetFrameBuf(const SceDisplayFrameBuf *pParam, int sync) {
     int quick = cordless_mem_get_overlay();
+    if (!s_in_shell) {
+        int eff_pct = (quick & CORDLESS_OV_ACTIVE) ? cordless_mem_get_game_vol() : 100;
+        sync_audio_volumes(eff_pct, 1);
+    }
     if (!(quick & CORDLESS_OV_ACTIVE)) {
         if (s_panel_open) s_panel_open = 0;
     } else if (pParam && pParam->base &&
@@ -375,17 +554,30 @@ static int ctrl_process(int port, SceCtrlData *pad_data, int count, int ret) {
             }
         } else if (s_panel_open && !combo_now) {
             if (pressed & SCE_CTRL_UP) {
-                s_sel = (s_sel > 0) ? (s_sel - 1) : 2;
+                s_sel = (s_sel > 0) ? (s_sel - 1) : 3;
             } else if (pressed & SCE_CTRL_DOWN) {
-                s_sel = (s_sel + 1) % 3;
+                s_sel = (s_sel + 1) % 4;
             } else if (pressed & SCE_CTRL_CIRCLE) {
                 s_panel_open = 0;
+            } else if (s_sel == 2 && (pressed & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT | SCE_CTRL_CROSS))) {
+                int v = cordless_mem_get_game_vol();
+                if (pressed & SCE_CTRL_LEFT) {
+                    v -= 10;
+                } else if (pressed & SCE_CTRL_RIGHT) {
+                    v += 10;
+                } else {
+                    v = (v < 100) ? 100 : 40;
+                }
+                if (v < 0) v = 0;
+                if (v > 100) v = 100;
+                cordless_mem_set_game_vol(v);
+                sync_audio_volumes(v, 0);
             } else if (pressed & SCE_CTRL_CROSS) {
                 if (s_sel == 0) {
                     cordless_mem_post_action(CORDLESS_ACT_MUTE);
                 } else if (s_sel == 1) {
                     cordless_mem_post_action(CORDLESS_ACT_DEAF);
-                } else {
+                } else if (s_sel == 3) {
                     cordless_mem_post_action(CORDLESS_ACT_LEAVE);
                     s_panel_open = 0;
                 }
@@ -453,6 +645,11 @@ void _start() __attribute__((weak, alias("module_start")));
 
 int module_start(SceSize argc, const void *args) {
     (void)argc; (void)args;
+    tai_module_info_t minfo;
+    memset(&minfo, 0, sizeof(minfo));
+    minfo.size = sizeof(minfo);
+    s_in_shell = (taiGetModuleInfo("SceShell", &minfo) >= 0) ? 1 : 0;
+
     s_disp_hook = taiHookFunctionImport(&s_disp_ref, TAI_MAIN_MODULE,
                                         TAI_ANY_LIBRARY, 0x7A410B64,
                                         hook_sceDisplaySetFrameBuf);
@@ -461,12 +658,35 @@ int module_start(SceSize argc, const void *args) {
                                                 TAI_ANY_LIBRARY, s_ctrl_targets[i].nid,
                                                 s_ctrl_targets[i].fn);
     }
+    if (!s_in_shell) {
+        s_audio_hooks[0] = taiHookFunctionImport(&s_audio_refs[0], TAI_MAIN_MODULE,
+                                                 TAI_ANY_LIBRARY, 0x5BC341E4u,
+                                                 hook_sceAudioOutOpenPort);
+        s_audio_hooks[1] = taiHookFunctionImport(&s_audio_refs[1], TAI_MAIN_MODULE,
+                                                 TAI_ANY_LIBRARY, 0x64167F11u,
+                                                 hook_sceAudioOutSetVolume);
+        s_audio_hooks[2] = taiHookFunctionImport(&s_audio_refs[2], TAI_MAIN_MODULE,
+                                                 TAI_ANY_LIBRARY, 0x02DB3F5Fu,
+                                                 hook_sceAudioOutOutput);
+        s_audio_hooks[3] = taiHookFunctionImport(&s_audio_refs[3], TAI_MAIN_MODULE,
+                                                 TAI_ANY_LIBRARY, 0x69E2E6B5u,
+                                                 hook_sceAudioOutReleasePort);
+    }
     return SCE_KERNEL_START_SUCCESS;
 }
 
 int module_stop(SceSize argc, const void *args) {
     (void)argc; (void)args;
     s_panel_open = 0;
+    if (!s_in_shell) {
+        sync_audio_volumes(100, 0);
+        for (int i = 0; i < NUM_AUDIO_HOOKS; i++) {
+            if (s_audio_hooks[i] >= 0) {
+                taiHookRelease(s_audio_hooks[i], s_audio_refs[i]);
+                s_audio_hooks[i] = -1;
+            }
+        }
+    }
     for (int i = 0; i < NUM_CTRL_HOOKS; i++) {
         if (s_ctrl_hooks[i] >= 0) {
             taiHookRelease(s_ctrl_hooks[i], s_ctrl_refs[i]);
