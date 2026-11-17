@@ -60,6 +60,7 @@ add_executable(${PROJECT_NAME}
   src/voice/voice_audio.c
   src/voice/dave_frame.c
   src/voice/dave.cpp
+  src/voice/plugin_install.c
   src/model/store.c
   src/model/settings.c
   src/ui/qr.c
@@ -161,6 +162,19 @@ target_link_libraries(${PROJECT_NAME}
 )
 
 ## VPK assembly ---------------------------------------------------------------
+set(VPK_PLUGIN_FILES "")
+if(EXISTS "${CMAKE_SOURCE_DIR}/cordless_mem.skprx"
+   AND EXISTS "${CMAKE_SOURCE_DIR}/cordless_voice_poc.suprx"
+   AND EXISTS "${CMAKE_SOURCE_DIR}/cordless_voice_core.suprx"
+   AND EXISTS "${CMAKE_SOURCE_DIR}/cordless_hud.suprx")
+  list(APPEND VPK_PLUGIN_FILES
+    FILE cordless_mem.skprx        data/plugins/cordless_mem.skprx
+    FILE cordless_voice_poc.suprx  data/plugins/cordless_voice_poc.suprx
+    FILE cordless_voice_core.suprx data/plugins/cordless_voice_core.suprx
+    FILE cordless_hud.suprx        data/plugins/cordless_hud.suprx
+  )
+endif()
+
 vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} UNSAFE)
 vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   VERSION ${VITA_VERSION}
@@ -176,4 +190,5 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   FILE    assets/fonts/Inter-Regular.ttf   data/fonts/Inter-Regular.ttf
   FILE    assets/fonts/Inter-SemiBold.ttf  data/fonts/Inter-SemiBold.ttf
   FILE    assets/emoji_atlas.png           data/emoji_atlas.png
+  ${VPK_PLUGIN_FILES}
 )

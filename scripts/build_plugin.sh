@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Build the background voice PoC plugin (cordless_voice_poc.suprx).
+# Build the background voice plugins (cordless_mem.skprx, cordless_voice_poc.suprx,
+# cordless_voice_core.suprx, cordless_hud.suprx).
+# Pass --stub to build the minimal 8K PoC core stub instead of the full voice core.
 set -euo pipefail
 
 if [[ -z "${VITASDK:-}" ]]; then
@@ -17,33 +19,50 @@ if [[ ! -f "$VITASDK/share/vita.toolchain.cmake" ]]; then
   exit 1
 fi
 
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/plugin"
-OUT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FULL_OPT="ON"
+if [[ "${1:-}" == "--stub" ]]; then
+  FULL_OPT="OFF"
+fi
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$HOME/.cache/cordless_plugin_build"
 JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
-echo ">> Mirroring plugin sources to $WORK"
+echo ">> Mirroring repo to $WORK"
 mkdir -p "$WORK"
-rsync -a --delete --exclude build/ "$SRC_DIR"/ "$WORK"/
+rsync -a --delete \
+  --exclude build/ --exclude .git/ \
+  --exclude '*.vpk' --exclude '*.suprx' --exclude '*.skprx' \
+  "$ROOT_DIR"/ "$WORK"/
 
-echo ">> Configuring plugin"
-cmake -S "$WORK" -B "$WORK/build" \
+if [[ -f "$WORK/build/CMakeCache.txt" ]] && ! grep -q "CMAKE_HOME_DIRECTORY:INTERNAL=$WORK/plugin" "$WORK/build/CMakeCache.txt"; then
+  rm -rf "$WORK/build"
+fi
+
+echo ">> Configuring plugin (BUILD_VOICE_FULL=$FULL_OPT)"
+cmake -S "$WORK/plugin" -B "$WORK/build" \
   -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" \
+  -DBUILD_VOICE_FULL="$FULL_OPT" \
   >/dev/null
 
 echo ">> Building (-j$JOBS)"
 cmake --build "$WORK/build" -j"$JOBS"
 
-SUPRX="$WORK/build/cordless_voice_poc.suprx"
-CORE_SUPRX="$WORK/build/cordless_voice_core.suprx"
-MEM_SKPRX="$WORK/build/cordless_mem.skprx"
-HUD_SUPRX="$WORK/build/cordless_hud.suprx"
-if [[ -f "$SUPRX" && -f "$CORE_SUPRX" && -f "$MEM_SKPRX" && -f "$HUD_SUPRX" ]]; then
-  cp "$SUPRX" "$OUT_DIR/cordless_voice_poc.suprx"
-  cp "$CORE_SUPRX" "$OUT_DIR/cordless_voice_core.suprx"
-  cp "$MEM_SKPRX" "$OUT_DIR/cordless_mem.skprx"
-  cp "$HUD_SUPRX" "$OUT_DIR/cordless_hud.suprx"
-  echo ">> OK: poc=$(du -h "$SUPRX" | cut -f1), core=$(du -h "$CORE_SUPRX" | cut -f1), mem=$(du -h "$MEM_SKPRX" | cut -f1), hud=$(du -h "$HUD_SUPRX" | cut -f1)"
+POC="$WORK/build/cordless_voice_poc.suprx"
+MEM="$WORK/build/cordless_mem.skprx"
+HUD="$WORK/build/cordless_hud.suprx"
+if [[ "$FULL_OPT" == "ON" ]]; then
+  CORE="$WORK/build/cordless_voice_full.suprx"
+else
+  CORE="$WORK/build/cordless_voice_core.suprx"
+fi
+
+if [[ -f "$POC" && -f "$CORE" && -f "$MEM" && -f "$HUD" ]]; then
+  cp "$POC"  "$ROOT_DIR/cordless_voice_poc.suprx"
+  cp "$CORE" "$ROOT_DIR/cordless_voice_core.suprx"
+  cp "$MEM"  "$ROOT_DIR/cordless_mem.skprx"
+  cp "$HUD"  "$ROOT_DIR/cordless_hud.suprx"
+  echo ">> OK: poc=$(du -h "$POC" | cut -f1), core=$(du -h "$CORE" | cut -f1), mem=$(du -h "$MEM" | cut -f1), hud=$(du -h "$HUD" | cut -f1)"
 else
   echo ">> BUILD FAILED: missing plugin output" >&2
   exit 1

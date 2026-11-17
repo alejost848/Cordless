@@ -15,6 +15,7 @@
 #include "api/discord.h"
 #include "gateway/gateway.h"
 #include "voice/voice.h"
+#include "voice/plugin_install.h"
 #include "console.h"
 
 #include <stdio.h>
@@ -298,6 +299,10 @@ static int      s_set_sw_r[4];  // Switch Account button
 #define SET_ROW_H  30           // appearance setting row height
 #define SET_NAPP    7           // appearance setting rows
 static int      s_set_app_r[SET_NAPP][4];  // appearance row hit rects
+static int      s_set_plg_r[4], s_set_plg2_r[4];
+static PluginStatus s_plg_status;
+static char     s_plg_msg[96];
+static bool     s_plg_need_reboot;
 static char     s_msg_sel_id[24];
 static bool     s_msg_sel_follow;
 static bool     s_rail_focus;
@@ -1565,6 +1570,9 @@ static void open_settings(void)
 {
     s_settings_open = true;
     s_set_scroll = 0;
+    s_plg_msg[0] = '\0';
+    s_plg_need_reboot = false;
+    plugin_get_status(&s_plg_status);
     s_me_bio[0] = '\0'; s_me_accent = 0; s_me_loading = true;
     SceUID th = sceKernelCreateThread("cl_me", me_prof_worker, 0x40, 0x100000, 0, SCE_KERNEL_CPU_MASK_USER_1, NULL);
     if (th >= 0) sceKernelStartThread(th, 0, NULL); else s_me_loading = false;
@@ -3035,12 +3043,31 @@ void browser_touch(int x, int y, int dy, bool tap)
             for (int i = 0; i < SET_NAPP; i++)
                 if (x >= s_set_app_r[i][0] && x < s_set_app_r[i][0] + s_set_app_r[i][2] &&
                     y >= s_set_app_r[i][1] && y < s_set_app_r[i][1] + s_set_app_r[i][3]) app_hit = i;
+            bool in_plg1 = (x >= s_set_plg_r[0] && x < s_set_plg_r[0] + s_set_plg_r[2] &&
+                            y >= s_set_plg_r[1] && y < s_set_plg_r[1] + s_set_plg_r[3]);
+            bool in_plg2 = (s_set_plg2_r[2] > 0 &&
+                            x >= s_set_plg2_r[0] && x < s_set_plg2_r[0] + s_set_plg2_r[2] &&
+                            y >= s_set_plg2_r[1] && y < s_set_plg2_r[1] + s_set_plg2_r[3]);
             if (in_av) {
                 settings_change_avatar();
             } else if (in_nm) {
                 settings_edit_name();
             } else if (in_sw) {
                 open_accounts();
+            } else if (in_plg1) {
+                if (s_plg_need_reboot) {
+                    plugin_request_reboot();
+                } else if (plugin_install(s_plg_msg, sizeof(s_plg_msg)) == 0) {
+                    plugin_get_status(&s_plg_status);
+                    s_plg_need_reboot = true;
+                    snprintf(s_plg_msg, sizeof(s_plg_msg), "Installed! Reboot Vita to activate.");
+                }
+            } else if (in_plg2) {
+                if (plugin_uninstall(s_plg_msg, sizeof(s_plg_msg)) == 0) {
+                    plugin_get_status(&s_plg_status);
+                    s_plg_need_reboot = true;
+                    snprintf(s_plg_msg, sizeof(s_plg_msg), "Uninstalled. Reboot Vita to finish.");
+                }
             } else if (hit >= 0) {
                 s_my_status = scode[hit];
                 gateway_set_status(sstr[hit]);
@@ -5436,9 +5463,10 @@ static void draw_settings(void)
     int aboutH    = 6 + 18 + bioH;
     int statusH   = 12 + 18 + 30 + 8 + 30;
     int appearH   = 12 + 18 + SET_NAPP * (SET_ROW_H + 6);  // label + 7 rows
+    int pluginH   = 12 + 18 + 18 + SET_ROW_H + (s_plg_msg[0] ? 20 : 4);
     int aboutAppH = 12 + 18 + 18 + 16;                     // label + 2 text lines
     int buttonsH  = 12 + SET_BTN_H + 10 + SET_BTN_H + 14;
-    int ch = headerH + aboutH + statusH + appearH + aboutAppH + buttonsH;
+    int ch = headerH + aboutH + statusH + appearH + pluginH + aboutAppH + buttonsH;
     int cx = (SCREEN_W - cw) / 2, cy;
     const int SET_MARGIN = 8, avail = SCREEN_H - 2 * SET_MARGIN;
     if (ch <= avail) { cy = (SCREEN_H - ch) / 2; s_set_scroll_max = 0; }
@@ -5523,6 +5551,60 @@ static void draw_settings(void)
         s_set_app_r[i][0] = cx + 20; s_set_app_r[i][1] = y;
         s_set_app_r[i][2] = cw - 40; s_set_app_r[i][3] = SET_ROW_H;
         y += SET_ROW_H + 6;
+    }
+
+    // BACKGROUND VOICE: taiHEN plugin status + one-tap install/uninstall.
+    y += 12;
+    ui_text(cx + 20, y, FS_TINY, COL_TEXT_MUTED, "BACKGROUND VOICE");
+    y += 18;
+    const char *pst = "Not installed";
+    unsigned pcol = COL_TEXT_MUTED;
+    if (s_plg_status.core_active) {
+        pst = "Active in SceShell (L+R+Triangle in-game)";
+        pcol = RGBA8(0x23, 0xa5, 0x5a, 0xff);
+    } else if (s_plg_status.files_installed && s_plg_status.config_installed) {
+        pst = "Installed (reboot Vita to enable)";
+        pcol = RGBA8(0xf0, 0xb2, 0x32, 0xff);
+    } else if (s_plg_status.bundled) {
+        pst = "Not installed (bundled in VPK)";
+    }
+    ui_text_clip(cx + 20, y, FS_TINY, pcol, pst, cw - 40);
+    y += 18;
+
+    int plg_half = (cw - 40 - 10) / 2;
+    bool has_plg = s_plg_status.files_installed || s_plg_status.config_installed;
+    if (s_plg_need_reboot || has_plg) {
+        const char *ltxt = s_plg_need_reboot ? "Reboot Vita" : "Update Plugins";
+        ui_rounded_rect(cx + 20, y, plg_half, SET_ROW_H, 6, COL_BLURPLE);
+        int lw1 = ui_text_bold_w(FS_SMALL, ltxt);
+        ui_text_bold(cx + 20 + plg_half / 2 - lw1 / 2, y + 7, FS_SMALL, COL_WHITE, ltxt);
+        s_set_plg_r[0] = cx + 20; s_set_plg_r[1] = y;
+        s_set_plg_r[2] = plg_half; s_set_plg_r[3] = SET_ROW_H;
+
+        int rx2 = cx + 20 + plg_half + 10;
+        ui_rounded_rect(rx2, y, plg_half, SET_ROW_H, 6, COL_ELEVATED);
+        int lw2 = ui_text_bold_w(FS_SMALL, "Uninstall");
+        ui_text_bold(rx2 + plg_half / 2 - lw2 / 2, y + 7, FS_SMALL, COL_TEXT_BRIGHT, "Uninstall");
+        s_set_plg2_r[0] = rx2; s_set_plg2_r[1] = y;
+        s_set_plg2_r[2] = plg_half; s_set_plg2_r[3] = SET_ROW_H;
+    } else {
+        const char *ltxt = "Install Background Voice Plugins";
+        unsigned bcol = s_plg_status.bundled ? COL_BLURPLE : COL_ELEVATED;
+        unsigned tcol = s_plg_status.bundled ? COL_WHITE : COL_TEXT_BRIGHT;
+        ui_rounded_rect(cx + 20, y, cw - 40, SET_ROW_H, 6, bcol);
+        int lw1 = ui_text_bold_w(FS_SMALL, ltxt);
+        ui_text_bold(cx + 20 + (cw - 40) / 2 - lw1 / 2, y + 7, FS_SMALL, tcol, ltxt);
+        s_set_plg_r[0] = cx + 20; s_set_plg_r[1] = y;
+        s_set_plg_r[2] = cw - 40; s_set_plg_r[3] = SET_ROW_H;
+        s_set_plg2_r[0] = s_set_plg2_r[1] = s_set_plg2_r[2] = s_set_plg2_r[3] = 0;
+    }
+    y += SET_ROW_H;
+    if (s_plg_msg[0]) {
+        y += 4;
+        ui_text_clip(cx + 20, y, FS_TINY, COL_TEXT_BRIGHT, s_plg_msg, cw - 40);
+        y += 16;
+    } else {
+        y += 4;
     }
 
     // ABOUT: static app info.

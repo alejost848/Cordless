@@ -75,34 +75,28 @@ disable voice or DAVE E2EE.
 
 ### Building the background plugins
 
-Build the kernel helper, loader, and HUD overlay:
+Build all four modules (`cordless_mem.skprx`, `cordless_voice_poc.suprx`,
+`cordless_voice_core.suprx`, and `cordless_hud.suprx`) in one command:
 
 ```bash
 bash scripts/build_plugin.sh
 ```
 
-To build the full voice core (`cordless_voice_full.suprx`, which is deployed as
-`ur0:tai/cordless_voice_core.suprx`), configure `plugin/` with `-DBUILD_VOICE_FULL=ON`
-(note `scripts/build_plugin.sh` writes an 8 KB stub `cordless_voice_core.suprx`
-for loader testing):
-
-```bash
-cmake -S plugin -B /tmp/cordless_full_plugin_build \
-  -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" \
-  -DBUILD_VOICE_FULL=ON
-cmake --build /tmp/cordless_full_plugin_build --target cordless_voice_full.suprx-self -j4
-```
+*(Pass `--stub` if you only want the 8 KB loader-test stub for `cordless_voice_core.suprx`.)*
+If you run `bash scripts/build.sh` afterward, `cordless.vpk` automatically
+bundles all four plugin files so they can be installed from inside the app.
 
 ## Install and run
 
 1. Install `cordless.vpk` in VitaShell on a Vita running HENkaku (firmware 3.60 to
    3.74). Launch it and sign in with a token or a QR code; both are covered in
    [docs/login.md](docs/login.md).
-2. *(Optional, for background voice + in-game overlay)* Copy all four plugin
-   files (`cordless_mem.skprx`, `cordless_voice_poc.suprx`,
-   `cordless_voice_core.suprx`, `cordless_hud.suprx`) to `ur0:tai/`, add these
-   three entries to `ur0:tai/config.txt` (`cordless_voice_core.suprx` is loaded
-   automatically by `poc`, not listed in `config.txt`), and reboot:
+2. *(Optional, for background voice + in-game overlay)* Open **Settings →
+   Background Voice** inside Cordless and tap **Install Background Voice Plugins**,
+   then reboot. Cordless backs up `ur0:tai/config.txt` to
+   `ur0:tai/config.txt.cordless.bak`, copies the four files to `ur0:tai/`, and
+   adds these three entries (`cordless_voice_core.suprx` is loaded on demand by
+   `poc`, not listed in `config.txt`):
 
    ```ini
    *KERNEL
