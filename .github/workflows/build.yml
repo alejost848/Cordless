@@ -26,14 +26,12 @@ jobs:
 
       - name: Install VitaSDK & portlibs
         run: |
-          sudo mkdir -p /usr/local/vitasdk
-          sudo chown "$USER:$USER" /usr/local/vitasdk
-          export VITASDK=/usr/local/vitasdk
+          export VITASDK="${{ runner.temp }}/vitasdk"
           export PATH="$VITASDK/bin:$PATH"
-          curl -fsSL https://github.com/vitasdk/vdpm/releases/latest/download/bootstrap-vitasdk.sh | bash
+          curl -fsSL https://github.com/vitasdk/vdpm/releases/latest/download/bootstrap-vitasdk.sh | bash -s -- --install-dir "$VITASDK"
           vdpm jansson opus libvita2d freetype libpng libjpeg-turbo libwebp bzip2 zlib pthread-embedded
-          echo "VITASDK=/usr/local/vitasdk" >> "$GITHUB_ENV"
-          echo "/usr/local/vitasdk/bin" >> "$GITHUB_PATH"
+          echo "VITASDK=$VITASDK" >> "$GITHUB_ENV"
+          echo "$VITASDK/bin" >> "$GITHUB_PATH"
 
       - name: Build background voice plugins
         run: bash scripts/build_plugin.sh
