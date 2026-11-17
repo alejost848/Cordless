@@ -582,13 +582,13 @@ static int tx_worker(SceSize sz, void *p)
     while (s_run) {
         if (s_mic < 0 || !s_enc) { sceKernelDelayThread(20 * 1000); continue; }
         if (sceAudioInInput(s_mic, in16) < 0) { sceKernelDelayThread(10 * 1000); continue; }
-        // 1-pole DC/rumble high-pass at ~80 Hz (16kHz native).
+        // 1-pole DC/rumble high-pass at ~80 Hz (16kHz native) + 2x mic preamp.
         for (int i = 0; i < VA_MIC_GRAIN && accn < (int)(sizeof(acc) / sizeof(acc[0])); i++) {
             float x = (float)in16[i];
             float y = 0.97f * (hp_y1 + x - hp_x1);
             hp_x1 = x;
             hp_y1 = y;
-            int cur = (int)y;
+            int cur = (int)(y * 2.0f);
             if (cur > 32767) cur = 32767;
             else if (cur < -32768) cur = -32768;
             acc[accn++] = (int16_t)cur;
@@ -596,7 +596,15 @@ static int tx_worker(SceSize sz, void *p)
         while (accn >= VA_TX_FRAME_SAMPLES && s_run) {
             if (s_denoise) speex_preprocess_run(s_denoise, acc);
             long long e = 0;
-            for (int i = 0; i < VA_TX_FRAME_SAMPLES; i++) { int v = acc[i]; e += (long long)v * v; }
+            for (int i = 0; i < VA_TX_FRAME_SAMPLES; i++) {
+                int v = (acc[i] * 135) / 100; // +2.6 dB makeup with soft ceiling
+                if (v > 24000) v = 24000 + (v - 24000) / 3;
+                else if (v < -24000) v = -24000 + (v + 24000) / 3;
+                if (v > 32000) v = 32000;
+                else if (v < -32000) v = -32000;
+                acc[i] = (int16_t)v;
+                e += (long long)v * v;
+            }
             long long ms2 = e / VA_TX_FRAME_SAMPLES;
             if (ms2 > tx_max_e) tx_max_e = ms2;
             tx_frames++;
@@ -711,9 +719,9 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
     } else console_logf("[voice] opus encoder create failed %d", eerr);
     s_denoise = speex_preprocess_state_init(VA_TX_FRAME_SAMPLES, 16000);
     if (s_denoise) {
-        int denoise = 1, suppress = -10, agc = 1;
+        int denoise = 1, suppress = -6, agc = 1;
         int agc_inc = 20, agc_max_gain = 35;
-        float agc_lvl = 22000.0f;
+        float agc_lvl = 28000.0f;
         speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_DENOISE, &denoise);
         speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &suppress);
         speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_AGC, &agc);
