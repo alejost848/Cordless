@@ -14,18 +14,26 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: vitasdk/vitasdk:latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure build tools (rsync, zip)
+      - name: Install host tools
         run: |
-          if ! command -v rsync >/dev/null || ! command -v zip >/dev/null; then
-            apt-get update && apt-get install -y --no-install-recommends rsync zip
-          fi
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake make rsync zip curl tar bzip2 xz-utils
+
+      - name: Install VitaSDK & portlibs
+        run: |
+          sudo mkdir -p /usr/local/vitasdk
+          sudo chown "$USER:$USER" /usr/local/vitasdk
+          export VITASDK=/usr/local/vitasdk
+          export PATH="$VITASDK/bin:$PATH"
+          curl -fsSL https://github.com/vitasdk/vdpm/releases/latest/download/bootstrap-vitasdk.sh | bash
+          vdpm jansson opus libvita2d freetype libpng libjpeg-turbo libwebp bzip2 zlib pthread-embedded
+          echo "VITASDK=/usr/local/vitasdk" >> "$GITHUB_ENV"
+          echo "/usr/local/vitasdk/bin" >> "$GITHUB_PATH"
 
       - name: Build background voice plugins
         run: bash scripts/build_plugin.sh
