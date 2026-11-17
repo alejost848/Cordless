@@ -299,6 +299,7 @@ static int      s_set_sw_r[4];  // Switch Account button
 #define SET_ROW_H  30           // appearance setting row height
 #define SET_NAPP    7           // appearance setting rows
 static int      s_set_app_r[SET_NAPP][4];  // appearance row hit rects
+static int      s_set_ns_r[4];             // voice noise suppression toggle row
 static int      s_set_plg_r[4], s_set_plg2_r[4];
 static PluginStatus s_plg_status;
 static char     s_plg_msg[96];
@@ -3043,6 +3044,8 @@ void browser_touch(int x, int y, int dy, bool tap)
             for (int i = 0; i < SET_NAPP; i++)
                 if (x >= s_set_app_r[i][0] && x < s_set_app_r[i][0] + s_set_app_r[i][2] &&
                     y >= s_set_app_r[i][1] && y < s_set_app_r[i][1] + s_set_app_r[i][3]) app_hit = i;
+            bool in_ns = (x >= s_set_ns_r[0] && x < s_set_ns_r[0] + s_set_ns_r[2] &&
+                          y >= s_set_ns_r[1] && y < s_set_ns_r[1] + s_set_ns_r[3]);
             bool in_plg1 = (x >= s_set_plg_r[0] && x < s_set_plg_r[0] + s_set_plg_r[2] &&
                             y >= s_set_plg_r[1] && y < s_set_plg_r[1] + s_set_plg_r[3]);
             bool in_plg2 = (s_set_plg2_r[2] > 0 &&
@@ -3091,6 +3094,10 @@ void browser_touch(int x, int y, int dy, bool tap)
                 case 6: g_settings.low_battery ^= 1; break;
                 }
                 settings_save();
+            } else if (in_ns) {
+                g_settings.noise_suppress ^= 1;
+                settings_save();
+                voice_set_noise_suppress(g_settings.noise_suppress);
             } else if (inbtn && y >= s_set_eb_y && y < s_set_eb_y + SET_BTN_H) {
                 edit_bio();
             } else if (inbtn && y >= s_set_lo_y && y < s_set_lo_y + SET_BTN_H) {
@@ -5463,10 +5470,11 @@ static void draw_settings(void)
     int aboutH    = 6 + 18 + bioH;
     int statusH   = 12 + 18 + 30 + 8 + 30;
     int appearH   = 12 + 18 + SET_NAPP * (SET_ROW_H + 6);  // label + 7 rows
+    int voiceH    = 12 + 18 + SET_ROW_H;                   // label + Noise Suppression
     int pluginH   = 12 + 18 + 18 + SET_ROW_H + (s_plg_msg[0] ? 20 : 4);
     int aboutAppH = 12 + 18 + 18 + 16;                     // label + 2 text lines
     int buttonsH  = 12 + SET_BTN_H + 10 + SET_BTN_H + 14;
-    int ch = headerH + aboutH + statusH + appearH + pluginH + aboutAppH + buttonsH;
+    int ch = headerH + aboutH + statusH + appearH + voiceH + pluginH + aboutAppH + buttonsH;
     int cx = (SCREEN_W - cw) / 2, cy;
     const int SET_MARGIN = 8, avail = SCREEN_H - 2 * SET_MARGIN;
     if (ch <= avail) { cy = (SCREEN_H - ch) / 2; s_set_scroll_max = 0; }
@@ -5552,6 +5560,19 @@ static void draw_settings(void)
         s_set_app_r[i][2] = cw - 40; s_set_app_r[i][3] = SET_ROW_H;
         y += SET_ROW_H + 6;
     }
+
+    // VOICE: experimental audio toggle (synced to in-app voice and background plugin).
+    y += 12;
+    ui_text(cx + 20, y, FS_TINY, COL_TEXT_MUTED, "VOICE");
+    y += 18;
+    ui_rounded_rect(cx + 20, y, cw - 40, SET_ROW_H, 6, COL_ELEVATED);
+    ui_text(cx + 30, y + 8, FS_SMALL, COL_TEXT, "Noise Suppression (Exp.)");
+    const char *ns_val = g_settings.noise_suppress ? "On" : "Off";
+    int nsvw = ui_text_w(FS_SMALL, ns_val);
+    ui_text(cx + 20 + (cw - 40) - nsvw - 10, y + 8, FS_SMALL, COL_TEXT_BRIGHT, ns_val);
+    s_set_ns_r[0] = cx + 20; s_set_ns_r[1] = y;
+    s_set_ns_r[2] = cw - 40; s_set_ns_r[3] = SET_ROW_H;
+    y += SET_ROW_H;
 
     // BACKGROUND VOICE: taiHEN plugin status + one-tap install/uninstall.
     y += 12;

@@ -27,6 +27,8 @@ void voice_audio_set_muted(int muted);
 int  voice_audio_is_muted(void);
 void voice_audio_set_deafened(int deafened);
 int  voice_audio_is_deafened(void);
+void voice_audio_set_noise_suppress(int enabled);
+int  voice_audio_is_noise_suppress(void);
 int  voice_audio_is_tx_speaking(void);
 int  voice_audio_ssrc_speaking(unsigned ssrc);
 unsigned voice_audio_speaking_mask(void);

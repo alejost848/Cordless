@@ -42,6 +42,7 @@ int voice_audio_selftest(void) { return voice_crypto_selftest(); }
 static volatile int      s_run;
 static volatile int      s_muted;
 static volatile int      s_deafened;
+static volatile int      s_noise_suppress;
 static volatile int      s_tx_speaking;
 static volatile unsigned s_rx_tick;
 static int           s_udp = -1;  // borrowed from voice.c
@@ -72,6 +73,8 @@ void voice_audio_set_muted(int muted)       { s_muted = muted ? 1 : 0; }
 int  voice_audio_is_muted(void)             { return s_muted; }
 void voice_audio_set_deafened(int deafened) { s_deafened = deafened ? 1 : 0; }
 int  voice_audio_is_deafened(void)          { return s_deafened; }
+void voice_audio_set_noise_suppress(int enabled) { s_noise_suppress = enabled ? 1 : 0; }
+int  voice_audio_is_noise_suppress(void)         { return s_noise_suppress; }
 int  voice_audio_is_tx_speaking(void)       { return (!s_muted && !s_deafened && s_tx_speaking) ? 1 : 0; }
 
 int voice_audio_ssrc_speaking(unsigned ssrc)
@@ -523,6 +526,23 @@ void speex_echo_get_residual(void *st, float *Yout, int len)
     (void)st; (void)Yout; (void)len;
 }
 
+static void tx_init_denoise(void)
+{
+    if (s_denoise) return;
+    s_denoise = speex_preprocess_state_init(VA_TX_FRAME_SAMPLES, 16000);
+    if (s_denoise) {
+        int denoise = 1, suppress = -6, agc = 1;
+        int agc_inc = 20, agc_max_gain = 35;
+        float agc_lvl = 28000.0f;
+        speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_DENOISE, &denoise);
+        speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &suppress);
+        speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_AGC, &agc);
+        speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_AGC_LEVEL, &agc_lvl);
+        speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_AGC_INCREMENT, &agc_inc);
+        speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_AGC_MAX_GAIN, &agc_max_gain);
+    }
+}
+
 static void tx_send(const uint8_t *payload, int len, uint16_t *seq, uint32_t *ts, uint32_t *ctr)
 {
     uint8_t hdr[12];
@@ -594,7 +614,10 @@ static int tx_worker(SceSize sz, void *p)
             acc[accn++] = (int16_t)cur;
         }
         while (accn >= VA_TX_FRAME_SAMPLES && s_run) {
-            if (s_denoise) speex_preprocess_run(s_denoise, acc);
+            if (s_noise_suppress) {
+                tx_init_denoise();
+                if (s_denoise) speex_preprocess_run(s_denoise, acc);
+            }
             long long e = 0;
             for (int i = 0; i < VA_TX_FRAME_SAMPLES; i++) {
                 int v = (acc[i] * 135) / 100; // +2.6 dB makeup with soft ceiling
@@ -717,18 +740,7 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
         opus_encoder_ctl(s_enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
         opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(3));
     } else console_logf("[voice] opus encoder create failed %d", eerr);
-    s_denoise = speex_preprocess_state_init(VA_TX_FRAME_SAMPLES, 16000);
-    if (s_denoise) {
-        int denoise = 1, suppress = -6, agc = 1;
-        int agc_inc = 20, agc_max_gain = 35;
-        float agc_lvl = 28000.0f;
-        speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_DENOISE, &denoise);
-        speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &suppress);
-        speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_AGC, &agc);
-        speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_AGC_LEVEL, &agc_lvl);
-        speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_AGC_INCREMENT, &agc_inc);
-        speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_AGC_MAX_GAIN, &agc_max_gain);
-    }
+    if (s_noise_suppress) tx_init_denoise();
     s_mic = sceAudioInOpenPort(SCE_AUDIO_IN_PORT_TYPE_VOICE, VA_MIC_GRAIN, 16000,
                                SCE_AUDIO_IN_PARAM_FORMAT_S16_MONO);
     if (s_mic < 0) console_logf("[voice] mic open failed 0x%08x", (unsigned)s_mic);

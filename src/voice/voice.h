@@ -31,6 +31,7 @@ void voice_toggle_mute(void);
 int  voice_is_deafened(void);
 void voice_set_deafened(int deafened);
 void voice_toggle_deaf(void);
+void voice_set_noise_suppress(int enabled);
 int      voice_is_speaking(const char *user_id);
 unsigned voice_speaking_mask(void);
 

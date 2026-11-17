@@ -274,6 +274,15 @@ void voice_toggle_deaf(void)
     if (s_connected) voice_audio_play_cue(s_deafened ? 1 : 2);
 }
 
+void voice_set_noise_suppress(int enabled)
+{
+    int on = enabled ? 1 : 0;
+    voice_audio_set_noise_suppress(on);
+#ifndef CORDLESS_PLUGIN
+    voice_ipc_set_noise_suppress(on);
+#endif
+}
+
 int voice_is_speaking(const char *user_id)
 {
     if (!s_active || !s_connected || !user_id || !user_id[0]) return 0;

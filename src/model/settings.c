@@ -1,5 +1,6 @@
 #include "model/settings.h"
 #include "ui/theme.h"
+#include "voice/voice_audio.h"
 #include "console.h"
 
 #include <string.h>
@@ -21,8 +22,9 @@ static void defaults(void)
     g_settings.font_size   = 1;  // medium
     g_settings.density     = 0;  // cozy
     g_settings.clock_24h   = 0;  // 12-hour
-    g_settings.open_last   = 0;  // Home
-    g_settings.low_battery = 1;  // idle skip on
+    g_settings.open_last      = 0;  // Home
+    g_settings.low_battery    = 1;  // idle skip on
+    g_settings.noise_suppress = 0;  // off by default (experimental)
 }
 
 void settings_load(void)
@@ -38,7 +40,9 @@ void settings_load(void)
         if (m == (int)sizeof magic && magic == SETTINGS_MAGIC && r > 0)
             g_settings = s;
     }
+    g_settings.noise_suppress = g_settings.noise_suppress ? 1 : 0;
     theme_apply_all();
+    voice_audio_set_noise_suppress(g_settings.noise_suppress);
 }
 
 void settings_save(void)

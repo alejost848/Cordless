@@ -1,4 +1,5 @@
 #include "voice/voice_ipc.h"
+#include "model/settings.h"
 #include "model/store.h"
 #include "console.h"
 
@@ -243,6 +244,7 @@ int voice_ipc_join(const char *guild_id, const char *channel_id,
     json_object_set_new(req, "user_id",    json_string(user_id ? user_id : ""));
     json_object_set_new(req, "token",      json_string(token ? token : ""));
     json_object_set_new(req, "cacert",     json_string(PLUGIN_CACERT_PATH));
+    json_object_set_new(req, "noise_suppress", json_integer(g_settings.noise_suppress ? 1 : 0));
     if (chan_label[0]) {
         json_object_set_new(req, "chan_name", json_string(chan_label));
     }
@@ -309,6 +311,15 @@ void voice_ipc_set_deafened(int deafened) {
     json_t *req = json_object();
     json_object_set_new(req, "cmd", json_string("deaf"));
     json_object_set_new(req, "val", json_integer(deafened ? 1 : 0));
+    ipc_rpc(req);
+    json_decref(req);
+}
+
+void voice_ipc_set_noise_suppress(int enabled) {
+    if (s_avail != 1) return;
+    json_t *req = json_object();
+    json_object_set_new(req, "cmd", json_string("noise"));
+    json_object_set_new(req, "val", json_integer(enabled ? 1 : 0));
     ipc_rpc(req);
     json_decref(req);
 }

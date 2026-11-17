@@ -8,8 +8,9 @@ typedef struct {
     int  font_size;    // 0 small, 1 medium, 2 large
     int  density;      // 0 cozy, 1 compact
     int  clock_24h;    // 0 = 12-hour, 1 = 24-hour
-    int  open_last;    // 0 open Home, 1 open last channel
-    int  low_battery;  // 1 idle frame-skip, 0 always 60fps
+    int  open_last;      // 0 open Home, 1 open last channel
+    int  low_battery;    // 1 idle frame-skip, 0 always 60fps
+    int  noise_suppress; // 0 off (default), 1 Speex noise suppression (experimental)
 } app_settings;
 
 extern app_settings g_settings;

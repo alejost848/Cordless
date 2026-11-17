@@ -21,6 +21,7 @@ void voice_ipc_on_state_update(const char *guild_id, const char *channel_id,
                                const char *session_id);
 void voice_ipc_set_muted(int muted);
 void voice_ipc_set_deafened(int deafened);
+void voice_ipc_set_noise_suppress(int enabled);
 
 int         voice_ipc_active(void);
 int         voice_ipc_connected(void);

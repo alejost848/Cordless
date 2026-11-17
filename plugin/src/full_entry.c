@@ -124,6 +124,10 @@ static void handle_ipc_line(int fd, const char *line) {
         const char *user_id  = json_string_value(json_object_get(req, "user_id"));
         const char *token    = json_string_value(json_object_get(req, "token"));
         const char *cacert   = json_string_value(json_object_get(req, "cacert"));
+        json_t *ns           = json_object_get(req, "noise_suppress");
+        if (json_is_integer(ns)) {
+            voice_audio_set_noise_suppress((int)json_integer_value(ns));
+        }
         main_gw_set_auth(token, cacert, user_id);
         int rc = voice_join(guild_id, chan_id, token, cacert);
         if (rc == 0) {
@@ -164,6 +168,9 @@ static void handle_ipc_line(int fd, const char *line) {
         json_t *v = json_object_get(req, "val");
         if (json_is_integer(v)) voice_set_deafened((int)json_integer_value(v));
         else voice_toggle_deaf();
+    } else if (strcmp(cmd, "noise") == 0) {
+        json_t *v = json_object_get(req, "val");
+        if (json_is_integer(v)) voice_audio_set_noise_suppress((int)json_integer_value(v));
     }
 
     json_object_set_new(resp, "active",     json_integer(voice_active()));
