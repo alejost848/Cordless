@@ -29,7 +29,10 @@ jobs:
           export VITASDK="${{ runner.temp }}/vitasdk"
           export PATH="$VITASDK/bin:$PATH"
           curl -fsSL https://github.com/vitasdk/vdpm/releases/latest/download/bootstrap-vitasdk.sh | bash -s -- --install-dir "$VITASDK"
-          vdpm jansson opus libvita2d freetype libpng libjpeg-turbo libwebp bzip2 zlib pthread-embedded
+          # Pin [vita] to a verified complete 2026.08 snapshot (avoids incomplete daily snapshots)
+          sed -i 's|Server = https://github.com/vitasdk/vitasdk-autobuild/releases/download/.*|Server = https://github.com/vitasdk/vitasdk-autobuild/releases/download/packages-2026.08-snapshot-20261115.68.1|' "$VITASDK/etc/pacman.conf"
+          vdpm pacman -- -Syy --noconfirm
+          vdpm install jansson opus libvita2d freetype libpng libjpeg-turbo libwebp bzip2 zlib
           echo "VITASDK=$VITASDK" >> "$GITHUB_ENV"
           echo "$VITASDK/bin" >> "$GITHUB_PATH"
 
