@@ -32,7 +32,7 @@ size_t strlen(const char *s) {
 }
 #pragma GCC pop_options
 
-#define NUM_CTRL_HOOKS 8
+#define NUM_CTRL_HOOKS 12
 
 static SceUID         s_disp_hook = -1;
 static tai_hook_ref_t s_disp_ref = 0;
@@ -41,9 +41,10 @@ static tai_hook_ref_t s_ctrl_refs[NUM_CTRL_HOOKS];
 
 static volatile int      s_panel_open = 0;
 static volatile int      s_sel = 0;
-static volatile uint64_t s_last_ts = 0;
-static volatile uint32_t s_prev_btn = 0;
-static volatile int      s_combo_prev = 0;
+static volatile uint64_t s_last_ts[2];
+static volatile uint32_t s_prev_btn[2];
+static volatile int      s_combo_prev[2];
+static volatile uint32_t s_swallow_mask[2];
 
 #define AUDIO_MAX_PORTS 8
 #define NUM_AUDIO_HOOKS 4
@@ -528,102 +529,132 @@ static int hook_sceDisplaySetFrameBuf(const SceDisplayFrameBuf *pParam, int sync
     return TAI_CONTINUE(int, s_disp_ref, pParam, sync);
 }
 
-static int ctrl_process(int port, SceCtrlData *pad_data, int count, int ret) {
-    if (ret <= 0 || !pad_data || (port != 0 && port != 1)) return ret;
+static void mask_pad_sample(SceCtrlData *d, uint32_t mask, int is_neg) {
+    uint32_t m = mask & 0x0000FFFFu;
+    if (!m) return;
+    if (is_neg) {
+        d->buttons |= m;
+    } else {
+        d->buttons &= ~m;
+    }
+    if (m == 0x0000FFFFu) {
+        d->lx = 128;
+        d->ly = 128;
+        d->rx = 128;
+        d->ry = 128;
+    }
+    if (m & SCE_CTRL_UP)       d->up = 0;
+    if (m & SCE_CTRL_RIGHT)    d->right = 0;
+    if (m & SCE_CTRL_DOWN)     d->down = 0;
+    if (m & SCE_CTRL_LEFT)     d->left = 0;
+    if (m & SCE_CTRL_LTRIGGER) d->lt = 0;
+    if (m & SCE_CTRL_RTRIGGER) d->rt = 0;
+    if (m & SCE_CTRL_L1)       d->l1 = 0;
+    if (m & SCE_CTRL_R1)       d->r1 = 0;
+    if (m & SCE_CTRL_TRIANGLE) d->triangle = 0;
+    if (m & SCE_CTRL_CIRCLE)   d->circle = 0;
+    if (m & SCE_CTRL_CROSS)    d->cross = 0;
+    if (m & SCE_CTRL_SQUARE)   d->square = 0;
+}
+
+static int ctrl_process(int port, SceCtrlData *pad_data, int count, int ret, int is_neg) {
+    if (ret <= 0 || !pad_data) return ret;
 
     int n = (ret < count) ? ret : count;
-    const SceCtrlData *cur = (n > 1 && pad_data[n - 1].timeStamp > pad_data[0].timeStamp)
-                             ? &pad_data[n - 1] : &pad_data[0];
-    uint32_t raw = cur->buttons;
-    uint64_t ts = cur->timeStamp;
-    int combo_now = ((raw & (SCE_CTRL_LTRIGGER | SCE_CTRL_L1)) != 0) &&
-                    ((raw & (SCE_CTRL_RTRIGGER | SCE_CTRL_R1)) != 0) &&
-                    ((raw & SCE_CTRL_TRIANGLE) != 0);
+    int closing = 0;
+    if (port == 0 || port == 1) {
+        const SceCtrlData *cur = (n > 1 && pad_data[n - 1].timeStamp > pad_data[0].timeStamp)
+                                 ? &pad_data[n - 1] : &pad_data[0];
+        uint32_t raw = is_neg ? ~cur->buttons : cur->buttons;
+        uint64_t ts = cur->timeStamp;
+        int combo_now = ((raw & (SCE_CTRL_LTRIGGER | SCE_CTRL_L1)) != 0) &&
+                        ((raw & (SCE_CTRL_RTRIGGER | SCE_CTRL_R1)) != 0) &&
+                        ((raw & SCE_CTRL_TRIANGLE) != 0);
 
-    if (ts != s_last_ts || (ts == 0 && raw != s_prev_btn)) {
-        s_last_ts = ts;
-        uint32_t pressed = raw & ~s_prev_btn;
-        s_prev_btn = raw;
+        if (ts != s_last_ts[port] || (ts == 0 && raw != s_prev_btn[port])) {
+            s_last_ts[port] = ts;
+            s_swallow_mask[port] &= (raw & 0x0000FFFFu);
+            uint32_t pressed = raw & ~s_prev_btn[port];
+            s_prev_btn[port] = raw;
 
-        if (combo_now && !s_combo_prev) {
-            if (s_panel_open) {
-                s_panel_open = 0;
-            } else if (cordless_mem_get_overlay() & CORDLESS_OV_ACTIVE) {
-                s_panel_open = 1;
-                s_sel = 0;
-            }
-        } else if (s_panel_open && !combo_now) {
-            if (pressed & SCE_CTRL_UP) {
-                s_sel = (s_sel > 0) ? (s_sel - 1) : 3;
-            } else if (pressed & SCE_CTRL_DOWN) {
-                s_sel = (s_sel + 1) % 4;
-            } else if (pressed & SCE_CTRL_CIRCLE) {
-                s_panel_open = 0;
-            } else if (s_sel == 2 && (pressed & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT | SCE_CTRL_CROSS))) {
-                int v = cordless_mem_get_game_vol();
-                if (pressed & SCE_CTRL_LEFT) {
-                    v -= 10;
-                } else if (pressed & SCE_CTRL_RIGHT) {
-                    v += 10;
-                } else {
-                    v = (v < 100) ? 100 : 40;
-                }
-                if (v < 0) v = 0;
-                if (v > 100) v = 100;
-                cordless_mem_set_game_vol(v);
-                sync_audio_volumes(v, 0);
-            } else if (pressed & SCE_CTRL_CROSS) {
-                if (s_sel == 0) {
-                    cordless_mem_post_action(CORDLESS_ACT_MUTE);
-                } else if (s_sel == 1) {
-                    cordless_mem_post_action(CORDLESS_ACT_DEAF);
-                } else if (s_sel == 3) {
-                    cordless_mem_post_action(CORDLESS_ACT_LEAVE);
+            if (combo_now && !s_combo_prev[port]) {
+                if (s_panel_open) {
+                    s_swallow_mask[port] |= (raw & 0x0000FFFFu);
                     s_panel_open = 0;
+                    closing = 1;
+                } else if (cordless_mem_get_overlay() & CORDLESS_OV_ACTIVE) {
+                    s_panel_open = 1;
+                    s_sel = 0;
+                    s_swallow_mask[port] = 0;
+                }
+            } else if (s_panel_open && !combo_now) {
+                if (pressed & SCE_CTRL_UP) {
+                    s_sel = (s_sel > 0) ? (s_sel - 1) : 3;
+                } else if (pressed & SCE_CTRL_DOWN) {
+                    s_sel = (s_sel + 1) % 4;
+                } else if (pressed & SCE_CTRL_CIRCLE) {
+                    s_swallow_mask[port] |= (raw & 0x0000FFFFu);
+                    s_panel_open = 0;
+                    closing = 1;
+                } else if (s_sel == 2 && (pressed & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT | SCE_CTRL_CROSS))) {
+                    int v = cordless_mem_get_game_vol();
+                    if (pressed & SCE_CTRL_LEFT) {
+                        v -= 10;
+                    } else if (pressed & SCE_CTRL_RIGHT) {
+                        v += 10;
+                    } else {
+                        v = (v < 100) ? 100 : 40;
+                    }
+                    if (v < 0) v = 0;
+                    if (v > 100) v = 100;
+                    cordless_mem_set_game_vol(v);
+                    sync_audio_volumes(v, 0);
+                } else if (pressed & SCE_CTRL_CROSS) {
+                    if (s_sel == 0) {
+                        cordless_mem_post_action(CORDLESS_ACT_MUTE);
+                    } else if (s_sel == 1) {
+                        cordless_mem_post_action(CORDLESS_ACT_DEAF);
+                    } else if (s_sel == 3) {
+                        cordless_mem_post_action(CORDLESS_ACT_LEAVE);
+                        s_swallow_mask[port] |= (raw & 0x0000FFFFu);
+                        s_panel_open = 0;
+                        closing = 1;
+                    }
                 }
             }
+            s_combo_prev[port] = combo_now;
         }
-        s_combo_prev = combo_now;
     }
 
-    if (s_panel_open) {
+    uint32_t mask = (s_panel_open || closing)
+                    ? 0x0000FFFFu
+                    : ((port == 0 || port == 1) ? s_swallow_mask[port] : 0u);
+    if (mask) {
         for (int i = 0; i < n; i++) {
-            pad_data[i].buttons &= 0xFFFF0000u;
-            pad_data[i].lx = 128;
-            pad_data[i].ly = 128;
-            pad_data[i].rx = 128;
-            pad_data[i].ry = 128;
-            pad_data[i].up = 0;
-            pad_data[i].right = 0;
-            pad_data[i].down = 0;
-            pad_data[i].left = 0;
-            pad_data[i].lt = 0;
-            pad_data[i].rt = 0;
-            pad_data[i].l1 = 0;
-            pad_data[i].r1 = 0;
-            pad_data[i].triangle = 0;
-            pad_data[i].circle = 0;
-            pad_data[i].cross = 0;
-            pad_data[i].square = 0;
+            mask_pad_sample(&pad_data[i], mask, is_neg);
         }
     }
     return ret;
 }
 
-#define DEFINE_CTRL_HOOK(idx) \
+#define DEFINE_CTRL_HOOK(idx, is_neg) \
 static int hook_ctrl_##idx(int port, SceCtrlData *pad_data, int count) { \
     int ret = TAI_CONTINUE(int, s_ctrl_refs[idx], port, pad_data, count); \
-    return ctrl_process(port, pad_data, count, ret); \
+    return ctrl_process(port, pad_data, count, ret, (is_neg)); \
 }
 
-DEFINE_CTRL_HOOK(0)
-DEFINE_CTRL_HOOK(1)
-DEFINE_CTRL_HOOK(2)
-DEFINE_CTRL_HOOK(3)
-DEFINE_CTRL_HOOK(4)
-DEFINE_CTRL_HOOK(5)
-DEFINE_CTRL_HOOK(6)
-DEFINE_CTRL_HOOK(7)
+DEFINE_CTRL_HOOK(0, 0)
+DEFINE_CTRL_HOOK(1, 0)
+DEFINE_CTRL_HOOK(2, 0)
+DEFINE_CTRL_HOOK(3, 0)
+DEFINE_CTRL_HOOK(4, 0)
+DEFINE_CTRL_HOOK(5, 0)
+DEFINE_CTRL_HOOK(6, 0)
+DEFINE_CTRL_HOOK(7, 0)
+DEFINE_CTRL_HOOK(8, 1)
+DEFINE_CTRL_HOOK(9, 1)
+DEFINE_CTRL_HOOK(10, 1)
+DEFINE_CTRL_HOOK(11, 1)
 
 typedef int (*ctrl_hook_fn)(int port, SceCtrlData *pad_data, int count);
 
@@ -631,14 +662,18 @@ static const struct {
     uint32_t     nid;
     ctrl_hook_fn fn;
 } s_ctrl_targets[NUM_CTRL_HOOKS] = {
-    { 0xA9C3CED6, hook_ctrl_0 }, /* sceCtrlPeekBufferPositive */
-    { 0x15F81E8C, hook_ctrl_1 }, /* sceCtrlPeekBufferPositive2 */
-    { 0xA59454D3, hook_ctrl_2 }, /* sceCtrlPeekBufferPositiveExt */
-    { 0x860BF292, hook_ctrl_3 }, /* sceCtrlPeekBufferPositiveExt2 */
-    { 0x67E7AB83, hook_ctrl_4 }, /* sceCtrlReadBufferPositive */
-    { 0xC4226A3E, hook_ctrl_5 }, /* sceCtrlReadBufferPositive2 */
-    { 0xE2D99296, hook_ctrl_6 }, /* sceCtrlReadBufferPositiveExt */
-    { 0xA7178860, hook_ctrl_7 }, /* sceCtrlReadBufferPositiveExt2 */
+    { 0xA9C3CED6, hook_ctrl_0  }, /* sceCtrlPeekBufferPositive */
+    { 0x15F81E8C, hook_ctrl_1  }, /* sceCtrlPeekBufferPositive2 */
+    { 0xA59454D3, hook_ctrl_2  }, /* sceCtrlPeekBufferPositiveExt */
+    { 0x860BF292, hook_ctrl_3  }, /* sceCtrlPeekBufferPositiveExt2 */
+    { 0x67E7AB83, hook_ctrl_4  }, /* sceCtrlReadBufferPositive */
+    { 0xC4226A3E, hook_ctrl_5  }, /* sceCtrlReadBufferPositive2 */
+    { 0xE2D99296, hook_ctrl_6  }, /* sceCtrlReadBufferPositiveExt */
+    { 0xA7178860, hook_ctrl_7  }, /* sceCtrlReadBufferPositiveExt2 */
+    { 0x104ED1A7, hook_ctrl_8  }, /* sceCtrlPeekBufferNegative */
+    { 0x81A89660, hook_ctrl_9  }, /* sceCtrlPeekBufferNegative2 */
+    { 0x15F96FB0, hook_ctrl_10 }, /* sceCtrlReadBufferNegative */
+    { 0x27A0C5FB, hook_ctrl_11 }, /* sceCtrlReadBufferNegative2 */
 };
 
 void _start() __attribute__((weak, alias("module_start")));
