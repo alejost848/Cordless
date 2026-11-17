@@ -714,6 +714,7 @@ static void send_select_protocol(ws_client *ws, const char *mode)
 static int worker(SceSize argsz, void *argp)
 {
     (void)argsz; (void)argp;
+    int fatal_close = 0;
 
     // wait for the main gateway to deliver the voice server assignment
     int64_t start = now_ms();
@@ -738,7 +739,6 @@ static int worker(SceSize argsz, void *argp)
     char url[192];
     snprintf(url, sizeof(url), "wss://%s/?v=8", s_endpoint);
 
-    int fatal_close = 0;
     for (int attempt = 0; s_run && !fatal_close && attempt < 6; attempt++) {
         if (attempt > 0) {
             s_connected = 0;
