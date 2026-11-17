@@ -39,6 +39,28 @@ jobs:
       - name: Build background voice plugins
         run: bash scripts/build_plugin.sh
 
+      - name: Diagnose ELF relocation 25 on failure
+        if: failure()
+        run: |
+          ELF="$HOME/.cache/cordless_plugin_build/build/cordless_voice_full"
+          echo "=== flags.make ==="
+          cat "$HOME/.cache/cordless_plugin_build/build/CMakeFiles/cordless_voice_full.dir/flags.make" || true
+          echo "=== link.txt ==="
+          cat "$HOME/.cache/cordless_plugin_build/build/CMakeFiles/cordless_voice_full.dir/link.txt" || true
+          echo "=== reloc 25 / R_ARM_BASE_PREL in ELF ==="
+          "$VITASDK/bin/arm-vita-eabi-readelf" -r "$ELF" | grep -B3 -A3 -E "R_ARM_BASE_PREL|R_ARM_GOT|Relocation section" | grep -B2 -A4 -E "R_ARM_BASE_PREL|R_ARM_GOT" | head -n 80 || true
+          echo "=== all reloc types in ELF ==="
+          "$VITASDK/bin/arm-vita-eabi-readelf" -r "$ELF" | awk '/R_ARM_/ {print $3}' | sort -u || true
+          echo "=== scan VITASDK libs for BASE_PREL ==="
+          find "$VITASDK/arm-vita-eabi" "$VITASDK/lib/gcc" -name "*.a" -o -name "*.o" | while read f; do
+            if "$VITASDK/bin/arm-vita-eabi-readelf" -r "$f" 2>/dev/null | grep -q "R_ARM_BASE_PREL"; then
+              echo "FOUND in $f"
+              "$VITASDK/bin/arm-vita-eabi-readelf" -r "$f" 2>/dev/null | grep -B2 -E "R_ARM_BASE_PREL|File:" | head -n 20
+            fi
+          done
+          echo "=== test cordless.vpk build ==="
+          bash scripts/build.sh || true
+
       - name: Build cordless.vpk (with bundled plugins)
         run: bash scripts/build.sh
 
