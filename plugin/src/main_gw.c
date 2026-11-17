@@ -2,6 +2,7 @@
 #include "voice/voice.h"
 
 #include <jansson.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/rtc.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,11 +16,28 @@ static char   *s_buf = NULL;
 static size_t  s_cap = 0;
 static int     s_hb_ms = 41250;
 static int64_t s_last_hb = 0;
+static int64_t s_last_rx = 0;
 static int64_t s_last_retry = 0;
 static int     s_seq = -1;
 static int     s_ready = 0;
 static int     s_identified = 0;
-static int     s_active = 0;
+static volatile int s_active = 0;
+static volatile int s_stop_req = 0;
+
+static SceUID s_gw_mtx = -1;
+static void gw_lock(void) {
+    if (s_gw_mtx < 0) {
+        SceUID m = sceKernelCreateMutex("cmgw", 0, 0, NULL);
+        if (m >= 0) {
+            if (!__sync_bool_compare_and_swap(&s_gw_mtx, -1, m))
+                sceKernelDeleteMutex(m);
+        }
+    }
+    if (s_gw_mtx >= 0) sceKernelLockMutex(s_gw_mtx, 1, NULL);
+}
+static void gw_unlock(void) {
+    if (s_gw_mtx >= 0) sceKernelUnlockMutex(s_gw_mtx, 1);
+}
 
 static char s_token[160];
 static char s_cacert[128];
@@ -65,12 +83,16 @@ static int64_t gw_now_ms(void) {
 }
 
 void main_gw_set_auth(const char *token, const char *cacert, const char *user_id) {
+    gw_lock();
+    if (token && strcmp(s_token, token) != 0)
+        s_sess_id[0] = '\0';
     snprintf(s_token, sizeof(s_token), "%s", token ? token : "");
     snprintf(s_cacert, sizeof(s_cacert), "%s",
              (cacert && cacert[0]) ? cacert : "ur0:data/cordless_cacert.pem");
     if (user_id && user_id[0]) {
         snprintf(s_me_id, sizeof(s_me_id), "%s", user_id);
     }
+    gw_unlock();
 }
 
 static void scan_reset(void) {
@@ -184,26 +206,26 @@ static void on_large_gw_chunk(const unsigned char *chunk, size_t len, int done, 
     }
 }
 
-static void send_op4(ws_client *ws) {
+static void send_op4_vals(ws_client *ws, const char *guild, const char *chan, int mute, int deaf) {
     json_t *d = json_object();
-    if (s_guild[0]) json_object_set_new(d, "guild_id", json_string(s_guild));
-    else            json_object_set_new(d, "guild_id", json_null());
-    if (s_chan[0])  json_object_set_new(d, "channel_id", json_string(s_chan));
-    else            json_object_set_new(d, "channel_id", json_null());
-    json_object_set_new(d, "self_mute", json_boolean(s_mute));
-    json_object_set_new(d, "self_deaf", json_boolean(s_deaf));
+    if (guild[0]) json_object_set_new(d, "guild_id", json_string(guild));
+    else          json_object_set_new(d, "guild_id", json_null());
+    if (chan[0])  json_object_set_new(d, "channel_id", json_string(chan));
+    else          json_object_set_new(d, "channel_id", json_null());
+    json_object_set_new(d, "self_mute", json_boolean(mute));
+    json_object_set_new(d, "self_deaf", json_boolean(deaf));
 
     json_t *pkt = json_pack("{si,so}", "op", 4, "d", d);
     char *txt = json_dumps(pkt, JSON_COMPACT);
     json_decref(pkt);
     if (txt) {
         int rc = ws_send_text(ws, txt, (int)strlen(txt));
-        console_logf("[maingw] OP4 sent chan=%s rc=%d", s_chan[0] ? s_chan : "(null)", rc);
+        console_logf("[maingw] OP4 sent chan=%s rc=%d", chan[0] ? chan : "(null)", rc);
         free(txt);
     }
 }
 
-static void send_identify(ws_client *ws) {
+static void send_identify_tok(ws_client *ws, const char *tok) {
     json_t *props = json_pack("{ss,ss,ss}",
                               "os", "Windows",
                               "browser", "Discord Client",
@@ -217,7 +239,7 @@ static void send_identify(ws_client *ws) {
                            "private_channels_version", "0",
                            "api_code_version", 0);
     json_t *d = json_pack("{ss,so,sb,si,so}",
-                          "token", s_token,
+                          "token", tok,
                           "properties", props,
                           "compress", 0,
                           "capabilities", 30717,
@@ -258,11 +280,38 @@ static void close_ws(void) {
 }
 
 void main_gw_tick(void) {
-    if (!s_active) {
-        if (s_ws) close_ws();
+    char tok[160], cacert[128];
+    int active, stop_req;
+    gw_lock();
+    active = s_active;
+    stop_req = s_stop_req;
+    if (stop_req) s_stop_req = 0;
+    snprintf(tok, sizeof(tok), "%s", s_token);
+    snprintf(cacert, sizeof(cacert), "%s", s_cacert);
+    gw_unlock();
+
+    if (!active || stop_req) {
+        if (s_ws) {
+            if (s_ready) {
+                char g[24], c[24];
+                int d = 0, m = 0, df = 0;
+                gw_lock();
+                if (s_dirty && !s_chan[0]) {
+                    d = 1; s_dirty = 0;
+                    snprintf(g, sizeof(g), "%s", s_guild);
+                    snprintf(c, sizeof(c), "%s", s_chan);
+                    m = s_mute; df = s_deaf;
+                }
+                gw_unlock();
+                if (d) send_op4_vals(s_ws, g, c, m, df);
+            }
+            close_ws();
+        }
+        s_last_retry = 0;
+        s_sess_id[0] = '\0';
         return;
     }
-    if (!s_token[0]) return;
+    if (!tok[0]) return;
 
     int64_t now = gw_now_ms();
     if (!s_ws) {
@@ -270,7 +319,7 @@ void main_gw_tick(void) {
         s_last_retry = now;
         console_logf("[maingw] connecting...");
         s_ws = ws_open("wss://gateway.discord.gg/?v=10&encoding=json",
-                       s_cacert, "https://discord.com", NULL);
+                       cacert, "https://discord.com", NULL);
         if (!s_ws) {
             console_logf("[maingw] ws_open failed");
             return;
@@ -278,6 +327,7 @@ void main_gw_tick(void) {
         ws_set_large_cb(s_ws, 16384, on_large_gw_chunk, NULL);
         s_hb_ms = 41250;
         s_last_hb = now;
+        s_last_rx = now;
         s_seq = -1;
         s_ready = 0;
         s_identified = 0;
@@ -293,6 +343,7 @@ void main_gw_tick(void) {
             return;
         }
         if (n == 0) break;
+        s_last_rx = now;
         if (is_bin) continue;
 
         json_error_t jerr;
@@ -311,7 +362,7 @@ void main_gw_tick(void) {
             s_last_hb = now;
             if (!s_identified) {
                 s_identified = 1;
-                send_identify(s_ws);
+                send_identify_tok(s_ws, tok);
             }
         } else if (op == 1) {
             send_heartbeat(s_ws, s_seq);
@@ -341,13 +392,17 @@ void main_gw_tick(void) {
                     voice_on_state_update(gid ? gid : "", cid ? cid : "", s_sess_id);
                 }
             } else if (t && strcmp(t, "VOICE_SERVER_UPDATE") == 0) {
-                const char *tok = json_string_value(json_object_get(d, "token"));
+                const char *vtok = json_string_value(json_object_get(d, "token"));
                 const char *ep  = json_string_value(json_object_get(d, "endpoint"));
                 const char *gid = json_string_value(json_object_get(d, "guild_id"));
                 const char *cid = json_string_value(json_object_get(d, "channel_id"));
+                char def_chan[24];
+                gw_lock();
+                snprintf(def_chan, sizeof(def_chan), "%s", s_chan);
+                gw_unlock();
                 console_logf("[maingw] VOICE_SERVER_UPDATE ep=%s", ep ? ep : "(null)");
-                voice_on_server(tok ? tok : "", ep ? ep : "", s_sess_id,
-                                gid ? gid : "", cid ? cid : s_chan, s_me_id);
+                voice_on_server(vtok ? vtok : "", ep ? ep : "", s_sess_id,
+                                gid ? gid : "", cid ? cid : def_chan, s_me_id);
             }
         }
         json_decref(root);
@@ -355,14 +410,33 @@ void main_gw_tick(void) {
 
     if (!s_ws) return;
 
-    if (s_ready && s_dirty) {
-        s_dirty = 0;
-        send_op4(s_ws);
-        if (!s_chan[0]) {
-            s_active = 0;
-            close_ws();
-            return;
+    if (s_ready) {
+        char g[24], c[24];
+        int do_send = 0, m = 0, df = 0;
+        gw_lock();
+        if (s_dirty) {
+            do_send = 1; s_dirty = 0;
+            snprintf(g, sizeof(g), "%s", s_guild);
+            snprintf(c, sizeof(c), "%s", s_chan);
+            m = s_mute; df = s_deaf;
+            if (!s_chan[0]) s_active = 0;
         }
+        gw_unlock();
+        if (do_send) {
+            send_op4_vals(s_ws, g, c, m, df);
+            if (!c[0]) {
+                close_ws();
+                s_last_retry = 0;
+                return;
+            }
+        }
+    }
+
+    if (now - s_last_rx > (int64_t)s_hb_ms * 2 + 15000) {
+        console_logf("[maingw] gateway stale after sleep/timeout, reconnecting");
+        close_ws();
+        s_last_retry = 0;
+        return;
     }
 
     if (now - s_last_hb >= s_hb_ms) {
@@ -373,17 +447,25 @@ void main_gw_tick(void) {
 
 int gateway_voice_update_ex(const char *guild_id, const char *channel_id,
                             int self_mute, int self_deaf) {
+    gw_lock();
     snprintf(s_guild, sizeof(s_guild), "%s", guild_id ? guild_id : "");
     snprintf(s_chan, sizeof(s_chan), "%s", channel_id ? channel_id : "");
     s_mute = self_mute ? 1 : 0;
     s_deaf = self_deaf ? 1 : 0;
     s_dirty = 1;
-    if (s_chan[0]) s_active = 1;
-    else if (!s_ws) s_active = 0;
+    if (s_chan[0]) {
+        s_active = 1;
+        s_stop_req = 0;
+    } else if (!s_ws) {
+        s_active = 0;
+    }
+    gw_unlock();
     return 0;
 }
 
 void main_gw_stop(void) {
+    gw_lock();
     s_active = 0;
-    close_ws();
+    s_stop_req = 1;
+    gw_unlock();
 }

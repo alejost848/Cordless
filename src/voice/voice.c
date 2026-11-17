@@ -934,7 +934,7 @@ void voice_on_server(const char *token, const char *endpoint,
                      const char *channel_id, const char *user_id)
 {
 #ifndef CORDLESS_PLUGIN
-    if (voice_ipc_available()) return;
+    if (!s_active && voice_ipc_available()) return;
 #endif
     if (!s_active) return;
     if (s_guild[0]) {
@@ -955,7 +955,7 @@ void voice_on_state_update(const char *guild_id, const char *channel_id,
                            const char *session_id)
 {
 #ifndef CORDLESS_PLUGIN
-    if (voice_ipc_available()) return;
+    if (!s_active && voice_ipc_available()) return;
 #endif
     if (!s_active) return;
     if (s_guild[0]) {

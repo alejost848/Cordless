@@ -54,6 +54,7 @@ typedef int (*pfn_net_accept_t)(int s, SceNetSockaddr *addr, unsigned int *addrl
 typedef int (*pfn_net_setsockopt_t)(int s, int level, int optname,
                                     const void *optval, unsigned int optlen);
 typedef int (*pfn_net_send_t)(int s, const void *msg, unsigned int len, int flags);
+typedef int (*pfn_net_recv_t)(int s, void *buf, unsigned int len, int flags);
 typedef int (*pfn_net_close_t)(int s);
 typedef int *(*pfn_net_errno_t)(void);
 
@@ -64,11 +65,14 @@ static pfn_net_listen_t     p_net_listen = NULL;
 static pfn_net_accept_t     p_net_accept = NULL;
 static pfn_net_setsockopt_t p_net_setsockopt = NULL;
 static pfn_net_send_t       p_net_send = NULL;
+static pfn_net_recv_t       p_net_recv = NULL;
 static pfn_net_close_t      p_net_close = NULL;
 static pfn_net_errno_t      p_net_errno = NULL;
 static int s_net_resolved = 0;
 static int s_net_init_tried = 0;
 static int s_wake_fd = -1;
+
+static void unload_core(void);
 
 static inline uint16_t net_htons(uint16_t v) {
     return (uint16_t)((v >> 8) | (v << 8));
@@ -107,6 +111,8 @@ static int resolve_net_funcs(void) {
     p_net_setsockopt = (pfn_net_setsockopt_t)fn;
     if (!resolve_one(0xE3DD8CD9u, &fn)) return 0;
     p_net_send = (pfn_net_send_t)fn;
+    if (!resolve_one(0x023643B7u, &fn)) return 0;
+    p_net_recv = (pfn_net_recv_t)fn;
     if (!resolve_one(0x29822B4Du, &fn)) return 0;
     p_net_close = (pfn_net_close_t)fn;
     if (!resolve_one(0xE37F34AAu, &fn)) return 0;
@@ -179,13 +185,39 @@ static int try_open_wake_socket(int allow_init_fallback) {
     return 0;
 }
 
-static void poll_wake_socket(void) {
+static void poll_wake_socket(int *wake_retry_ticks) {
     if (s_wake_fd < 0) return;
     int cfd = p_net_accept(s_wake_fd, NULL, NULL);
-    if (cfd < 0) return;
-    ldr_log("wake connection accepted (core=%d)", s_core_mod);
-    if (s_core_mod < 0)
+    if (cfd < 0) {
+        int err = p_net_errno ? *p_net_errno() : 0;
+        if (cfd == (int)SCE_NET_ERROR_EAGAIN || cfd == (int)SCE_NET_ERROR_EINTR ||
+            err == SCE_NET_EAGAIN || err == SCE_NET_EINTR) {
+            return;
+        }
+        ldr_log("wake listener lost (cfd=0x%08x err=%d), reopening", cfd, err);
+        p_net_close(s_wake_fd);
+        s_wake_fd = -1;
+        if (wake_retry_ticks) *wake_retry_ticks = 0;
+        return;
+    }
+
+    int nbio = 1;
+    p_net_setsockopt(cfd, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &nbio, sizeof(nbio));
+    sceKernelDelayThread(10 * 1000);
+
+    char req[16];
+    sceClibMemset(req, 0, sizeof(req));
+    int rn = p_net_recv ? p_net_recv(cfd, req, sizeof(req) - 1, 0) : 0;
+    int want_reload = (rn >= 6 && req[0] == 'r' && req[1] == 'e' && req[2] == 'l' &&
+                       req[3] == 'o' && req[4] == 'a' && req[5] == 'd');
+    ldr_log("wake connection accepted (core=%d reload=%d)", s_core_mod, want_reload);
+    if (want_reload) {
+        unload_core();
+        sceKernelDelayThread(100 * 1000);
         load_core();
+    } else if (s_core_mod < 0) {
+        load_core();
+    }
     const char *reply = (s_core_mod >= 0) ? "ok\n" : "err\n";
     unsigned int rlen = (s_core_mod >= 0) ? 3u : 4u;
     p_net_send(cfd, reply, rlen, 0);
@@ -221,12 +253,13 @@ static int loader_thread(SceSize args, void *argp) {
     while (s_running) {
         if (s_wake_fd < 0) {
             wake_retry_ticks++;
-            if ((!s_net_init_tried && (wake_retry_ticks % 20) == 0) ||
+            if (wake_retry_ticks == 5 ||
+                (!s_net_init_tried && (wake_retry_ticks % 20) == 0) ||
                 (wake_retry_ticks % 100) == 0) {
                 try_open_wake_socket(wake_retry_ticks >= 40);
             }
         } else {
-            poll_wake_socket();
+            poll_wake_socket(&wake_retry_ticks);
         }
 
         SceCtrlData pad;

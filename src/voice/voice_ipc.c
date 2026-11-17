@@ -105,9 +105,9 @@ static int ipc_connect(uint16_t port, int timeout_ms) {
     return fd;
 }
 
-static int ipc_rpc(json_t *req) {
-    int fd = ipc_connect(VOICE_IPC_PORT, 80);
-    if (fd < 0) return -1;
+static int ipc_rpc_raw(json_t *req) {
+    int fd = ipc_connect(VOICE_IPC_PORT, 150);
+    if (fd < 0) return -2; // listener unreachable
 
     char *body = json_dumps(req, JSON_COMPACT);
     if (!body) { close(fd); return -1; }
@@ -119,7 +119,7 @@ static int ipc_rpc(json_t *req) {
     fd_set rfds;
     FD_ZERO(&rfds);
     FD_SET(fd, &rfds);
-    struct timeval tv = { 0, 250 * 1000 };
+    struct timeval tv = { 0, 400 * 1000 };
     if (select(fd + 1, &rfds, NULL, NULL, &tv) > 0) {
         char buf[1024];
         int n = recv(fd, buf, sizeof(buf) - 1, 0);
@@ -136,22 +136,24 @@ static int ipc_probe_status(void) {
     json_t *req = json_object();
     if (!req) return 0;
     json_object_set_new(req, "cmd", json_string("status"));
-    int ok = (ipc_rpc(req) == 0);
+    int ok = (ipc_rpc_raw(req) == 0);
     json_decref(req);
     return ok;
 }
 
 // Wake on-demand cordless_voice_poc loader on localhost:47322 so the user
-// doesn't need to press L+R+START manually after every reboot.
-static int ipc_wake_core(int *did_contact) {
-    int fd = ipc_connect(VOICE_WAKE_PORT, 80);
+// doesn't need to press L+R+START manually after boot or sleep.
+static int ipc_wake_core(int force_reload) {
+    int fd = ipc_connect(VOICE_WAKE_PORT, 120);
     if (fd < 0) return 0;
 
-    if (did_contact) *did_contact = 1;
+    const char *msg = force_reload ? "reload\n" : "wake\n";
+    send(fd, msg, strlen(msg), 0);
+
     fd_set rfds;
     FD_ZERO(&rfds);
     FD_SET(fd, &rfds);
-    struct timeval tv = { 2, 0 }; // loading core + starting IPC takes ~100-400ms
+    struct timeval tv = { 3, 0 }; // loading core + starting IPC takes ~100-400ms
     char resp[16];
     memset(resp, 0, sizeof(resp));
     int loaded_ok = 0;
@@ -161,20 +163,22 @@ static int ipc_wake_core(int *did_contact) {
             loaded_ok = 1;
     }
     close(fd);
-    console_logf("[voice-ipc] wake reply: loaded=%d (%s)",
+    console_logf("[voice-ipc] wake(%s) reply: loaded=%d (%s)",
+                 force_reload ? "reload" : "wake",
                  loaded_ok, resp[0] ? resp : "timeout");
     return loaded_ok;
 }
 
 int voice_ipc_available(void) {
-    static int s_wake_contacted = 0;
+    static int s_wake_tries = 0;
     if (s_avail == 1) return 1;
     uint64_t now = sceKernelGetProcessTimeWide();
     if (s_avail == 0 && (now - s_last_poll_us) < 3000000ULL) return 0;
 
     int ok = ipc_probe_status();
-    if (!ok && !s_wake_contacted && ipc_wake_core(&s_wake_contacted)) {
-        for (int i = 0; i < 15; i++) {
+    if (!ok && s_wake_tries < 2 && ipc_wake_core(s_wake_tries > 0)) {
+        s_wake_tries++;
+        for (int i = 0; i < 25; i++) {
             sceKernelDelayThread(100 * 1000);
             ok = ipc_probe_status();
             if (ok) break;
@@ -182,10 +186,23 @@ int voice_ipc_available(void) {
         now = sceKernelGetProcessTimeWide();
     }
 
+    if (ok) s_wake_tries = 0;
     s_avail = ok ? 1 : 0;
     s_last_poll_us = now;
     if (s_avail) console_logf("[voice-ipc] background plugin DETECTED");
     return s_avail;
+}
+
+static int ipc_rpc(json_t *req) {
+    int rc = ipc_rpc_raw(req);
+    if (rc == -2) {
+        // Listener may have reset across Vita sleep; re-probe/wake once immediately.
+        s_avail = -1;
+        s_last_poll_us = 0;
+        if (voice_ipc_available())
+            rc = ipc_rpc_raw(req);
+    }
+    return (rc == 0) ? 0 : -1;
 }
 
 void voice_ipc_poll(void) {

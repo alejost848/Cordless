@@ -508,8 +508,8 @@ static int rx_worker(SceSize sz, void *p)
 
 #define VA_MIC_GRAIN        256     // sceAudioIn VOICE grain @ 16kHz (16ms)
 #define VA_TX_FRAME_SAMPLES 320     // 20ms @ 16kHz native Opus wideband
-#define VA_VAD_MS2          150000  // mean-square energy gate (attack)
-#define VA_VAD_HOLD_MS2     60000   // lower hold gate while speaking so soft syllables don't clip
+#define VA_VAD_MS2          80000   // mean-square energy gate (attack)
+#define VA_VAD_HOLD_MS2     30000   // lower hold gate while speaking so soft syllables don't clip
 #define VA_VAD_HANG         25      // quiet frames before we stop (~500ms)
 
 static SceUID               s_tx_thread = -1;
@@ -711,12 +711,15 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
     } else console_logf("[voice] opus encoder create failed %d", eerr);
     s_denoise = speex_preprocess_state_init(VA_TX_FRAME_SAMPLES, 16000);
     if (s_denoise) {
-        int denoise = 1, suppress = -20, agc = 1;
-        float agc_lvl = 8000.0f;
+        int denoise = 1, suppress = -10, agc = 1;
+        int agc_inc = 20, agc_max_gain = 35;
+        float agc_lvl = 22000.0f;
         speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_DENOISE, &denoise);
         speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &suppress);
         speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_AGC, &agc);
         speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_AGC_LEVEL, &agc_lvl);
+        speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_AGC_INCREMENT, &agc_inc);
+        speex_preprocess_ctl(s_denoise, SPEEX_PREPROCESS_SET_AGC_MAX_GAIN, &agc_max_gain);
     }
     s_mic = sceAudioInOpenPort(SCE_AUDIO_IN_PORT_TYPE_VOICE, VA_MIC_GRAIN, 16000,
                                SCE_AUDIO_IN_PARAM_FORMAT_S16_MONO);

@@ -38,7 +38,42 @@ extern void main_gw_stop(void);
 
 static volatile int s_run = 0;
 static SceUID s_thread = -1;
+static SceUID s_gw_thread = -1;
 static int s_listen_fd = -1;
+
+static void open_ipc_listener(void) {
+    if (s_listen_fd >= 0) return;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(IPC_PORT);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0 && listen(fd, 4) == 0) {
+        int fl = fcntl(fd, F_GETFL, 0);
+        if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        s_listen_fd = fd;
+        console_logf("[full] IPC listening on 127.0.0.1:%d", IPC_PORT);
+    } else {
+        console_logf("[full] IPC bind/listen failed (errno=%d)", errno);
+        close(fd);
+    }
+}
+
+static int main_gw_worker(SceSize args, void *argp) {
+    (void)args; (void)argp;
+    while (s_run) {
+        main_gw_tick();
+        sceKernelDelayThread(20 * 1000);
+    }
+    main_gw_stop();
+    main_gw_tick();
+    vitasdk_delete_thread_reent(0);
+    return sceKernelExitDeleteThread(0);
+}
 
 static void play_ready_chime(void) {
     int aport = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_MAIN, 768, 48000,
@@ -156,30 +191,16 @@ static int full_thread(SceSize args, void *argp) {
     __libc_init_array();
     console_logf("=== cordless_voice_full started (lazy pool) ===");
 
+    open_ipc_listener();
+    s_gw_thread = sceKernelCreateThread("cv_maingw", main_gw_worker, 0x10000100,
+                                        0x10000, 0, 0, NULL);
+    if (s_gw_thread >= 0) sceKernelStartThread(s_gw_thread, 0, NULL);
+
     play_ready_chime();
 
-    s_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (s_listen_fd >= 0) {
-        int yes = 1;
-        setsockopt(s_listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-        struct sockaddr_in sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sin_family = AF_INET;
-        sa.sin_port = htons(IPC_PORT);
-        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (bind(s_listen_fd, (struct sockaddr *)&sa, sizeof(sa)) == 0 &&
-            listen(s_listen_fd, 4) == 0) {
-            int fl = fcntl(s_listen_fd, F_GETFL, 0);
-            if (fl >= 0) fcntl(s_listen_fd, F_SETFL, fl | O_NONBLOCK);
-            console_logf("[full] IPC listening on 127.0.0.1:%d", IPC_PORT);
-        } else {
-            console_logf("[full] IPC bind/listen failed");
-            close(s_listen_fd);
-            s_listen_fd = -1;
-        }
-    }
-
     int combo_held = 0;
+    int was_active = 0;
+    int reopen_ticks = 0;
     cordless_overlay_state prev_ov;
     memset(&prev_ov, 0xff, sizeof(prev_ov));
     while (s_run) {
@@ -189,10 +210,11 @@ static int full_thread(SceSize args, void *argp) {
             if (act & CORDLESS_ACT_DEAF)  voice_toggle_deaf();
             if (act & CORDLESS_ACT_LEAVE) voice_leave();
         }
-        main_gw_tick();
-        if (!voice_active()) main_gw_stop();
+        int va_now = voice_active();
+        if (was_active && !va_now) main_gw_stop();
+        was_active = va_now;
         {
-            int a = voice_active(), c = voice_connected(), m = voice_is_muted(), d = voice_is_deafened();
+            int a = va_now, c = voice_connected(), m = voice_is_muted(), d = voice_is_deafened();
             int tx = (a && c && voice_audio_is_tx_speaking()) ? 1 : 0;
             cordless_overlay_state ov;
             memset(&ov, 0, sizeof(ov));
@@ -236,7 +258,15 @@ static int full_thread(SceSize args, void *argp) {
         if (s_listen_fd >= 0) {
             for (;;) {
                 int cfd = accept(s_listen_fd, NULL, NULL);
-                if (cfd < 0) break;
+                if (cfd < 0) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                        console_logf("[full] IPC listener reset (errno=%d)", errno);
+                        close(s_listen_fd);
+                        s_listen_fd = -1;
+                        reopen_ticks = 0;
+                    }
+                    break;
+                }
                 int cfl = fcntl(cfd, F_GETFL, 0);
                 if (cfl >= 0) fcntl(cfd, F_SETFL, cfl & ~O_NONBLOCK);
                 struct timeval tv = { 0, 250 * 1000 };
@@ -254,13 +284,21 @@ static int full_thread(SceSize args, void *argp) {
                 if (tot > 0) handle_ipc_line(cfd, buf);
                 close(cfd);
             }
+        } else if (++reopen_ticks >= 50) {
+            reopen_ticks = 0;
+            open_ipc_listener();
         }
         sceKernelDelayThread(20 * 1000);
     }
 
     cordless_mem_set_overlay(0, 0, 0, 0);
     voice_leave();
-    main_gw_stop();
+    if (s_gw_thread >= 0) {
+        sceKernelWaitThreadEnd(s_gw_thread, NULL, NULL);
+        s_gw_thread = -1;
+    } else {
+        main_gw_stop();
+    }
     if (s_listen_fd >= 0) { close(s_listen_fd); s_listen_fd = -1; }
     __libc_fini_array();
     _free_vita_io();
