@@ -16,7 +16,7 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 ## App identity ---------------------------------------------------------------
 set(VITA_APP_NAME  "Cordless")
 set(VITA_TITLEID   "CRDL00001")
-set(VITA_VERSION   "01.10")
+set(VITA_VERSION   "01.11")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
