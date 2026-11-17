@@ -738,7 +738,8 @@ static int worker(SceSize argsz, void *argp)
     char url[192];
     snprintf(url, sizeof(url), "wss://%s/?v=8", s_endpoint);
 
-    for (int attempt = 0; s_run && attempt < 6; attempt++) {
+    int fatal_close = 0;
+    for (int attempt = 0; s_run && !fatal_close && attempt < 6; attempt++) {
         if (attempt > 0) {
             s_connected = 0;
             s_status = "Reconnecting";
@@ -780,7 +781,12 @@ static int worker(SceSize argsz, void *argp)
         while (s_run) {
         int is_bin = 0;
         int n = vws_read(ws, &buf, &cap, 500, &is_bin);
-        if (n < 0) { if (s_run) console_logf("[voice] ws closed by server (pre-connect=%d)", !s_connected); break; }
+        if (n < 0) {
+            int cc = ws_last_close_code(ws);
+            if (s_run) console_logf("[voice] ws closed by server (code=%d pre-connect=%d)", cc, !s_connected);
+            if (cc == 4006 || cc == 4014) fatal_close = cc;
+            break;
+        }
         if (n > 0 && is_bin) {  // binary frame (DAVE only)
             if (n >= 3)
                 s_seq_ack = ((int)(uint8_t)buf[0] << 8) | (uint8_t)buf[1];
@@ -920,7 +926,22 @@ done:
 #endif
     if (s_udp >= 0) { close(s_udp); s_udp = -1; }
     s_connected = 0;
-    if (s_active) s_status = "Disconnected";
+#ifdef CORDLESS_PLUGIN
+    if (s_active) {
+        if (fatal_close != 4014) gateway_voice_update_ex(s_guild, "", 0, 0);
+        s_active = 0; s_have_server = 0; s_state_acked = 0;
+        s_guild[0] = '\0'; s_chan[0] = '\0';
+        s_status = "Idle";
+    }
+#else
+    if (s_active) {
+        if (fatal_close == 4014) {
+            s_active = 0; s_guild[0] = '\0'; s_chan[0] = '\0'; s_status = "Idle";
+        } else {
+            s_status = "Disconnected";
+        }
+    }
+#endif
 #ifdef CORDLESS_PLUGIN
     extern int vitasdk_delete_thread_reent(SceUID thid);
     vitasdk_delete_thread_reent(0);
