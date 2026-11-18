@@ -35,7 +35,7 @@ static long long now_ms(void)
     return (long long)(t.tick / 1000);
 }
 
-#define CL_VERSION "1.1.0-beta.2"  // shown in Settings > About
+#define CL_VERSION "1.1.0-beta.3"  // shown in Settings > About
 
 #define RAIL_W     72
 #define SIDE_X     RAIL_W
