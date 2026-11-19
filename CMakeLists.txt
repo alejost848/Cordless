@@ -21,7 +21,7 @@ set(VITA_VERSION   "01.11")
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-add_compile_options(-Wall -Wextra -Wno-unused-parameter -O2 -g -ffunction-sections -fdata-sections)
+add_compile_options(-Wall -Wextra -Wno-unused-parameter -Os -g -ffunction-sections -fdata-sections)
 # Enable RTTI and exceptions; silence psabi notes.
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -frtti -fexceptions -Wno-psabi")
 
