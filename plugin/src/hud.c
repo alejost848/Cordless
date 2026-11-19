@@ -45,6 +45,8 @@ static volatile uint64_t s_last_ts[2];
 static volatile uint32_t s_prev_btn[2];
 static volatile int      s_combo_prev[2];
 static volatile uint32_t s_swallow_mask[2];
+static volatile uint32_t s_rep_dir[2];
+static volatile uint64_t s_rep_next_ts[2];
 
 #define AUDIO_MAX_PORTS 8
 #define NUM_AUDIO_HOOKS 4
@@ -563,66 +565,90 @@ static int ctrl_process(int port, SceCtrlData *pad_data, int count, int ret, int
     int n = (ret < count) ? ret : count;
     int closing = 0;
     if (port == 0 || port == 1) {
-        const SceCtrlData *cur = (n > 1 && pad_data[n - 1].timeStamp > pad_data[0].timeStamp)
-                                 ? &pad_data[n - 1] : &pad_data[0];
-        uint32_t raw = is_neg ? ~cur->buttons : cur->buttons;
-        uint64_t ts = cur->timeStamp;
-        int combo_now = ((raw & (SCE_CTRL_LTRIGGER | SCE_CTRL_L1)) != 0) &&
-                        ((raw & (SCE_CTRL_RTRIGGER | SCE_CTRL_R1)) != 0) &&
-                        ((raw & SCE_CTRL_TRIANGLE) != 0);
+        int rev = (n > 1 && pad_data[0].timeStamp > pad_data[n - 1].timeStamp);
+        int start = rev ? (n - 1) : 0;
+        int end   = rev ? -1 : n;
+        int step  = rev ? -1 : 1;
 
-        if (ts != s_last_ts[port] || (ts == 0 && raw != s_prev_btn[port])) {
-            s_last_ts[port] = ts;
-            s_swallow_mask[port] &= (raw & 0x0000FFFFu);
-            uint32_t pressed = raw & ~s_prev_btn[port];
-            s_prev_btn[port] = raw;
+        for (int idx = start; idx != end; idx += step) {
+            const SceCtrlData *cur = &pad_data[idx];
+            uint32_t raw = is_neg ? ~cur->buttons : cur->buttons;
+            uint64_t ts = cur->timeStamp;
+            int combo_now = ((raw & (SCE_CTRL_LTRIGGER | SCE_CTRL_L1)) != 0) &&
+                            ((raw & (SCE_CTRL_RTRIGGER | SCE_CTRL_R1)) != 0) &&
+                            ((raw & SCE_CTRL_TRIANGLE) != 0);
 
-            if (combo_now && !s_combo_prev[port]) {
-                if (s_panel_open) {
-                    s_swallow_mask[port] |= (raw & 0x0000FFFFu);
-                    s_panel_open = 0;
-                    closing = 1;
-                } else if (cordless_mem_get_overlay() & CORDLESS_OV_ACTIVE) {
-                    s_panel_open = 1;
-                    s_sel = 0;
-                    s_swallow_mask[port] = 0;
-                }
-            } else if (s_panel_open && !combo_now) {
-                if (pressed & SCE_CTRL_UP) {
-                    s_sel = (s_sel > 0) ? (s_sel - 1) : 3;
-                } else if (pressed & SCE_CTRL_DOWN) {
-                    s_sel = (s_sel + 1) % 4;
-                } else if (pressed & SCE_CTRL_CIRCLE) {
-                    s_swallow_mask[port] |= (raw & 0x0000FFFFu);
-                    s_panel_open = 0;
-                    closing = 1;
-                } else if (s_sel == 2 && (pressed & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT | SCE_CTRL_CROSS))) {
-                    int v = cordless_mem_get_game_vol();
-                    if (pressed & SCE_CTRL_LEFT) {
-                        v -= 10;
-                    } else if (pressed & SCE_CTRL_RIGHT) {
-                        v += 10;
+            if (ts != s_last_ts[port] || (ts == 0 && raw != s_prev_btn[port])) {
+                s_last_ts[port] = ts;
+                s_swallow_mask[port] &= (raw & 0x0000FFFFu);
+                uint32_t pressed = raw & ~s_prev_btn[port];
+                s_prev_btn[port] = raw;
+
+                uint32_t nav_held = raw & (SCE_CTRL_UP | SCE_CTRL_DOWN | SCE_CTRL_LEFT | SCE_CTRL_RIGHT);
+                if (s_panel_open && !combo_now && ts != 0) {
+                    if (pressed & (SCE_CTRL_UP | SCE_CTRL_DOWN | SCE_CTRL_LEFT | SCE_CTRL_RIGHT)) {
+                        s_rep_dir[port] = nav_held;
+                        s_rep_next_ts[port] = ts + 280000ULL;
+                    } else if (nav_held != 0 && nav_held == s_rep_dir[port]) {
+                        if (ts >= s_rep_next_ts[port]) {
+                            pressed |= nav_held;
+                            s_rep_next_ts[port] = ts + 80000ULL;
+                        }
                     } else {
-                        v = (v < 100) ? 100 : 40;
+                        s_rep_dir[port] = 0;
                     }
-                    if (v < 0) v = 0;
-                    if (v > 100) v = 100;
-                    cordless_mem_set_game_vol(v);
-                    sync_audio_volumes(v, 0);
-                } else if (pressed & SCE_CTRL_CROSS) {
-                    if (s_sel == 0) {
-                        cordless_mem_post_action(CORDLESS_ACT_MUTE);
-                    } else if (s_sel == 1) {
-                        cordless_mem_post_action(CORDLESS_ACT_DEAF);
-                    } else if (s_sel == 3) {
-                        cordless_mem_post_action(CORDLESS_ACT_LEAVE);
+                } else {
+                    s_rep_dir[port] = 0;
+                }
+
+                if (combo_now && !s_combo_prev[port]) {
+                    if (s_panel_open) {
                         s_swallow_mask[port] |= (raw & 0x0000FFFFu);
                         s_panel_open = 0;
                         closing = 1;
+                    } else if (cordless_mem_get_overlay() & CORDLESS_OV_ACTIVE) {
+                        s_panel_open = 1;
+                        s_sel = 0;
+                        s_swallow_mask[port] = 0;
+                        s_rep_dir[port] = 0;
+                    }
+                } else if (s_panel_open && !combo_now) {
+                    if (pressed & SCE_CTRL_UP) {
+                        s_sel = (s_sel > 0) ? (s_sel - 1) : 3;
+                    } else if (pressed & SCE_CTRL_DOWN) {
+                        s_sel = (s_sel + 1) % 4;
+                    } else if (pressed & SCE_CTRL_CIRCLE) {
+                        s_swallow_mask[port] |= (raw & 0x0000FFFFu);
+                        s_panel_open = 0;
+                        closing = 1;
+                    } else if (s_sel == 2 && (pressed & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT | SCE_CTRL_CROSS))) {
+                        int v = cordless_mem_get_game_vol();
+                        if (pressed & SCE_CTRL_LEFT) {
+                            v -= 10;
+                        } else if (pressed & SCE_CTRL_RIGHT) {
+                            v += 10;
+                        } else {
+                            v = (v < 100) ? 100 : 40;
+                        }
+                        if (v < 0) v = 0;
+                        if (v > 100) v = 100;
+                        cordless_mem_set_game_vol(v);
+                        sync_audio_volumes(v, 0);
+                    } else if (pressed & SCE_CTRL_CROSS) {
+                        if (s_sel == 0) {
+                            cordless_mem_post_action(CORDLESS_ACT_MUTE);
+                        } else if (s_sel == 1) {
+                            cordless_mem_post_action(CORDLESS_ACT_DEAF);
+                        } else if (s_sel == 3) {
+                            cordless_mem_post_action(CORDLESS_ACT_LEAVE);
+                            s_swallow_mask[port] |= (raw & 0x0000FFFFu);
+                            s_panel_open = 0;
+                            closing = 1;
+                        }
                     }
                 }
+                s_combo_prev[port] = combo_now;
             }
-            s_combo_prev[port] = combo_now;
         }
     }
 

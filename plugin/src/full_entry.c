@@ -161,13 +161,19 @@ static void handle_ipc_line(int fd, const char *line) {
     } else if (strcmp(cmd, "leave") == 0) {
         voice_leave();
     } else if (strcmp(cmd, "mute") == 0) {
+        int prev = voice_is_muted();
         json_t *v = json_object_get(req, "val");
         if (json_is_integer(v)) voice_set_muted((int)json_integer_value(v));
         else voice_toggle_mute();
+        if (json_is_integer(v) && voice_connected() && voice_is_muted() != prev)
+            voice_audio_play_cue(voice_is_muted() ? 1 : 2);
     } else if (strcmp(cmd, "deaf") == 0) {
+        int prev = voice_is_deafened();
         json_t *v = json_object_get(req, "val");
         if (json_is_integer(v)) voice_set_deafened((int)json_integer_value(v));
         else voice_toggle_deaf();
+        if (json_is_integer(v) && voice_connected() && voice_is_deafened() != prev)
+            voice_audio_play_cue(voice_is_deafened() ? 1 : 2);
     } else if (strcmp(cmd, "noise") == 0) {
         json_t *v = json_object_get(req, "val");
         if (json_is_integer(v)) voice_audio_set_noise_suppress((int)json_integer_value(v));
@@ -180,6 +186,17 @@ static void handle_ipc_line(int fd, const char *line) {
     json_object_set_new(resp, "guild_id",   json_string(voice_guild_id()));
     json_object_set_new(resp, "channel_id", json_string(voice_channel_id()));
     json_object_set_new(resp, "status",     json_string(voice_status()));
+    json_object_set_new(resp, "spk_mask",   json_integer((json_int_t)voice_speaking_mask()));
+    if (voice_active() && voice_connected()) {
+        char spk_uids[16][24];
+        int sn = voice_get_speaking_uids(spk_uids, 16);
+        if (sn > 0) {
+            json_t *sarr = json_array();
+            for (int i = 0; i < sn; i++)
+                json_array_append_new(sarr, json_string(spk_uids[i]));
+            json_object_set_new(resp, "spk_uids", sarr);
+        }
+    }
 
     char *out = json_dumps(resp, JSON_COMPACT);
     if (out) {
@@ -295,7 +312,7 @@ static int full_thread(SceSize args, void *argp) {
             reopen_ticks = 0;
             open_ipc_listener();
         }
-        sceKernelDelayThread(20 * 1000);
+        sceKernelDelayThread((va_now ? 10 : 20) * 1000);
     }
 
     cordless_mem_set_overlay(0, 0, 0, 0);
@@ -322,7 +339,7 @@ void _start() __attribute__((weak, alias("module_start")));
 int module_start(SceSize argc, const void *args) {
     (void)argc; (void)args;
     s_run = 1;
-    s_thread = sceKernelCreateThread("cv_full", full_thread, 0x10000100, 0x8000, 0, 0, NULL);
+    s_thread = sceKernelCreateThread("cv_full", full_thread, 0x60, 0x8000, 0, 0, NULL);
     if (s_thread >= 0) sceKernelStartThread(s_thread, 0, NULL);
     return SCE_KERNEL_START_SUCCESS;
 }

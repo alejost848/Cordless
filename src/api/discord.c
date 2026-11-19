@@ -320,6 +320,7 @@ void discord_json_to_message(json_t *m, message *out)
     snprintf(out->timestamp, sizeof(out->timestamp), "%s",
              json_string_value(json_object_get(m, "timestamp")) ?: "");
     out->type = (int)json_integer_value(json_object_get(m, "type"));
+    out->edited = json_is_string(json_object_get(m, "edited_timestamp"));
 
     // Does this message mention us (or @everyone/@here)?
     if (json_is_true(json_object_get(m, "mention_everyone"))) out->mentions_me = true;

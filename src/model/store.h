@@ -168,6 +168,9 @@ const char *store_oldest_message_id(void);
 
 // Edit / delete a message in the open channel by id (no-op if not present).
 void store_update_message(const char *id, const char *content);
+void store_patch_message(const char *id, const message *upd,
+                         bool has_content, bool is_edited,
+                         bool has_embeds, bool has_poll);
 void store_delete_message(const char *id);
 
 // Live reaction updates. `name` is unicode emoji chars or a custom-emoji name;

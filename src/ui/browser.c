@@ -1676,17 +1676,33 @@ static void open_forum(const channel *c)
     }
 }
 
-// open the New Post form (fetches the forum's tags first)
+static int ftags_worker(SceSize sz, void *p)
+{
+    (void)sz; (void)p;
+    char ids[MAX_FTAGS][24], names[MAX_FTAGS][40];
+    int nt = discord_get_forum_tags(s_forum_id, ids, names, MAX_FTAGS, s_token, s_cacert);
+    if (s_np_open && nt > 0) {
+        for (int i = 0; i < nt; i++) {
+            snprintf(s_np_tag_ids[i], sizeof(s_np_tag_ids[0]), "%s", ids[i]);
+            snprintf(s_np_tag_names[i], sizeof(s_np_tag_names[0]), "%s", names[i]);
+        }
+        s_np_ntags = nt;
+        s_np_tag_required = true;
+    }
+    return sceKernelExitDeleteThread(0);
+}
+
+// open the New Post form (fetches the forum's tags off-thread)
 static void new_forum_post(void)
 {
     if (!s_forum_id[0]) return;
     s_np_title[0] = '\0'; s_np_content[0] = '\0'; s_np_tagsel = -1;
+    s_np_ntags = 0; s_np_tag_required = false;
     s_forum_status[0] = '\0';
-    int nt = discord_get_forum_tags(s_forum_id, s_np_tag_ids, s_np_tag_names,
-                                    MAX_FTAGS, s_token, s_cacert);
-    s_np_ntags = nt > 0 ? nt : 0;
-    s_np_tag_required = (s_np_ntags > 0);  // forums with tags usually require one
     s_np_open = true;
+    SceUID th = sceKernelCreateThread("cl_ftags", ftags_worker, 0x40, 0x40000, 0,
+                                      SCE_KERNEL_CPU_MASK_USER_1, NULL);
+    if (th >= 0) sceKernelStartThread(th, 0, NULL);
 }
 
 struct np_req { char fid[24]; char title[128]; char content[1024]; char tag[24]; };
@@ -1993,15 +2009,25 @@ static void open_pins(void)
     if (th >= 0) sceKernelStartThread(th, 0, NULL); else s_pins_loading = false;
 }
 
-// edit your bio via the on-screen keyboard, then PATCH it;
-// updates the shown bio on success
+// edit your bio via the on-screen keyboard, then PATCH it off-thread;
+// updates the shown bio optimistically
+static char s_new_bio[256];
+static int set_bio_worker(SceSize sz, void *p)
+{
+    (void)sz; (void)p;
+    int code = discord_set_bio(s_new_bio, s_token, s_cacert);
+    console_dbgf("[ui] set bio -> %d", code);
+    return sceKernelExitDeleteThread(0);
+}
 static void edit_bio(void)
 {
     char buf[256];
     if (ime_get_text("Bio", s_me_bio, buf, sizeof(buf))) {
-        int code = discord_set_bio(buf, s_token, s_cacert);
-        if (code >= 200 && code < 300) snprintf(s_me_bio, sizeof(s_me_bio), "%s", buf);
-        console_dbgf("[ui] set bio -> %d", code);
+        snprintf(s_me_bio, sizeof(s_me_bio), "%s", buf);
+        snprintf(s_new_bio, sizeof(s_new_bio), "%s", buf);
+        SceUID th = sceKernelCreateThread("cl_setbio", set_bio_worker, 0x40, 0x40000, 0,
+                                          SCE_KERNEL_CPU_MASK_USER_1, NULL);
+        if (th >= 0) sceKernelStartThread(th, 0, NULL);
     }
 }
 
@@ -3499,6 +3525,19 @@ static void draw_hangup_icon(int cx, int cy, unsigned col)
     ui_rounded_rect(cx + 5, cy - 1, 5, 5, 2, col);
 }
 
+static void draw_headphone_icon(int cx, int cy, unsigned col, bool deafened)
+{
+    ui_rounded_rect(cx - 6, cy - 7, 12, 3, 2, col);
+    ui_rect(cx - 7, cy - 5, 2, 6, col);
+    ui_rect(cx + 5, cy - 5, 2, 6, col);
+    ui_rounded_rect(cx - 8, cy - 1, 4, 8, 2, col);
+    ui_rounded_rect(cx + 4, cy - 1, 4, 8, 2, col);
+    if (deafened) {
+        vita2d_draw_line((float)(cx - 8), (float)(cy - 7), (float)(cx + 8), (float)(cy + 7), col);
+        vita2d_draw_line((float)(cx - 8), (float)(cy - 6), (float)(cx + 8), (float)(cy + 8), col);
+    }
+}
+
 static void draw_sidebar(guild *g, bool home)
 {
     if (s_channels_collapsed) return;  // channel drawer hidden; message pane fills it
@@ -3541,17 +3580,17 @@ static void draw_sidebar(guild *g, bool home)
             int avail = SIDE_W - 56;
             if (row->vm.deaf || row->vm.mute) {
                 int ix = SIDE_X + SIDE_W - 18, iy = y + 10;
+                int left_ix = ix;
                 if (row->vm.deaf) {
-                    // Compact headphones + slash icon in COL_RED.
-                    ui_rounded_rect(ix - 5, iy - 5, 10, 4, 3, COL_RED);
-                    ui_rounded_rect(ix - 6, iy - 2, 3, 6, 1, COL_RED);
-                    ui_rounded_rect(ix + 3, iy - 2, 3, 6, 1, COL_RED);
-                    vita2d_draw_line((float)(ix - 6), (float)(iy - 5), (float)(ix + 6), (float)(iy + 5), COL_RED);
-                    vita2d_draw_line((float)(ix - 6), (float)(iy - 4), (float)(ix + 6), (float)(iy + 6), COL_RED);
+                    draw_headphone_icon(ix, iy, COL_RED, true);
+                    if (row->vm.mute) {
+                        left_ix = ix - 20;
+                        draw_mic_icon(left_ix, iy, COL_RED, true);
+                    }
                 } else {
                     draw_mic_icon(ix, iy, COL_RED, true);
                 }
-                avail = (ix - 12) - (SIDE_X + 48);
+                avail = (left_ix - 12) - (SIDE_X + 48);
             }
             if (avail > 0)
                 ui_text_clip(SIDE_X + 48, y + 2, FS_SMALL,
@@ -3697,7 +3736,8 @@ static void draw_sidebar(guild *g, bool home)
         ui_text_bold_clip(SIDE_X + 24, vy + 5, FS_TINY,
                           vconn ? COL_GREEN : COL_TEXT_BRIGHT, vhdr, SIDE_W - 32);
 
-        int bw = (SIDE_W - 28) / 2, gap = 8, bx0 = SIDE_X + 10, by = vy + 26, bh = 36;
+        int gap = 6, bx0 = SIDE_X + 10, by = vy + 26, bh = 36;
+        int bw = (SIDE_W - 20 - 2 * gap) / 3;
 
         int muted = voice_is_muted();
         int mx = bx0;
@@ -3707,9 +3747,15 @@ static void draw_sidebar(guild *g, bool home)
         s_vmute_btn[0] = mx; s_vmute_btn[1] = by;
         s_vmute_btn[2] = bw; s_vmute_btn[3] = bh;
 
-        s_vdeaf_btn[2] = 0;
+        int deaf = voice_is_deafened();
+        int dx = mx + bw + gap;
+        ui_rounded_rect(dx, by, bw, bh, 7, deaf ? COL_RED : COL_ELEVATED);
+        draw_headphone_icon(dx + bw / 2, by + bh / 2,
+                            deaf ? COL_WHITE : COL_TEXT_BRIGHT, deaf != 0);
+        s_vdeaf_btn[0] = dx; s_vdeaf_btn[1] = by;
+        s_vdeaf_btn[2] = bw; s_vdeaf_btn[3] = bh;
 
-        int lx = mx + bw + gap;
+        int lx = dx + bw + gap;
         ui_rounded_rect(lx, by, bw, bh, 7, COL_RED);
         draw_hangup_icon(lx + bw / 2, by + bh / 2, COL_WHITE);
         s_vleave_btn[0] = lx; s_vleave_btn[1] = by;
@@ -4587,6 +4633,14 @@ static void draw_topbar(const channel *cc, int msg_w)
                               muted ? COL_WHITE : COL_TEXT_BRIGHT, muted != 0);
                 s_dm_mute_btn_x0 = mx; s_dm_mute_btn_x1 = mx + mw;
                 rx = mx;
+
+                int deaf = voice_is_deafened();
+                int dw = 34, dx = rx - dw - bgap;
+                ui_rounded_rect(dx, 9, dw, 24, 8, deaf ? COL_RED : COL_ELEVATED);
+                draw_headphone_icon(dx + dw / 2, 21,
+                                    deaf ? COL_WHITE : COL_TEXT_BRIGHT, deaf != 0);
+                s_dm_deaf_btn_x0 = dx; s_dm_deaf_btn_x1 = dx + dw;
+                rx = dx;
             } else {
                 int cw = ui_text_bold_w(FS_SMALL, "Call") + bpad;
                 int cx = rx - cw - bgap;

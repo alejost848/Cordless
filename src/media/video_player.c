@@ -1,4 +1,5 @@
 #include "media/video_player.h"
+#include "media/audio_player.h"
 #include "media/mp4.h"
 #include "tls/https_get.h"
 #include "net_common.h"
@@ -176,6 +177,7 @@ static int dismiss_pressed(void)
 
 void video_play(const char *url, const char *cacert_path)
 {
+    audio_player_stop();
     // Dim the chat behind a "Loading video" overlay during the blocking download.
     for (int f = 0; f < 2; f++) {  // both display buffers
         vita2d_start_drawing();

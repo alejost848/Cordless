@@ -33,7 +33,7 @@ typedef enum { E_EMPTY, E_QUEUED, E_FETCHING, E_DECODED, E_READY, E_FAILED } est
 #define QUEUE_MAX 16
 
 typedef struct {
-    char            url[256];
+    char            url[600];
     estate          state;
     unsigned char  *rgba;  // worker-decoded frames, contiguous rgba_n*w*h*4
     int             rgba_w, rgba_h, rgba_n;
@@ -415,7 +415,7 @@ static unsigned url_hash32(const char *s)
 // queues a background fetch.
 static entry *touch(const char *url)
 {
-    if (!url || !url[0]) return NULL;
+    if (!url || !url[0] || strlen(url) >= sizeof(s_cache[0].url)) return NULL;
     unsigned h = url_hash32(url);
     entry *ready = NULL;
     sceKernelLockMutex(s_mutex, 1, NULL);

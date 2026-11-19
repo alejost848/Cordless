@@ -180,10 +180,8 @@ static int audio_worker(SceSize sz, void *p)
     unsigned char *data = NULL;
     int len = 0;
     long http = 0;
-    net_lock();
     int rc = https_get_mbedtls(s_url, s_cacert[0] ? s_cacert : NULL,
                                &data, &len, &http, AP_MAX_BYTES);
-    net_unlock();
     if (!s_stop && rc == 0 && http >= 200 && http < 300 && data && len > 0) {
         play_ogg_opus(data, len);
     } else if (!s_stop) {
@@ -429,11 +427,9 @@ static int rec_worker(SceSize sz, void *p)
         b64_encode(wf32, (size_t)nb, wf_b64);
 
         double dur = (double)s_rec_ms / 1000.0;
-        net_lock();
         int code = discord_send_voice_message(s_rec_cid, ob.buf, (int)ob.len,
                                               dur, wf_b64,
                                               s_rec_tok, s_rec_ca[0] ? s_rec_ca : NULL);
-        net_unlock();
         console_logf("[audio] voice msg upload HTTP %d (%d bytes, %.1fs)", code, (int)ob.len, dur);
     }
 

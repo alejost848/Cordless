@@ -34,6 +34,7 @@ void voice_toggle_deaf(void);
 void voice_set_noise_suppress(int enabled);
 int      voice_is_speaking(const char *user_id);
 unsigned voice_speaking_mask(void);
+int      voice_get_speaking_uids(char out_uids[][24], int max_uids);
 
 typedef struct voice_hud_peer {
     char name[20];

@@ -1400,11 +1400,20 @@ static void parse_message_create(json_t *d)
 static void parse_message_update(json_t *d)
 {
     const char *cid = json_string_value(json_object_get(d, "channel_id"));
-    const char *content = json_string_value(json_object_get(d, "content"));
-    if (!cid || !content) return;  // embed/other updates carry no content
+    const char *mid = json_string_value(json_object_get(d, "id"));
+    if (!cid || !mid) return;
+    bool has_content = json_is_string(json_object_get(d, "content"));
+    bool is_edited   = json_is_string(json_object_get(d, "edited_timestamp"));
+    bool has_embeds  = json_is_array(json_object_get(d, "embeds"));
+    bool has_poll    = json_is_object(json_object_get(d, "poll"));
+    if (!has_content && !has_embeds && !has_poll) return;
+
     store_lock();
-    if (strcmp(cid, store_open_channel()) == 0)
-        store_update_message(json_string_value(json_object_get(d, "id")), content);
+    if (strcmp(cid, store_open_channel()) == 0) {
+        message upd;
+        discord_json_to_message(d, &upd);
+        store_patch_message(mid, &upd, has_content, is_edited, has_embeds, has_poll);
+    }
     store_unlock();
 }
 

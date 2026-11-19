@@ -19,6 +19,8 @@
 
 #define PLUGIN_CACERT_PATH "ur0:data/cordless_cacert.pem"
 
+#define IPC_MAX_SPK_UIDS 16
+
 static int      s_avail = -1; // -1 = unknown, 0 = no, 1 = yes
 static int      s_active;
 static int      s_connected;
@@ -27,6 +29,9 @@ static int      s_deafened;
 static char     s_guild[24];
 static char     s_chan[24];
 static char     s_status[32] = "Idle";
+static unsigned s_spk_mask;
+static char     s_spk_uids[IPC_MAX_SPK_UIDS][24];
+static int      s_spk_uid_count;
 static uint64_t s_last_poll_us;
 
 static void ensure_ur0_cacert(const char *src_path) {
@@ -55,10 +60,17 @@ static void parse_resp(const char *line) {
     json_t *r = json_loads(line, 0, &jerr);
     if (!r) return;
 
+    int prev_active = s_active;
+    int prev_muted  = s_muted;
+    int prev_deaf   = s_deafened;
+    char prev_chan[24];
+    snprintf(prev_chan, sizeof(prev_chan), "%s", s_chan);
+
     s_active    = (int)json_integer_value(json_object_get(r, "active"));
     s_connected = (int)json_integer_value(json_object_get(r, "connected"));
     s_muted     = (int)json_integer_value(json_object_get(r, "muted"));
     s_deafened  = (int)json_integer_value(json_object_get(r, "deaf"));
+    s_spk_mask  = (unsigned)json_integer_value(json_object_get(r, "spk_mask"));
 
     const char *gid = json_string_value(json_object_get(r, "guild_id"));
     const char *cid = json_string_value(json_object_get(r, "channel_id"));
@@ -66,6 +78,30 @@ static void parse_resp(const char *line) {
     snprintf(s_guild,  sizeof(s_guild),  "%s", gid ? gid : "");
     snprintf(s_chan,   sizeof(s_chan),   "%s", cid ? cid : "");
     snprintf(s_status, sizeof(s_status), "%s", (st && st[0]) ? st : "Idle");
+
+    s_spk_uid_count = 0;
+    json_t *su = json_object_get(r, "spk_uids");
+    if (json_is_array(su)) {
+        size_t n = json_array_size(su);
+        for (size_t i = 0; i < n && s_spk_uid_count < IPC_MAX_SPK_UIDS; i++) {
+            const char *u = json_string_value(json_array_get(su, i));
+            if (u && u[0]) snprintf(s_spk_uids[s_spk_uid_count++], 24, "%s", u);
+        }
+    }
+
+    if (s_active != prev_active || s_muted != prev_muted ||
+        s_deafened != prev_deaf || strcmp(s_chan, prev_chan) != 0) {
+        store_lock();
+        const char *me = store_me_id();
+        if (me && me[0] && (s_active || prev_active)) {
+            store_voice_set(s_guild, s_active ? s_chan : "", me, NULL, NULL,
+                            s_muted ? true : false, s_deafened ? true : false);
+            store_unlock();
+            store_touch();
+        } else {
+            store_unlock();
+        }
+    }
 
     json_decref(r);
 }
@@ -209,7 +245,8 @@ static int ipc_rpc(json_t *req) {
 void voice_ipc_poll(void) {
     if (s_avail != 1) return;
     uint64_t now = sceKernelGetProcessTimeWide();
-    if (now - s_last_poll_us < 500000ULL) return;
+    uint64_t interval = (s_active && s_connected) ? 200000ULL : 500000ULL;
+    if (now - s_last_poll_us < interval) return;
     s_last_poll_us = now;
 
     json_t *req = json_object();
@@ -331,3 +368,15 @@ int         voice_ipc_is_deafened(void){ return s_deafened; }
 const char *voice_ipc_guild_id(void)   { return s_guild; }
 const char *voice_ipc_channel_id(void) { return s_chan; }
 const char *voice_ipc_status(void)     { return s_status; }
+
+int voice_ipc_is_speaking(const char *user_id) {
+    if (!s_active || !s_connected || s_deafened || !user_id || !user_id[0]) return 0;
+    for (int i = 0; i < s_spk_uid_count; i++) {
+        if (strcmp(s_spk_uids[i], user_id) == 0) return 1;
+    }
+    return 0;
+}
+
+unsigned voice_ipc_speaking_mask(void) {
+    return (s_active && s_connected) ? s_spk_mask : 0;
+}

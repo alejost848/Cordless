@@ -27,6 +27,7 @@ typedef struct {
     ws_client   *ws;
     SceUID       thread;
     int          heartbeat_ms;
+    volatile int stop;
     // Session identity (fingerprint + cookies) from the pre-login /experiments handshake.
     char         fingerprint[64];
     char         cookies[600];
@@ -261,15 +262,17 @@ static int worker(SceSize args, void *argp)
     // Best-effort; on failure we still attempt the login.
     discord_auth_preflight(c->cacert, c->fingerprint, sizeof(c->fingerprint),
                            c->cookies, sizeof(c->cookies));
+    if (c->stop) return 0;
 
     console_dbgf("[ra] connecting remote-auth gateway...");
     c->ws = ws_open(RA_WSS, c->cacert, "https://discord.com", CORDLESS_UA);
-    if (!c->ws) { fail(s, "remote-auth WS upgrade failed"); return 0; }
+    if (!c->ws) { if (!c->stop) fail(s, "remote-auth WS upgrade failed"); return 0; }
+    if (c->stop) { ws_close(c->ws); c->ws = NULL; return 0; }
     set_state(s, RA_CONNECTING);
 
     int64_t last_hb = now_ms();
     char *frame = NULL; size_t fcap = 0;
-    while (s->state != RA_DONE && s->state != RA_FAILED &&
+    while (!c->stop && s->state != RA_DONE && s->state != RA_FAILED &&
            s->state != RA_CANCELLED) {
         int n = ws_recv_frame(c->ws, &frame, &fcap);
         if (n < 0) { fail(s, "ws closed"); break; }
@@ -330,6 +333,7 @@ void remoteauth_join(ra_session *s)
 {
     (void)s;
     if (!g_ctx) return;
+    g_ctx->stop = 1;
     sceKernelWaitThreadEnd(g_ctx->thread, NULL, NULL);
     sceKernelDeleteThread(g_ctx->thread);
     if (g_ctx->kp) ra_keypair_free(g_ctx->kp);

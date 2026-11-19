@@ -32,7 +32,7 @@ static void ensure_net_mutex(void)
     if (__atomic_compare_exchange_n(&s_net_mtx_state, &expected, 1, 0,
                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
         if (s_net_mutex < 0)
-            s_net_mutex = sceKernelCreateMutex("net_serialize", 0, 0, NULL);
+            s_net_mutex = sceKernelCreateMutex("net_serialize", SCE_KERNEL_MUTEX_ATTR_RECURSIVE, 0, NULL);
         __atomic_store_n(&s_net_mtx_state, 2, __ATOMIC_RELEASE);
     } else {
         while (__atomic_load_n(&s_net_mtx_state, __ATOMIC_ACQUIRE) != 2) {

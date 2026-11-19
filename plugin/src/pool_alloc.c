@@ -24,6 +24,8 @@ static SceUID s_pool_uid = -1;
 static uintptr_t s_pool_base = 0;
 static uintptr_t s_pool_end = 0;
 static block_hdr_t *s_head = NULL;
+static uint32_t s_used = 0;
+static uint32_t s_peak = 0;
 static SceKernelLwMutexWork s_mtx;
 static volatile int s_mtx_state = 0; /* 0=uninit, 1=initing, 2=ready */
 
@@ -58,13 +60,12 @@ static int in_pool(const void *ptr) {
 static int pool_ensure_init(void) {
     if (s_head) return 0;
     static const uint32_t sizes[] = {
-        3 * 1024 * 1024,
-        2 * 1024 * 1024,
-        1536 * 1024,
-        1024 * 1024,
+        768 * 1024,
+        640 * 1024,
+        512 * 1024,
     };
     uint32_t addr = 0, type = 0, chosen = 0;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 3; i++) {
         s_pool_uid = cordless_mem_alloc_pool(sizes[i], &addr, &type);
         console_logf("[pool] try(%u KiB) uid=0x%08x addr=0x%08x type=0x%08x",
                      (unsigned)(sizes[i] / 1024), (unsigned)s_pool_uid, addr, type);
@@ -86,6 +87,10 @@ static int pool_ensure_init(void) {
 
 void pool_alloc_shutdown(void) {
     pool_lock();
+    if (s_peak > 0) {
+        console_logf("[pool] shutdown peak=%u KiB used=%u KiB",
+                     (unsigned)(s_peak / 1024), (unsigned)(s_used / 1024));
+    }
     if (s_pool_uid >= 0) {
         cordless_mem_free_pool(s_pool_uid);
         s_pool_uid = -1;
@@ -93,6 +98,8 @@ void pool_alloc_shutdown(void) {
     s_head = NULL;
     s_pool_base = 0;
     s_pool_end = 0;
+    s_used = 0;
+    s_peak = 0;
     pool_unlock();
 }
 
@@ -113,6 +120,8 @@ static void *pool_malloc_locked(size_t size) {
                 b->next = nb;
             }
             b->free = 0;
+            s_used += b->size;
+            if (s_used > s_peak) s_peak = s_used;
             return (void *)(b + 1);
         }
     }
@@ -133,7 +142,10 @@ static void coalesce_all_locked(void) {
 static void pool_free_locked(void *ptr) {
     if (!in_pool(ptr)) return;
     block_hdr_t *b = ((block_hdr_t *)ptr) - 1;
+    if (b->free) return;
     b->free = 1;
+    if (s_used >= b->size) s_used -= b->size;
+    else s_used = 0;
     coalesce_all_locked();
 }
 

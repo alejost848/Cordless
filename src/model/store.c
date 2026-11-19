@@ -195,6 +195,56 @@ void store_update_message(const char *id, const char *content)
     }
 }
 
+void store_patch_message(const char *id, const message *upd,
+                         bool has_content, bool is_edited,
+                         bool has_embeds, bool has_poll)
+{
+    if (!id || !upd) return;
+    for (int i = 0; i < S->message_count; i++) {
+        message *m = &S->messages[i];
+        if (strcmp(m->id, id) != 0) continue;
+        if (has_content) {
+            snprintf(m->content, sizeof(m->content), "%s", upd->content);
+            m->mentions_me = upd->mentions_me;
+            m->has_invite = upd->has_invite;
+            snprintf(m->invite_code, sizeof(m->invite_code), "%s", upd->invite_code);
+        }
+        if (is_edited || (has_content && !has_embeds))
+            m->edited = true;
+        if (has_embeds) {
+            m->has_embed = upd->has_embed;
+            m->embed_color = upd->embed_color;
+            snprintf(m->embed_author, sizeof(m->embed_author), "%s", upd->embed_author);
+            snprintf(m->embed_title, sizeof(m->embed_title), "%s", upd->embed_title);
+            snprintf(m->embed_desc, sizeof(m->embed_desc), "%s", upd->embed_desc);
+            m->embed_field_count = upd->embed_field_count;
+            memcpy(m->embed_fields, upd->embed_fields, sizeof(m->embed_fields));
+            if (upd->has_image && !m->has_file && !m->has_video && !m->has_audio) {
+                m->has_image = true;
+                snprintf(m->image_url, sizeof(m->image_url), "%s", upd->image_url);
+                m->img_w = upd->img_w;
+                m->img_h = upd->img_h;
+                if (!upd->has_embed && m->content[0] && strncmp(m->content, "http", 4) == 0) {
+                    int has_space = 0;
+                    for (const char *p = m->content; *p; p++)
+                        if (*p == ' ' || *p == '\n') { has_space = 1; break; }
+                    if (!has_space) m->content[0] = '\0';
+                }
+            }
+        }
+        if (has_poll && upd->has_poll) {
+            m->has_poll = true;
+            snprintf(m->poll_question, sizeof(m->poll_question), "%s", upd->poll_question);
+            m->poll_finalized = upd->poll_finalized;
+            m->poll_total = upd->poll_total;
+            m->poll_answer_count = upd->poll_answer_count;
+            memcpy(m->poll_answers, upd->poll_answers, sizeof(m->poll_answers));
+        }
+        S->msg_rev++;
+        return;
+    }
+}
+
 void store_delete_message(const char *id)
 {
     if (!id) return;

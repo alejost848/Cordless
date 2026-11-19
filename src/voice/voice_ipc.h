@@ -30,5 +30,7 @@ int         voice_ipc_is_deafened(void);
 const char *voice_ipc_guild_id(void);
 const char *voice_ipc_channel_id(void);
 const char *voice_ipc_status(void);
+int         voice_ipc_is_speaking(const char *user_id);
+unsigned    voice_ipc_speaking_mask(void);
 
 #endif // CORDLESS_VOICE_IPC_H

@@ -335,6 +335,26 @@ static void spk_push_pcm(spk_slot *sp, int got)
         sp->r_idx = (uint8_t)((sp->r_idx + 1) % VA_JITTER_FRAMES);
 }
 
+static int open_voice_out_port(void)
+{
+    static const SceAudioOutPortType types[3] = {
+        SCE_AUDIO_OUT_PORT_TYPE_MAIN,
+        SCE_AUDIO_OUT_PORT_TYPE_VOICE,
+        SCE_AUDIO_OUT_PORT_TYPE_BGM,
+    };
+    int port = -1;
+    for (int i = 0; i < 3; i++) {
+        port = sceAudioOutOpenPort(types[i], VA_FRAME_SAMPLES, 48000, SCE_AUDIO_OUT_MODE_STEREO);
+        if (port >= 0) {
+            int vols[2] = { SCE_AUDIO_VOLUME_0DB, SCE_AUDIO_VOLUME_0DB };
+            sceAudioOutSetVolume(port, SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH, vols);
+            if (i > 0) console_logf("[voice] audio out fallback type=%d port=%d", (int)types[i], port);
+            return port;
+        }
+    }
+    return port;
+}
+
 static int rx_worker(SceSize sz, void *p)
 {
     (void)sz; (void)p;
@@ -488,6 +508,8 @@ static int rx_worker(SceSize sz, void *p)
             }
         }
         mix_cue_into(mix);
+        if (s_aport < 0 && (tick % 25) == 0)
+            s_aport = open_voice_out_port();
         if (s_aport >= 0) sceAudioOutOutput(s_aport, mix);  // blocks ~20ms -> paces us
         else sceKernelDelayThread(20 * 1000);
 #ifdef CORDLESS_PLUGIN
@@ -706,8 +728,7 @@ int voice_audio_start(int udp_fd, unsigned ssrc, const unsigned char secret_key[
     int fl = fcntl(s_udp, F_GETFL, 0);
     if (fl >= 0) fcntl(s_udp, F_SETFL, fl | O_NONBLOCK);
 
-    s_aport = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_MAIN, VA_FRAME_SAMPLES,
-                                  48000, SCE_AUDIO_OUT_MODE_STEREO);
+    s_aport = open_voice_out_port();
     if (s_aport < 0) console_logf("[voice] audio out open failed 0x%08x", (unsigned)s_aport);
 
     s_run = 1;

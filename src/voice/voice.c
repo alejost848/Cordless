@@ -216,9 +216,6 @@ void voice_set_muted(int muted)
 #ifndef CORDLESS_PLUGIN
     if (voice_ipc_available()) {
         voice_ipc_set_muted(muted);
-        if (voice_ipc_active())
-            gateway_voice_update_ex(voice_ipc_guild_id(), voice_ipc_channel_id(),
-                                    voice_ipc_is_muted(), voice_ipc_is_deafened());
         return;
     }
 #endif
@@ -245,9 +242,6 @@ void voice_set_deafened(int deafened)
 #ifndef CORDLESS_PLUGIN
     if (voice_ipc_available()) {
         voice_ipc_set_deafened(deafened);
-        if (voice_ipc_active())
-            gateway_voice_update_ex(voice_ipc_guild_id(), voice_ipc_channel_id(),
-                                    voice_ipc_is_muted(), voice_ipc_is_deafened());
         return;
     }
 #endif
@@ -285,6 +279,9 @@ void voice_set_noise_suppress(int enabled)
 
 int voice_is_speaking(const char *user_id)
 {
+#ifndef CORDLESS_PLUGIN
+    if (voice_ipc_available()) return voice_ipc_is_speaking(user_id);
+#endif
     if (!s_active || !s_connected || !user_id || !user_id[0]) return 0;
     if ((s_user[0] && strcmp(user_id, s_user) == 0) ||
         (store_me_id()[0] && strcmp(user_id, store_me_id()) == 0))
@@ -314,6 +311,9 @@ int voice_is_speaking(const char *user_id)
 
 unsigned voice_speaking_mask(void)
 {
+#ifndef CORDLESS_PLUGIN
+    if (voice_ipc_available()) return voice_ipc_speaking_mask();
+#endif
     if (!s_active || !s_connected) return 0;
     unsigned mask = voice_audio_speaking_mask();
     if (!s_deafened) {
@@ -325,6 +325,34 @@ unsigned voice_speaking_mask(void)
         mask |= (ws << 12);
     }
     return mask;
+}
+
+int voice_get_speaking_uids(char out_uids[][24], int max_uids)
+{
+    if (!s_active || !s_connected || !out_uids || max_uids <= 0) return 0;
+    int count = 0;
+    if (!s_muted && !s_deafened && voice_audio_is_tx_speaking() && s_user[0]) {
+        snprintf(out_uids[count++], 24, "%s", s_user);
+    }
+    if (!s_deafened && count < max_uids) {
+        int64_t now = now_ms();
+        dave_lock();
+        for (int i = 0; i < VOICE_SSRC_MAP_N && count < max_uids; i++) {
+            const char *uid = s_ssrc_map[i].uid;
+            if (!uid[0]) continue;
+            if (s_user[0] && strcmp(uid, s_user) == 0) continue;
+            int spk = 0;
+            if (s_ssrc_map[i].ssrc && voice_audio_ssrc_speaking(s_ssrc_map[i].ssrc)) {
+                spk = 1;
+            } else if (s_ssrc_map[i].speaking) {
+                if (now - s_ssrc_map[i].speaking_at <= 1500) spk = 1;
+                else s_ssrc_map[i].speaking = 0;
+            }
+            if (spk) snprintf(out_uids[count++], 24, "%s", uid);
+        }
+        dave_unlock();
+    }
+    return count;
 }
 
 void voice_set_channel_meta(const char *channel_name)

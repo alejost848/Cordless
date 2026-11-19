@@ -296,6 +296,17 @@ static int do_request(const char *method, const char *url, const char *cacert_pa
     do { rc = mbedtls_ssl_handshake(&ssl); }
     while (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE);
     if (rc != 0) { console_logf("[https] handshake %s rc=-0x%04x", host, -rc); goto done; }
+    if (ca) {
+        uint32_t vflags = mbedtls_ssl_get_verify_result(&ssl);
+        uint32_t ignore = MBEDTLS_X509_BADCERT_EXPIRED | MBEDTLS_X509_BADCERT_FUTURE;
+#ifdef CORDLESS_INSECURE_TLS
+        ignore |= MBEDTLS_X509_BADCERT_CN_MISMATCH;
+#endif
+        if ((vflags & ~ignore) != 0) {
+            console_logf("[https] verify %s flags=0x%08x", host, (unsigned)vflags);
+            goto done;
+        }
+    }
     tls_sess_save(host, &ssl);
 
     // Request line + headers.
